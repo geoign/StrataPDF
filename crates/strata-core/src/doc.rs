@@ -129,6 +129,7 @@ struct Shared {
     revision: AtomicU64,
     closed: AtomicBool,
     waker: Waker,
+    ocr: Arc<crate::ocr::OcrStore>,
 }
 
 /// Cheap, clonable request channel to a document thread (used by render workers).
@@ -332,6 +333,8 @@ impl Document {
         let id = DocId(NEXT_DOC_ID.fetch_add(1, Ordering::Relaxed));
         let (init_tx, init_rx) = bounded::<Result<(DocInfo, SizeF), OpenError>>(1);
         let (tx, rx) = unbounded::<Cmd>();
+        let ocr_store = Arc::new(crate::ocr::OcrStore::open(path));
+        let thread_ocr = ocr_store.clone();
         let path_buf = path.to_path_buf();
         let pw = password.clone();
         let wk = waker.clone();
@@ -351,7 +354,7 @@ impl Document {
                 if init_tx.send(Ok((info, first))).is_err() {
                     return;
                 }
-                doc_thread(eng, rx, wk);
+                doc_thread(eng, rx, wk, thread_ocr);
             })
             .map_err(|e| OpenError::Failed(e.to_string()))?;
 
@@ -364,6 +367,7 @@ impl Document {
             revision: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             waker,
+            ocr: ocr_store,
         });
         if info.page_count > 1 {
             let sh = shared.clone();
@@ -386,6 +390,10 @@ impl Document {
     }
     pub(crate) fn password(&self) -> Option<String> {
         self.shared.password.clone()
+    }
+    /// OCR results of this document (shared with background jobs).
+    pub fn ocr_store(&self) -> &Arc<crate::ocr::OcrStore> {
+        &self.shared.ocr
     }
     pub(crate) fn waker(&self) -> Waker {
         self.shared.waker.clone()
@@ -444,11 +452,18 @@ impl Document {
                     if cancel.load(Ordering::Relaxed) || sh.closed.load(Ordering::Relaxed) {
                         return;
                     }
+                    let mut quads: Vec<QuadF> = Vec::new();
                     if let Ok(page) = eng.load_page(p as i32)
                         && let Ok(hits) = page.search(&needle, 4096)
-                        && !hits.is_empty()
                     {
-                        let quads = hits.iter().map(|q| QuadF::from(q.clone())).collect();
+                        quads = hits.iter().map(|q| QuadF::from(q.clone())).collect();
+                    }
+                    if quads.is_empty()
+                        && let Some(o) = sh.ocr.get(p as u32)
+                    {
+                        quads = o.search(&needle);
+                    }
+                    if !quads.is_empty() {
                         if tx.send(SearchEvent::Hits { page: p as u32, quads }).is_err() {
                             return;
                         }
@@ -508,7 +523,25 @@ fn scan_sizes(sh: Arc<Shared>) {
     (sh.waker)();
 }
 
-fn doc_thread(eng: Engine, rx: Receiver<Cmd>, waker: Waker) {
+/// The PDF's own text is unusable: almost no characters, or mostly undecodable ones.
+fn poor_text(t: &PageText) -> bool {
+    let (mut n, mut bad) = (0usize, 0usize);
+    for (_, _, l) in t.lines() {
+        for c in &l.chars {
+            if c.c.is_whitespace() {
+                continue;
+            }
+            n += 1;
+            let u = c.c as u32;
+            if c.c == '\u{FFFD}' || u < 0x20 || (0xE000..=0xF8FF).contains(&u) {
+                bad += 1;
+            }
+        }
+    }
+    n < 20 || bad * 10 > n * 3
+}
+
+fn doc_thread(eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::ocr::OcrStore>) {
     let cap = |n| NonZeroUsize::new(n).unwrap();
     let mut dl_cache: LruCache<u32, Arc<DisplayList>> = LruCache::new(cap(64));
     let mut text_cache: LruCache<u32, Arc<PageText>> = LruCache::new(cap(256));
@@ -553,6 +586,12 @@ fn doc_thread(eng: Engine, rx: Receiver<Cmd>, waker: Waker) {
                         text_cache.put(p, t.clone());
                     }
                     res
+                };
+                // OCR text stands in for an unusable text layer.
+                let v = match (&v, ocr.get(p)) {
+                    (Ok(t), Some(o)) if poor_text(t) => Ok(Arc::new(o.to_page_text())),
+                    (Err(_), Some(o)) => Ok(Arc::new(o.to_page_text())),
+                    _ => v,
                 };
                 send(r, v, wake, &waker);
             }

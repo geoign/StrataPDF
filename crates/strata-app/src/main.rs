@@ -3,6 +3,7 @@
 mod app;
 mod instance;
 mod layout;
+mod ocr_ui;
 mod print;
 mod reflow_view;
 mod tiles;

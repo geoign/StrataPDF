@@ -70,6 +70,14 @@ pub struct Services<'a> {
     pub theme: strata_core::reflow::output::Theme,
     /// A popup or dialog covers the UI: native child windows must hide.
     pub overlay: bool,
+    pub ocr: &'a mut crate::ocr_ui::OcrManager,
+}
+
+struct OcrJob {
+    rx: Receiver<strata_core::ocr::OcrEvent>,
+    cancel: Arc<AtomicBool>,
+    done: usize,
+    total: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -178,6 +186,9 @@ pub struct DocView {
     pub mode: ViewMode,
     reflow: Option<ReflowPane>,
     pub requests: Vec<ViewRequest>,
+    ocr_job: Option<OcrJob>,
+    /// OCR asked for; starts once the engine is loaded.
+    ocr_request: Option<strata_core::ocr::OcrScope>,
 }
 
 impl DocView {
@@ -224,6 +235,8 @@ impl DocView {
             mode: ViewMode::Pdf,
             reflow: None,
             requests: Vec::new(),
+            ocr_job: None,
+            ocr_request: None,
         }
     }
 
@@ -760,6 +773,104 @@ impl DocView {
         }
     }
 
+    pub fn request_ocr(&mut self, scope: strata_core::ocr::OcrScope) {
+        if self.ocr_job.is_none() {
+            self.ocr_request = Some(scope);
+        }
+    }
+
+    fn cancel_ocr(&mut self) {
+        if let Some(j) = self.ocr_job.take() {
+            j.cancel.store(true, Ordering::Relaxed);
+        }
+        self.ocr_request = None;
+    }
+
+    fn poll_ocr(&mut self, ctx: &egui::Context, svc: &mut Services) {
+        if let Some(scope) = self.ocr_request
+            && let Some(engine) = svc.ocr.engine(ctx)
+        {
+            self.ocr_request = None;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let rx = self.doc.run_ocr(scope, engine, cancel.clone());
+            self.ocr_job = Some(OcrJob { rx, cancel, done: 0, total: 0 });
+            self.status = "OCR を準備しています…".into();
+        }
+        if self.ocr_request.is_some() {
+            self.status = svc.ocr.status().unwrap_or("OCR の準備中…").to_string();
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        let Some(job) = &mut self.ocr_job else { return };
+        let mut finished = None;
+        let mut pages = Vec::new();
+        while let Ok(ev) = job.rx.try_recv() {
+            use strata_core::ocr::OcrEvent;
+            match ev {
+                OcrEvent::Progress { done, total } => {
+                    job.done = done;
+                    job.total = total;
+                }
+                OcrEvent::Page(p) => pages.push(p),
+                OcrEvent::Done { pages } => finished = Some(Ok(pages)),
+                OcrEvent::Error(e) => finished = Some(Err(e)),
+            }
+        }
+        for p in pages {
+            // Re-request text so selection and search see the OCR result.
+            self.texts.remove(&p);
+        }
+        if job.total > 0 {
+            self.status = format!("OCR 中 {}/{} ページ", job.done, job.total);
+        }
+        match finished {
+            Some(Ok(n)) => {
+                self.ocr_job = None;
+                self.status = if n == 0 { "OCR が必要なページはありませんでした".into() } else { format!("OCR 完了：{n} ページ") };
+                // Rebuild the reflowed text with the new OCR results.
+                if self.reflow.is_some() {
+                    let doc = self.doc.clone();
+                    let at = self.reflow.as_ref().map(|r| r.at_page).unwrap_or(1);
+                    let mut pane = ReflowPane::start(&doc);
+                    pane.goto_page(at);
+                    if let Some(old) = &mut self.reflow {
+                        old.hide();
+                    }
+                    self.reflow = Some(pane);
+                }
+            }
+            Some(Err(e)) => self.status = format!("OCR エラー: {e}"),
+            None => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
+        }
+    }
+
+    fn ocr_menu(&mut self, ui: &mut Ui) {
+        use strata_core::ocr::OcrScope;
+        let busy = self.ocr_job.is_some() || self.ocr_request.is_some();
+        ui.menu_button(if busy { "OCR…" } else { "OCR" }, |ui| {
+            if busy {
+                if ui.button("OCR を中止").clicked() {
+                    self.cancel_ocr();
+                    self.status = "OCR を中止しました".into();
+                    ui.close();
+                }
+                return;
+            }
+            if ui.button("文字のないページを OCR").on_hover_text("スキャンページや文字化けするページだけを読み取る").clicked() {
+                self.request_ocr(OcrScope::Needed);
+                ui.close();
+            }
+            if ui.button("全ページを OCR").on_hover_text("既存の文字があるページも読み取る（既存の文字は置き換えない）").clicked() {
+                self.request_ocr(OcrScope::All);
+                ui.close();
+            }
+            let n = self.doc.ocr_store().len();
+            if n > 0 {
+                ui.separator();
+                ui.weak(format!("OCR 済み {n} ページ（キャッシュ済み）"));
+            }
+        });
+    }
+
     fn mode_switch(&mut self, ui: &mut Ui) {
         let mut m = self.mode;
         ui.selectable_value(&mut m, ViewMode::Pdf, "PDF").on_hover_text("ページをそのまま表示");
@@ -798,12 +909,19 @@ impl DocView {
                     let ocr = d.nodes.iter().filter(|n| matches!(n, strata_core::reflow::Node::PageImage { .. })).count();
                     let extra = if ocr > 0 { format!("・要OCR {ocr} ページ") } else { String::new() };
                     ui.weak(format!("{} 要素・画像 {figs}{extra}", d.nodes.len()));
+                    if ocr > 0 && self.ocr_job.is_none() && self.ocr_request.is_none() && ui.button("OCR を実行").clicked() {
+                        self.request_ocr(strata_core::ocr::OcrScope::Needed);
+                    }
                 }
+                ui.separator();
+                self.ocr_menu(ui);
             });
         });
     }
 
     pub fn ui(&mut self, ui: &mut Ui, svc: &mut Services) {
+        let ctx = ui.ctx().clone();
+        self.poll_ocr(&ctx, svc);
         if self.mode == ViewMode::Reflow {
             self.reflow_ui(ui, svc);
             return;
@@ -897,6 +1015,7 @@ impl DocView {
                     self.goto_page(p, None);
                 }
                 ui.separator();
+                self.ocr_menu(ui);
                 if ui.selectable_label(self.search.open, "🔍").on_hover_text("検索 (Ctrl+F)").clicked() {
                     if self.search.open {
                         self.search.open = false;
@@ -1485,6 +1604,7 @@ impl DocView {
     }
 
     pub fn close(&mut self, pool: &RenderPool) {
+        self.cancel_ocr();
         self.search.stop();
         pool.remove_view(self.id);
     }

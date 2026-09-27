@@ -34,11 +34,12 @@ pub struct Settings {
     pub theme: ThemeChoice,
     /// GPU memory for cached tiles.
     pub tile_budget_mb: usize,
+    pub ocr_device: strata_core::ocr::Device,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024 }
+        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu }
     }
 }
 
@@ -83,6 +84,7 @@ pub struct StrataApp {
     title: String,
     waker: Waker,
     web: wry::WebContext,
+    ocr: crate::ocr_ui::OcrManager,
 }
 
 impl StrataApp {
@@ -95,6 +97,7 @@ impl StrataApp {
         let wctx = ctx.clone();
         let waker: Waker = Arc::new(move || wctx.request_repaint());
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).clamp(2, 16);
+        let settings_device = settings.ocr_device;
         let (open_tx, open_rx) = unbounded();
         let (msg_tx, msg_rx) = unbounded();
         let (ipc_tx, ipc_rx) = unbounded();
@@ -120,6 +123,7 @@ impl StrataApp {
             fullscreen: false,
             title: String::new(),
             waker,
+            ocr: crate::ocr_ui::OcrManager::new(settings_device),
             web: wry::WebContext::new(directories::ProjectDirs::from("", "", "StrataPDF").map(|d| d.data_local_dir().join("WebView2"))),
         };
         for f in files {
@@ -394,6 +398,16 @@ impl StrataApp {
                         apply_theme(ui.ctx(), t);
                     }
                     ui.separator();
+                    ui.label("OCR の実行装置");
+                    let mut d = self.settings.ocr_device;
+                    ui.radio_value(&mut d, strata_core::ocr::Device::Gpu, "GPU（DirectML、使えなければ CPU）");
+                    ui.radio_value(&mut d, strata_core::ocr::Device::Cpu, "CPU");
+                    if d != self.settings.ocr_device {
+                        self.settings.ocr_device = d;
+                        self.ocr.device = d;
+                        self.ocr.reset();
+                    }
+                    ui.separator();
                     if ui.checkbox(&mut self.fullscreen, "全画面 (F11)").changed() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
                     }
@@ -595,6 +609,7 @@ struct Viewer<'a> {
     web: &'a mut wry::WebContext,
     theme: strata_core::reflow::output::Theme,
     overlay: bool,
+    ocr: &'a mut crate::ocr_ui::OcrManager,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -618,6 +633,7 @@ impl TabViewer for Viewer<'_> {
             web: Some(&mut *self.web),
             theme: self.theme,
             overlay: self.overlay,
+            ocr: &mut *self.ocr,
         };
         tab.ui(ui, &mut svc);
     }
@@ -708,7 +724,7 @@ impl eframe::App for StrataApp {
                 ThemeChoice::Light => strata_core::reflow::output::Theme::Light,
                 ThemeChoice::Dark => strata_core::reflow::output::Theme::Dark,
             };
-            let overlay = ctx.any_popup_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
+            let overlay = ctx.any_popup_open() || self.ocr.status().is_some() || self.ocr.waiting && !self.ocr.is_ready() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
             let mut viewer = Viewer {
                 pool: &self.pool,
                 tiles: &mut self.tiles,
@@ -719,6 +735,7 @@ impl eframe::App for StrataApp {
                 web: &mut self.web,
                 theme,
                 overlay,
+                ocr: &mut self.ocr,
             };
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                 DockArea::new(&mut self.dock)
@@ -759,6 +776,9 @@ impl eframe::App for StrataApp {
         self.run_actions();
         self.gc_documents();
         self.dialogs(&ctx);
+        if let Some(e) = self.ocr.ui(&ctx) {
+            self.errors.push(e);
+        }
         self.update_title(&ctx);
         self.tiles.end_frame();
     }

@@ -3,6 +3,7 @@
 pub mod doc;
 pub mod fonts;
 pub mod geom;
+pub mod ocr;
 pub mod reflow;
 pub mod render;
 pub mod rich;

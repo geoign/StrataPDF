@@ -7,7 +7,7 @@ pub struct SizeF {
     pub h: f32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RectF {
     pub x0: f32,
     pub y0: f32,

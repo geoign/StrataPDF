@@ -130,6 +130,7 @@ impl Document {
         let path = self.info().path.clone();
         let password = self.password();
         let waker = self.waker();
+        let ocr = self.ocr_store().clone();
         std::thread::Builder::new()
             .name("strata-reflow".into())
             .spawn(move || {
@@ -139,7 +140,7 @@ impl Document {
                             let _ = tx.send(ReflowEvent::Progress { done, total });
                             waker();
                         };
-                        match build(&eng, &opts, &progress, &cancel) {
+                        match build(&eng, &opts, &progress, &cancel, &ocr) {
                             Ok(Some(doc)) => ReflowEvent::Done(Arc::new(doc)),
                             Ok(None) => return,
                             Err(e) => ReflowEvent::Error(e),
@@ -673,7 +674,7 @@ fn vertical_text_area(units: &[Unit], body: f32) -> (f32, f32) {
     if top > bottom { (0.0, 0.0) } else { (top, bottom) }
 }
 
-fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), cancel: &AtomicBool) -> Result<Option<ReflowDoc>, String> {
+fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), cancel: &AtomicBool, ocr: &crate::ocr::OcrStore) -> Result<Option<ReflowDoc>, String> {
     let n = eng.page_count().map_err(|e| e.to_string())?.max(0) as usize;
     let total = n * 2;
     // Pass 1: extraction.
@@ -687,6 +688,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
         let tp = page.to_text_page(reflow_flags() | mupdf::TextPageFlags::COLLECT_VECTORS);
         let Ok(tp) = tp else { continue };
         let mut rich = RichPage::from_text_page(&tp, b.width(), b.height());
+        // OCR text replaces an unusable text layer.
+        if let Some(o) = ocr.get(p as u32)
+            && needs_ocr(&rich).is_some()
+        {
+            rich = o.to_rich(b.width(), b.height());
+        }
         normalize_vertical(&mut rich);
         let links = page
             .links()
@@ -919,7 +926,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                 };
                 if vertical {
                     let (_, bottom) = vertical_text_area(&ordered, body);
-                    last_col_full = u.bbox.y1 >= bottom - body * 0.8;
+                    last_col_full = u.bbox.y1 >= bottom - body * 1.5;
                 }
                 if merge {
                     let idx = prev.unwrap();
