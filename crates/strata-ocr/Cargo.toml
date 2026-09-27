@@ -1,0 +1,23 @@
+[package]
+name = "strata-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+directories = "6"
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+log = "0.4"
+ndarray = { version = "0.17", default-features = false }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-native", "copy-dylibs", "directml", "api-27"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+ureq = "3"
+
+[dev-dependencies]
+env_logger = "0.11"
