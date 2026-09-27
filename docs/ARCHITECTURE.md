@@ -83,3 +83,33 @@ MuPDF の型（`mupdf::*`）を直接使うのは `strata-core` の中だけに�
 プロトコル `http://strata.doc/` でメモリから配る（文字列で渡すと 2MB の上限がある）。
 ページ番号の目印を押すと PDF 表示の該当ページへ戻る。WebView がキーボードを持っている間も
 主要なショートカットは JS 経由でアプリに届く。
+
+## OCR と数式認識
+
+`strata-ocr` クレートが推論を担う。ONNX Runtime（`ort`）を使い、GPU は DirectML で動かす。
+DirectML は DirectX 12 対応の GPU なら追加インストールなしで動く。CUDA 版は cuDNN などの
+DLL 一式を要するため採らない。
+
+- **OCR**：NDLOCR-Lite（国立国会図書館、CC BY 4.0）の Rust 移植（`ndl.rs`）。DEIM でレイアウトと
+  行を検出し、PARSeq（30/50/100 文字の3段）で行を読む。縦の行は 90° 回して読む。
+  前処理（OpenCV 互換の双線形縮小、整数座標での切り出し）を本家に合わせ、同梱サンプルで
+  本家 Python 版と文字一致率 98〜99% を確認した。DEIM は DirectML だと検出が 0 件になるため
+  常に CPU で動かす。
+- **数式**：Pix2Text MFR 1.5（MIT、DeiT エンコーダと TrOCR デコーダ）。貪欲法で復号し、
+  バイトレベル BPE を自前で文字列に戻す。デコーダの入力長が毎ステップ伸びるため DirectML では
+  グラフの組み直しが起き 5〜10 倍遅い。常に CPU で動かす。LaTeX は `math-core` で MathML Core に
+  変換し、WebView2（Chromium）の標準機能で描く。
+- **モデル**：初回使用時に確認ダイアログを出してダウンロードする（`models.rs`）。取得元は
+  コミットやリビジョンを固定した URL で、SHA-256 を検証する。`%LOCALAPPDATA%\StrataPDF\data\models\models.json`
+  を置くと、コードを変えずに一覧を差し替えられる。
+
+`strata-core/src/ocr.rs` がアプリ側との橋渡しをする。
+
+- ページを 150dpi で描画して OCR し、座標を PDF のページ空間（pt）に写す。
+- 結果は文書ごとに保持し、`%LOCALAPPDATA%\StrataPDF\data\ocr\` に JSON Lines で追記保存する
+  （キーはパス・サイズ・更新時刻）。同じファイルを二度 OCR しない。
+- PDF 自身のテキスト層が使えないページに限り、文字選択・コピー・検索・リフローが OCR 結果を使う。
+- **検索可能 PDF の書き出し**：OCR 結果を描画モード 3（不可視）のテキスト層として追記する。
+  フォントは Adobe-Japan1 の非埋め込み CID フォント（UniJIS-UTF16-H）。縦の行は縦書きフォントを
+  使わず、横書きフォントを 90° 回して置く。MuPDF などが縦書きフォントの文字を1字ずつ別の行として
+  扱い、行をまたぐ検索ができなくなるためである。既存の描画内容は `q`/`Q` で囲んで状態の漏れを防ぐ。

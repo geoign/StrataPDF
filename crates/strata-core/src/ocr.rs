@@ -360,3 +360,142 @@ impl Document {
         rx
     }
 }
+
+// ------------------------------------------------------------ searchable PDF
+
+fn apply_vec(m: &mupdf::Matrix, x: f32, y: f32) -> (f32, f32) {
+    (x * m.a + y * m.c, x * m.b + y * m.d)
+}
+
+fn apply_pt(m: &mupdf::Matrix, x: f32, y: f32) -> (f32, f32) {
+    let (vx, vy) = apply_vec(m, x, y);
+    (vx + m.e, vy + m.f)
+}
+
+/// Advance of a character in ems for the (proportional) Adobe-Japan1 font.
+fn em_width(c: char) -> f32 {
+    if (c as u32) >= 0x2E80 { 1.0 } else { 0.5 }
+}
+
+fn utf16_hex(s: &str) -> String {
+    s.encode_utf16().map(|u| format!("{u:04X}")).collect()
+}
+
+/// Content stream drawing the OCR lines as invisible text (render mode 3).
+/// `inv` maps MuPDF page space (y down) to PDF user space.
+fn text_layer(o: &PageOcr, inv: &mupdf::Matrix) -> String {
+    let mut s = String::from("q\nBT\n3 Tr\n");
+    for l in &o.lines {
+        let text: String = l.text.chars().filter(|c| !c.is_control()).collect();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let b = l.bbox;
+        let (e1x, e1y) = apply_vec(inv, 1.0, 0.0);
+        let (e2x, e2y) = apply_vec(inv, 0.0, -1.0);
+        let (font, a, bb, c, d, (ox, oy)) = if l.vertical {
+            // Horizontal font rotated 90° clockwise: the baseline runs down the
+            // column and glyph tops face right. Readers then extract one line
+            // per column (a vertical-mode font yields one line per glyph in MuPDF).
+            let size = b.width().max(0.1);
+            let ems = text.chars().count().max(1) as f32;
+            let s_adv = b.height() / (ems * size);
+            let (dx, dy) = apply_vec(inv, 0.0, 1.0);
+            let (ux, uy) = apply_vec(inv, 1.0, 0.0);
+            ("StrataOcrH", dx * size * s_adv, dy * size * s_adv, ux * size, uy * size, apply_pt(inv, b.x0 + size * 0.12, b.y0))
+        } else {
+            let size = b.height().max(0.1);
+            let ems: f32 = text.chars().map(em_width).sum::<f32>().max(0.5);
+            let xs = b.width() / (ems * size);
+            ("StrataOcrH", e1x * size * xs, e1y * size * xs, e2x * size, e2y * size, apply_pt(inv, b.x0, b.y1 - size * 0.12))
+        };
+        s.push_str(&format!("/{font} 1 Tf {a:.4} {bb:.4} {c:.4} {d:.4} {ox:.3} {oy:.3} Tm <{}> Tj\n", utf16_hex(&text)));
+    }
+    s.push_str("ET\nQ\n");
+    s
+}
+
+fn add_text_layer(pdf: &mut mupdf::pdf::PdfDocument, page: u32, o: &PageOcr, font: &mupdf::pdf::PdfObject) -> Result<(), mupdf::Error> {
+    use mupdf::pdf::PdfObject;
+    let mut pobj = pdf.find_page(page as i32)?;
+    let ctm = pobj.page_ctm()?;
+    let Some(inv) = ctm.invert() else { return Ok(()) };
+    // Resources: the page gets its own dictionary if it only inherits one.
+    // (`try_clone` deep-copies, so dictionaries are completed before insertion.)
+    let own = pobj.get_dict("Resources")?;
+    let has_own = own.is_some();
+    let mut res = match own {
+        Some(r) => r.resolve()?.unwrap_or(r),
+        None => match pobj.get_dict_inheritable("Resources")? {
+            Some(i) => i.resolve()?.unwrap_or(i).copy_dict()?,
+            None => pdf.new_dict()?,
+        },
+    };
+    match res.get_dict("Font")? {
+        Some(f) => {
+            let mut f = f.resolve()?.unwrap_or(f);
+            f.dict_put("StrataOcrH", font.try_clone()?)?;
+        }
+        None => {
+            let mut f = pdf.new_dict()?;
+            f.dict_put("StrataOcrH", font.try_clone()?)?;
+            res.dict_put("Font", f)?;
+        }
+    }
+    if !has_own {
+        pobj.dict_put("Resources", res)?;
+    }
+
+    // Wrap existing content in q/Q so its graphics state cannot leak into ours.
+    let mut stream = |data: &str| -> Result<PdfObject, mupdf::Error> {
+        let buf = mupdf::Buffer::from_bytes(data.as_bytes())?;
+        pdf.add_stream(&buf, None, true)
+    };
+    let q = stream("q\n")?;
+    let big_q = stream("Q\n")?;
+    let layer = stream(&text_layer(o, &inv))?;
+    let mut contents = pdf.new_array()?;
+    contents.array_push(q)?;
+    if let Some(old) = pobj.get_dict("Contents")? {
+        let resolved = old.resolve()?.unwrap_or(old.try_clone()?);
+        if resolved.is_array()? {
+            for i in 0..resolved.len()? as i32 {
+                if let Some(item) = resolved.get_array(i)? {
+                    contents.array_push(item)?;
+                }
+            }
+        } else {
+            contents.array_push(old)?;
+        }
+    }
+    contents.array_push(big_q)?;
+    contents.array_push(layer)?;
+    pobj.dict_put("Contents", contents)?;
+    Ok(())
+}
+
+impl Document {
+    /// Save a copy with an invisible text layer on every OCR'd page whose own
+    /// text layer is unusable, so the file becomes searchable elsewhere.
+    /// Encryption is removed. Blocking: call from a background thread.
+    pub fn save_searchable_pdf(&self, dest: &Path) -> Result<usize, String> {
+        let (eng, _) = open_engine(&self.info().path, self.password().as_deref()).map_err(|e| e.to_string())?;
+        let store = self.ocr_store().clone();
+        let n = self.page_count() as u32;
+        let pages: Vec<u32> = (0..n).filter(|&p| store.get(p).is_some_and(|o| !o.lines.is_empty()) && text_layer_unusable(&eng, p)).collect();
+        let Engine::Pdf(mut pdf) = eng else { return Err("PDF 以外の形式にはテキスト層を追加できません".into()) };
+        let e = |e: mupdf::Error| e.to_string();
+        let font = mupdf::Font::new_cjk(mupdf::CjkFontOrdering::AdobeJapan).map_err(e)?;
+        let fh = pdf.add_cjk_font(&font, mupdf::CjkFontOrdering::AdobeJapan, mupdf::WriteMode::Horizontal, false).map_err(e)?;
+        let fonts = fh;
+        for &p in &pages {
+            if let Some(o) = store.get(p) {
+                add_text_layer(&mut pdf, p, &o, &fonts).map_err(|err| format!("{} ページ: {err}", p + 1))?;
+            }
+        }
+        let mut opts = mupdf::pdf::PdfWriteOptions::default();
+        opts.set_garbage_level(1).set_compress(true).set_encryption(mupdf::pdf::Encryption::None);
+        pdf.save_with_options(&dest.to_string_lossy(), opts).map_err(e)?;
+        Ok(pages.len())
+    }
+}

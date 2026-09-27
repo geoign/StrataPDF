@@ -193,6 +193,7 @@ pub struct DocView {
     ocr_request: Option<strata_core::ocr::OcrScope>,
     /// The current reflow was built with the formula engine.
     reflow_has_latex: bool,
+    save_job: Option<Receiver<Result<(usize, std::path::PathBuf), String>>>,
 }
 
 impl DocView {
@@ -242,6 +243,7 @@ impl DocView {
             ocr_job: None,
             ocr_request: None,
             reflow_has_latex: false,
+            save_job: None,
         }
     }
 
@@ -810,7 +812,39 @@ impl DocView {
         self.ocr_request = None;
     }
 
+    fn save_searchable(&mut self) {
+        let stem = self.doc.info().path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let Some(dest) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(format!("{stem}_ocr.pdf")).save_file() else { return };
+        if dest == self.doc.info().path {
+            self.status = "開いているファイル自体には上書きできません。別の名前で保存してください".into();
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let doc = self.doc.clone();
+        std::thread::Builder::new()
+            .name("strata-save-ocr".into())
+            .spawn(move || {
+                let _ = tx.send(doc.save_searchable_pdf(&dest).map(|n| (n, dest)));
+            })
+            .ok();
+        self.save_job = Some(rx);
+        self.status = "検索可能な PDF を書き出しています…".into();
+    }
+
     fn poll_ocr(&mut self, ctx: &egui::Context, svc: &mut Services) {
+        if let Some(rx) = &self.save_job {
+            match rx.try_recv() {
+                Ok(Ok((n, path))) => {
+                    self.status = format!("{n} ページにテキスト層を付けて保存しました: {}", path.display());
+                    self.save_job = None;
+                }
+                Ok(Err(e)) => {
+                    self.status = format!("保存に失敗しました: {e}");
+                    self.save_job = None;
+                }
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
         if let Some(scope) = self.ocr_request
             && let Some(engine) = svc.ocr.engine(ctx)
         {
@@ -885,6 +919,13 @@ impl DocView {
             if n > 0 {
                 ui.separator();
                 ui.weak(format!("OCR 済み {n} ページ（キャッシュ済み）"));
+                if ui.add_enabled(self.doc.info().is_pdf && self.save_job.is_none(), egui::Button::new("検索可能な PDF として保存…"))
+                    .on_hover_text("OCR 結果を透明なテキスト層として埋め込む。暗号は外れます")
+                    .clicked()
+                {
+                    ui.close();
+                    self.save_searchable();
+                }
             }
         });
     }
