@@ -20,6 +20,7 @@ use crate::layout::{Layout, LayoutParams, Spread};
 use crate::reflow_view::{ReflowPane, WebMsg};
 
 mod annot_ui;
+mod table_ui;
 use crate::tiles::TileCache;
 
 static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
@@ -197,6 +198,7 @@ pub struct DocView {
     reflow_has_latex: bool,
     save_job: Option<Receiver<Result<(usize, std::path::PathBuf), String>>>,
     annot: annot_ui::AnnotState,
+    table: table_ui::TableState,
 }
 
 impl DocView {
@@ -248,6 +250,7 @@ impl DocView {
             reflow_has_latex: false,
             save_job: None,
             annot: annot_ui::AnnotState::default(),
+            table: table_ui::TableState::default(),
         }
     }
 
@@ -996,6 +999,7 @@ impl DocView {
         let ctx = ui.ctx().clone();
         self.poll_ocr(&ctx, svc);
         self.poll_annot(&ctx);
+        self.poll_table(&ctx, svc.ocr);
         if self.mode == ViewMode::Reflow {
             self.reflow_ui(ui, svc);
             return;
@@ -1020,6 +1024,7 @@ impl DocView {
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.canvas(ui, svc, wanted_thumbs));
         self.annot_dialogs(&ctx);
+        self.table_dialog(&ctx);
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
@@ -1094,6 +1099,7 @@ impl DocView {
                 }
                 ui.separator();
                 self.ocr_menu(ui);
+                self.table_toolbar_button(ui);
                 if ui.selectable_label(self.annot.bar, "注釈").on_hover_text("注釈ツール").clicked() {
                     self.annot.bar = !self.annot.bar;
                     if !self.annot.bar {
@@ -1177,6 +1183,7 @@ impl DocView {
                     ui.separator();
                     ui.label(&self.status);
                 }
+                self.table_status_button(ui);
             });
         });
     }
@@ -1427,6 +1434,7 @@ impl DocView {
             }
         }
         self.draw_annot_overlay(painter, p);
+        self.draw_table_overlay(painter, p);
     }
 
     /// Horizontally center the current row (documents mixing portrait and
@@ -1486,7 +1494,7 @@ impl DocView {
             }
         }
 
-        let annot_consumed = self.annot_input(ui, resp);
+        let annot_consumed = if self.table.mode { self.table_input(ui, resp) } else { self.annot_input(ui, resp) };
         if !annot_consumed {
             // Pointer: pan / select / links.
             let primary_start = resp.drag_started_by(egui::PointerButton::Primary);

@@ -8,6 +8,7 @@ pub mod ocr;
 pub mod reflow;
 pub mod render;
 pub mod rich;
+pub mod table;
 pub mod text;
 
 pub use doc::{AnnotOp, AnnotResult, SaveOptions, DocClient, DocId, DocInfo, Document, LinkInfo, LinkTarget, OpenError, OutlineItem, Pending, SearchEvent, Waker};
