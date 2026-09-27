@@ -60,6 +60,8 @@ pub struct DocInfo {
     pub right_to_left: bool,
     /// `/PageLayout` name, e.g. `TwoPageRight`.
     pub page_layout: Option<String>,
+    /// Repairs applied while opening (shown to the user).
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +175,7 @@ impl Deref for Engine {
     }
 }
 
-fn open_engine(path: &Path, password: Option<&str>) -> Result<Engine, OpenError> {
+fn open_engine(path: &Path, password: Option<&str>) -> Result<(Engine, Vec<String>), OpenError> {
     let p = path.to_string_lossy();
     let mut doc = mupdf::Document::open(p.as_ref()).map_err(|e| OpenError::Failed(e.to_string()))?;
     if doc.needs_password().unwrap_or(false) {
@@ -187,10 +189,78 @@ fn open_engine(path: &Path, password: Option<&str>) -> Result<Engine, OpenError>
         }
     }
     if doc.is_pdf() {
-        PdfDocument::try_from(doc).map(Engine::Pdf).map_err(|e| OpenError::Failed(e.to_string()))
+        let mut pdf = PdfDocument::try_from(doc).map_err(|e| OpenError::Failed(e.to_string()))?;
+        let mut notes = Vec::new();
+        if pdf.page_count().unwrap_or(0) <= 0 {
+            match rebuild_page_tree(&mut pdf) {
+                Ok(n) if n > 0 => notes.push(format!("ページツリーが壊れていたため、残存する {n} ページから再構築しました")),
+                Ok(_) => {}
+                Err(e) => notes.push(format!("ページツリーの再構築に失敗しました: {e}")),
+            }
+        }
+        Ok((Engine::Pdf(pdf), notes))
     } else {
-        Ok(Engine::Other(doc))
+        Ok((Engine::Other(doc), Vec::new()))
     }
+}
+
+/// When the page tree is lost (truncated or corrupted file) but page objects
+/// survive, rebuild a flat page tree from every `/Type /Page` object, in object
+/// number order. The change lives only in memory.
+fn rebuild_page_tree(pdf: &mut PdfDocument) -> Result<usize, mupdf::Error> {
+    use mupdf::pdf::PdfObject;
+    let is_name = |o: &PdfObject, key: &str, v: &[u8]| {
+        o.get_dict(key).ok().flatten().and_then(|t| t.as_name().ok()).as_deref() == Some(v)
+    };
+    let n = pdf.xref_len()? as i32;
+    let mut pages = Vec::new();
+    let mut default_box = None;
+    for i in 1..n {
+        let Ok(Some(o)) = pdf.xref_object(i) else { continue };
+        if o.is_dict().unwrap_or(false) && is_name(&o, "Type", b"Page") {
+            if default_box.is_none() {
+                default_box = o.get_dict("MediaBox").ok().flatten();
+            }
+            pages.push(i);
+        }
+    }
+    if pages.is_empty() {
+        return Ok(0);
+    }
+    let mut tree = pdf.new_dict()?;
+    tree.dict_put("Type", PdfObject::new_name("Pages")?)?;
+    let tree_ref = pdf.add_object(&tree)?;
+    let mut kids = pdf.new_array()?;
+    for &i in &pages {
+        let r = pdf.new_indirect(i, 0)?;
+        if let Some(mut page) = r.resolve()? {
+            page.dict_put("Parent", tree_ref.try_clone()?)?;
+            if page.get_dict_inheritable("MediaBox")?.is_none() {
+                let mb = match &default_box {
+                    Some(b) => b.try_clone()?,
+                    None => pdf.new_object_from_str("[0 0 595 842]")?,
+                };
+                page.dict_put("MediaBox", mb)?;
+            }
+        }
+        kids.array_push(r)?;
+    }
+    if let Some(mut t) = tree_ref.resolve()? {
+        t.dict_put("Kids", kids)?;
+        t.dict_put("Count", PdfObject::new_int(pages.len() as i32)?)?;
+    }
+    let catalog = pdf.catalog().ok().filter(|c| c.is_dict().unwrap_or(false));
+    match catalog {
+        Some(mut c) => c.dict_put("Pages", tree_ref)?,
+        None => {
+            let mut c = pdf.new_dict()?;
+            c.dict_put("Type", PdfObject::new_name("Catalog")?)?;
+            c.dict_put("Pages", tree_ref)?;
+            let cref = pdf.add_object(&c)?;
+            pdf.trailer()?.dict_put("Root", cref)?;
+        }
+    }
+    Ok(pages.len())
 }
 
 fn page_size(doc: &mupdf::Document, page: i32) -> Option<SizeF> {
@@ -268,14 +338,15 @@ impl Document {
         thread::Builder::new()
             .name(format!("strata-doc-{}", id.0))
             .spawn(move || {
-                let eng = match open_engine(&path_buf, pw.as_deref()) {
+                let (eng, notes) = match open_engine(&path_buf, pw.as_deref()) {
                     Ok(e) => e,
                     Err(e) => {
                         let _ = init_tx.send(Err(e));
                         return;
                     }
                 };
-                let info = read_info(&path_buf, &eng);
+                let mut info = read_info(&path_buf, &eng);
+                info.notes = notes;
                 let first = page_size(&eng, 0).unwrap_or(SizeF { w: 595.0, h: 842.0 });
                 if init_tx.send(Ok((info, first))).is_err() {
                     return;
@@ -354,7 +425,7 @@ impl Document {
             .name(format!("strata-search-{}", self.id.0))
             .spawn(move || {
                 let eng = match open_engine(&sh.path, sh.password.as_deref()) {
-                    Ok(e) => e,
+                    Ok((e, _)) => e,
                     Err(e) => {
                         let _ = tx.send(SearchEvent::Error(e.to_string()));
                         (sh.waker)();
@@ -392,7 +463,7 @@ impl Document {
 }
 
 fn scan_sizes(sh: Arc<Shared>) {
-    let Ok(eng) = open_engine(&sh.path, sh.password.as_deref()) else { return };
+    let Ok((eng, _)) = open_engine(&sh.path, sh.password.as_deref()) else { return };
     let n = sh.sizes.read().len();
     let mut batch: Vec<SizeF> = Vec::new();
     let mut batch_start = 1;

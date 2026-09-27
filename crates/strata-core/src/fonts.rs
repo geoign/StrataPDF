@@ -144,6 +144,16 @@ pub fn install() {
     mupdf::set_font_loader(IndexedFontLoader::default());
 }
 
+/// First installed face matching one of `names` (any language), as (file, face index).
+/// Blocks until the index is built.
+pub fn find_face(names: &[&str]) -> Option<(PathBuf, u32)> {
+    let idx = index();
+    names.iter().find_map(|n| {
+        let f = IndexedFontLoader::pick(idx.by_name.get(&normalize(n))?, false, false);
+        Some((f.path.to_path_buf(), f.index))
+    })
+}
+
 #[derive(Default)]
 pub struct IndexedFontLoader {
     data: Mutex<HashMap<Arc<Path>, Arc<Vec<u8>>>>,

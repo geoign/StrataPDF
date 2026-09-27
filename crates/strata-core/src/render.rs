@@ -236,3 +236,42 @@ fn render_tile(dl: &DisplayList, key: TileKey) -> Result<(u32, u32, Vec<u8>), St
     }
     Ok((w as u32, h as u32, rgba))
 }
+
+/// Render a whole page to packed RGB (3 bytes per pixel, no padding) at `scale`
+/// px per point, optionally rotated 90° clockwise. Used for printing and export.
+pub fn render_page_rgb(dl: &DisplayList, scale: f32, rotate90: bool) -> Result<(u32, u32, Vec<u8>), String> {
+    let b = dl.bounds();
+    let (w, h) = ((b.x1 - b.x0) * scale, (b.y1 - b.y0) * scale);
+    // Page space -> device: translate to origin, scale, then optionally rotate by 90°.
+    let ctm = if rotate90 {
+        // (x, y) -> (h - y, x) after scaling
+        Matrix::new(0.0, scale, -scale, 0.0, h + b.y0 * scale, -b.x0 * scale)
+    } else {
+        Matrix::new(scale, 0.0, 0.0, scale, -b.x0 * scale, -b.y0 * scale)
+    };
+    let (dw, dh) = if rotate90 { (h, w) } else { (w, h) };
+    let irect = IRect { x0: 0, y0: 0, x1: dw.ceil() as i32, y1: dh.ceil() as i32 };
+    let e = |e: mupdf::Error| e.to_string();
+    let mut pix = Pixmap::new_with_rect(&Colorspace::device_rgb(), irect, false).map_err(e)?;
+    pix.clear_with(255).map_err(e)?;
+    {
+        let dev = Device::from_pixmap(&pix).map_err(e)?;
+        dl.run(&dev, &ctm, Rect { x0: 0.0, y0: 0.0, x1: irect.x1 as f32, y1: irect.y1 as f32 }).map_err(e)?;
+    }
+    let (pw, ph) = (irect.x1 as usize, irect.y1 as usize);
+    let stride = pix.stride() as usize;
+    let n = pix.n() as usize;
+    let src = pix.samples();
+    let mut out = Vec::with_capacity(pw * ph * 3);
+    for y in 0..ph {
+        let row = &src[y * stride..y * stride + pw * n];
+        if n == 3 {
+            out.extend_from_slice(row);
+        } else {
+            for px in row.chunks_exact(n) {
+                out.extend_from_slice(&px[..3]);
+            }
+        }
+    }
+    Ok((pw as u32, ph as u32, out))
+}

@@ -10,7 +10,8 @@ fn main() {
     let needle = std::env::args().nth(2);
     let waker: strata_core::Waker = Arc::new(|| {});
     let t0 = Instant::now();
-    let doc = Document::open(path.as_ref(), None, waker.clone()).expect("open");
+    let pw = std::env::var("STRATA_PW").ok();
+    let doc = match Document::open(path.as_ref(), pw, waker.clone()) { Ok(d) => d, Err(e) => { println!("open error: {e}"); return; } };
     let info = doc.info().clone();
     println!("open {:?}: pages={} format={} enc='{}' r2l={} layout={:?}", t0.elapsed(), info.page_count, info.format, info.encryption, info.right_to_left, info.page_layout);
 
