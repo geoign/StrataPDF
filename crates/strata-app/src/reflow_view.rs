@@ -66,9 +66,10 @@ const JS_BRIDGE: &str = r#"
 "#;
 
 impl ReflowPane {
-    pub fn start(doc: &Document) -> ReflowPane {
+    pub fn start(doc: &Document, formula: Option<Arc<dyn strata_ocr::formula::FormulaEngine>>) -> ReflowPane {
         let cancel = Arc::new(AtomicBool::new(false));
-        let rx = doc.reflow(ReflowOptions::default(), cancel.clone());
+        let opts = ReflowOptions { formula, ..ReflowOptions::default() };
+        let rx = doc.reflow(opts, cancel.clone());
         let (msg_tx, msg_rx) = unbounded();
         ReflowPane {
             rx: Some(rx),

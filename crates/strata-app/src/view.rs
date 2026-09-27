@@ -71,6 +71,8 @@ pub struct Services<'a> {
     /// A popup or dialog covers the UI: native child windows must hide.
     pub overlay: bool,
     pub ocr: &'a mut crate::ocr_ui::OcrManager,
+    /// Convert display formulas to LaTeX in the text view.
+    pub latex: bool,
 }
 
 struct OcrJob {
@@ -189,6 +191,8 @@ pub struct DocView {
     ocr_job: Option<OcrJob>,
     /// OCR asked for; starts once the engine is loaded.
     ocr_request: Option<strata_core::ocr::OcrScope>,
+    /// The current reflow was built with the formula engine.
+    reflow_has_latex: bool,
 }
 
 impl DocView {
@@ -237,6 +241,7 @@ impl DocView {
             requests: Vec::new(),
             ocr_job: None,
             ocr_request: None,
+            reflow_has_latex: false,
         }
     }
 
@@ -710,7 +715,7 @@ impl DocView {
             ViewMode::Reflow => {
                 let page = self.current_page() + 1;
                 let doc = self.doc.clone();
-                self.reflow.get_or_insert_with(|| ReflowPane::start(&doc)).goto_page(page);
+                self.reflow.get_or_insert_with(|| ReflowPane::start(&doc, None)).goto_page(page);
             }
             ViewMode::Pdf => {
                 if let Some(r) = &mut self.reflow {
@@ -732,8 +737,27 @@ impl DocView {
         }
     }
 
+    fn rebuild_reflow(&mut self, formula: Option<Arc<dyn strata_ocr::formula::FormulaEngine>>) {
+        let doc = self.doc.clone();
+        let at = self.reflow.as_ref().map(|r| r.at_page).unwrap_or(self.current_page() + 1);
+        self.reflow_has_latex = formula.is_some();
+        let mut pane = ReflowPane::start(&doc, formula);
+        pane.goto_page(at);
+        if let Some(old) = &mut self.reflow {
+            old.hide();
+        }
+        self.reflow = Some(pane);
+    }
+
     fn reflow_ui(&mut self, ui: &mut Ui, svc: &mut Services) {
         svc.pool.remove_view(self.id);
+        // Formula recognition: rebuild once the engine is available.
+        if svc.latex && !self.reflow_has_latex {
+            let has_formulas = self.reflow.as_ref().and_then(|r| r.doc.as_ref()).is_some_and(|d| d.nodes.iter().any(|n| matches!(n, strata_core::reflow::Node::Formula { .. })));
+            if has_formulas && let Some(f) = svc.ocr.formula.engine(ui.ctx()) {
+                self.rebuild_reflow(Some(f));
+            }
+        }
         self.reflow_toolbar(ui);
         self.status_bar(ui);
         let ctx = ui.ctx().clone();
@@ -828,14 +852,8 @@ impl DocView {
                 self.status = if n == 0 { "OCR が必要なページはありませんでした".into() } else { format!("OCR 完了：{n} ページ") };
                 // Rebuild the reflowed text with the new OCR results.
                 if self.reflow.is_some() {
-                    let doc = self.doc.clone();
-                    let at = self.reflow.as_ref().map(|r| r.at_page).unwrap_or(1);
-                    let mut pane = ReflowPane::start(&doc);
-                    pane.goto_page(at);
-                    if let Some(old) = &mut self.reflow {
-                        old.hide();
-                    }
-                    self.reflow = Some(pane);
+                    let f = if svc.latex { svc.ocr.formula.ready() } else { None };
+                    self.rebuild_reflow(f);
                 }
             }
             Some(Err(e)) => self.status = format!("OCR エラー: {e}"),

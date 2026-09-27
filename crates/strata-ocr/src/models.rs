@@ -56,8 +56,24 @@ fn ndl_file(path: &str, name: &str, sha256: &str, size: u64) -> ModelFile {
     }
 }
 
+const MFR_REV: &str = "1cef9f0bdcd6a4c63df7de1311fb0894593340cc";
+
+fn mfr_file(name: &str, sha256: &str, size: u64) -> ModelFile {
+    ModelFile { name: name.into(), url: format!("https://huggingface.co/breezedeus/pix2text-mfr-1.5/resolve/{MFR_REV}/{name}"), sha256: sha256.into(), size }
+}
+
 pub fn builtin_sets() -> Vec<ModelSet> {
     vec![ModelSet {
+        id: "pix2text-mfr-1.5".into(),
+        title: "Pix2Text MFR 1.5（数式を LaTeX に変換）".into(),
+        license: "MIT".into(),
+        source: "https://huggingface.co/breezedeus/pix2text-mfr-1.5".into(),
+        files: vec![
+            mfr_file("encoder_model.onnx", "080a3f660f08bc9ebcacdd96e34be6b6400f8c7e62d7cd0dd8251badc37f610b", 87510770),
+            mfr_file("decoder_model.onnx", "917deb98e91a0453c5f234f58a0f32f9fb037de8527c7eb4ed394daf9e692f2a", 32026253),
+            mfr_file("tokenizer.json", "4ffbeb2143e6a38324bb6111b7a8109530d38a076a8439aa5777535f0a32758a", 113168),
+        ],
+    }, ModelSet {
         id: "ndlocr-lite-202604".into(),
         title: "NDLOCR-Lite（国立国会図書館）日本語・縦書き対応".into(),
         license: "CC BY 4.0".into(),

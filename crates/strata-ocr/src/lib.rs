@@ -9,6 +9,7 @@
 //! Remote engines (an HTTP VLM endpoint, cloud APIs) are a planned extension:
 //! they only need another `OcrEngine` implementation.
 
+pub mod formula;
 pub mod models;
 pub mod ndl;
 mod order;

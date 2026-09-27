@@ -25,7 +25,7 @@ use crate::render::render_region_png;
 use crate::rich::{RichBlock, RichLine, RichPage, reflow_flags};
 use crate::text::FontInfo;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReflowOptions {
     pub strip_headers: bool,
     /// Pixels per point for figure/table crops.
@@ -34,11 +34,13 @@ pub struct ReflowOptions {
     pub formula_scale: f32,
     /// Drop furigana (ruby) lines in Japanese text.
     pub drop_ruby: bool,
+    /// Converts display formulas to LaTeX when set.
+    pub formula: Option<std::sync::Arc<dyn strata_ocr::formula::FormulaEngine>>,
 }
 
 impl Default for ReflowOptions {
     fn default() -> Self {
-        ReflowOptions { strip_headers: true, image_scale: 2.0, formula_scale: 3.0, drop_ruby: true }
+        ReflowOptions { strip_headers: true, image_scale: 2.0, formula_scale: 3.0, drop_ruby: true, formula: None }
     }
 }
 
@@ -67,7 +69,7 @@ pub enum Node {
     Figure { image: usize, caption: Vec<Span> },
     /// Tables are kept as an image plus their raw text lines.
     Table { image: usize, caption: Vec<Span>, rows: Vec<String> },
-    Formula { image: usize, text: String, latex: Option<String> },
+    Formula { image: usize, text: String, latex: Option<String>, number: Option<String> },
     /// Footnote text, kept where it appears but skipped when joining paragraphs.
     Footnote { spans: Vec<Span> },
     /// Whole page as an image: no usable text layer (see [`needs_ocr`]).
@@ -460,6 +462,10 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                                 return false;
                             }
                         }
+                        // Rotated text (margin stamps such as arXiv identifiers).
+                        if !l.vertical && l.dir[1].abs() > 0.5 {
+                            return false;
+                        }
                         if opts.drop_ruby && line_size(l) < body * 0.6 && l.chars.iter().all(|c| matches!(c.c as u32, 0x3040..=0x30FF) || c.c.is_whitespace()) {
                             return false;
                         }
@@ -663,6 +669,54 @@ fn continues(prev: &str, next: &str) -> bool {
     first.is_lowercase() || is_cjk(first) || first.is_ascii_digit() || matches!(first, ',' | ';' | '(' | '、')
 }
 
+fn math_fraction(u: &Unit, fonts: &[FontInfo]) -> f32 {
+    u.frac(|c| (is_math_char(c.c) || fonts.get(c.font as usize).is_some_and(|f| is_math_font(&f.name))) && c.c != '•')
+}
+
+/// Ends with an equation number such as "(12)" or "(3a)".
+fn has_equation_number(t: &str) -> bool {
+    let t = t.trim_end();
+    t.ends_with(')')
+        && t.rfind('(').is_some_and(|i| {
+            let n = &t[i + 1..t.len() - 1];
+            !n.is_empty() && n.len() <= 5 && n.chars().any(|c| c.is_ascii_digit()) && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+        })
+}
+
+/// A display formula is often extracted as several fragments (numerator,
+/// radical sign, denominator, equation number). Merge consecutive math-like
+/// fragments that sit on neighbouring lines into one unit.
+fn merge_display_math(units: Vec<Unit>, fonts: &[FontInfo], body: f32) -> Vec<Unit> {
+    let mathish = |u: &Unit| {
+        if u.kind != UnitKind::Text || u.lines.len() > 4 {
+            return false;
+        }
+        let t = u.text();
+        let tiny = t.trim().chars().count() <= 4 && t.chars().any(|c| is_math_char(c) || "√∑∫∏()".contains(c));
+        math_fraction(u, fonts) >= 0.2 || tiny || (has_equation_number(&t) && t.chars().count() < 80)
+    };
+    let mut out: Vec<Unit> = Vec::with_capacity(units.len());
+    let mut prev_math = false;
+    for u in units {
+        let m = mathish(&u);
+        if m
+            && prev_math
+            && let Some(last) = out.last_mut()
+        {
+            let gap = u.bbox.y0 - last.bbox.y1;
+            let overlap_x = u.bbox.x0 < last.bbox.x1 + body * 4.0 && u.bbox.x1 > last.bbox.x0 - body * 4.0;
+            if gap < body * 1.6 && overlap_x {
+                last.bbox = last.bbox.union(&u.bbox);
+                last.lines.extend(u.lines);
+                continue;
+            }
+        }
+        prev_math = m;
+        out.push(u);
+    }
+    out
+}
+
 /// Top and bottom of the body text columns on a vertical page.
 fn vertical_text_area(units: &[Unit], body: f32) -> (f32, f32) {
     let cols = units.iter().filter(|u| u.kind == UnitKind::Text && u.lines.iter().all(|l| l.vertical) && (u.size() - body).abs() <= body * 0.15);
@@ -746,6 +800,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
             if let Some(u) = slots[i].take() {
                 ordered.push(u);
             }
+        }
+        if !vertical {
+            ordered = merge_display_math(ordered, &p.rich.fonts, body);
         }
         doc.nodes.push(Node::PageStart { page: p.page });
         let dl = eng.load_page(p.page as i32).and_then(|pg| pg.to_display_list(true)).ok();
@@ -838,14 +895,52 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                 }
                 None => {}
             }
-            let math = u.frac(|c| (is_math_char(c.c) || p.rich.fonts.get(c.font as usize).is_some_and(|f| is_math_font(&f.name))) && c.c != '•');
+            let math = math_fraction(u, &p.rich.fonts);
             let short = text.chars().count() < 160 && u.lines.len() <= 3;
             let bold = u.frac(|c| c.bold || p.rich.fonts.get(c.font as usize).is_some_and(|f| f.bold || f.name.to_ascii_lowercase().contains("bold")));
             let italic = u.frac(|c| p.rich.fonts.get(c.font as usize).is_some_and(|f| f.italic || f.name.to_ascii_lowercase().contains("italic")));
             let numbered = numbered_heading_depth(&text);
-            if !vertical && math >= 0.35 && u.lines.len() <= 6 && u.chars() >= 3 {
+            // Words set in text fonts mean prose with inline math, not a display formula.
+            // Only lowercase words count: operator names such as "MultiHead" or
+            // "Concat" are capitalised.
+            let prose_words = {
+                let mut words = 0;
+                for l in &u.lines {
+                    let (mut run, mut lower_start) = (0, false);
+                    for c in &l.chars {
+                        let text_font = !p.rich.fonts.get(c.font as usize).is_some_and(|f| is_math_font(&f.name));
+                        if c.c.is_ascii_alphabetic() && text_font {
+                            if run == 0 {
+                                lower_start = c.c.is_ascii_lowercase();
+                            }
+                            run += 1;
+                        } else {
+                            words += (run >= 3 && lower_start) as usize;
+                            run = 0;
+                        }
+                    }
+                    words += (run >= 3 && lower_start) as usize;
+                }
+                words
+            };
+            let display_math = (prose_words < 4 && (math >= 0.35 || (math >= 0.12 && has_equation_number(&text) && text.chars().count() < 160)))
+                || (prose_words <= 1 && math >= 0.2 && u.lines.len() <= 4);
+            if !vertical && display_math && u.lines.len() <= 8 && u.chars() >= 3 {
                 if let Some(img) = crop(u.bbox, opts.formula_scale, &mut doc) {
-                    doc.nodes.push(Node::Formula { image: img, text: text.clone(), latex: None });
+                    let (latex, number) = match &opts.formula {
+                        Some(f) => {
+                            let png = &doc.images[img].png;
+                            match image::load_from_memory(png).map(|i| i.to_rgb8()).ok().and_then(|i| f.to_latex(&i).ok()) {
+                                Some(l) if !l.is_empty() => {
+                                    let (body, num) = strata_ocr::formula::split_equation_number(&l);
+                                    (Some(body), num)
+                                }
+                                _ => (None, None),
+                            }
+                        }
+                        None => (None, None),
+                    };
+                    doc.nodes.push(Node::Formula { image: img, text: text.clone(), latex, number });
                 }
                 i += 1;
                 continue;
@@ -898,12 +993,27 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                 }
             }
             if let Some(level) = level {
-                let spans = spans.into_iter().map(|mut s| {
-                    s.style.bold = false;
-                    s.style.italic = false;
-                    s
-                });
-                doc.nodes.push(Node::Heading { level: level as u8, spans: spans.collect() });
+                let spans: Vec<Span> = spans
+                    .into_iter()
+                    .map(|mut s| {
+                        s.style.bold = false;
+                        s.style.italic = false;
+                        s
+                    })
+                    .collect();
+                // "3.2.1" and its title extracted as separate blocks.
+                if let Some(Node::Heading { level: pl, spans: ps }) = doc.nodes.last_mut()
+                    && spans_text(ps).trim().chars().all(|c| c.is_ascii_digit() || c == '.')
+                {
+                    let num = spans_text(ps).trim().trim_end_matches('.').to_string();
+                    let depth = num.split('.').filter(|s| !s.is_empty()).count() as u8;
+                    *pl = (depth + 1).clamp(2, 6);
+                    ps.clear();
+                    ps.push(Span { text: format!("{num} "), style: Style::default(), link: None });
+                    ps.extend(spans);
+                } else {
+                    doc.nodes.push(Node::Heading { level: level as u8, spans });
+                }
             } else if is_list_marker(&text) {
                 doc.nodes.push(Node::ListItem { spans });
             } else if !vertical && size <= body * 0.92 && u.bbox.y0 > p.rich.height * 0.6 && u.lines.len() <= 8 {

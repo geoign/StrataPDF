@@ -163,8 +163,11 @@ pub fn to_markdown(doc: &ReflowDoc, image_path: &dyn Fn(&ReflowImage) -> String)
             Node::PageImage { image, reason } => {
                 o.push_str(&format!("> [!NOTE]\n> {reason}。OCR するまで画像で表示しています。\n\n![page]({})\n\n", image_path(&doc.images[*image])));
             }
-            Node::Formula { image, text, latex } => match latex {
-                Some(l) => o.push_str(&format!("$$\n{l}\n$$\n\n")),
+            Node::Formula { image, text, latex, number } => match latex {
+                Some(l) => match number {
+                    Some(n) => o.push_str(&format!("$$\n{l} \\tag{{{n}}}\n$$\n\n")),
+                    None => o.push_str(&format!("$$\n{l}\n$$\n\n")),
+                },
                 None => o.push_str(&format!("![{}]({})\n\n", text.replace(['[', ']', '\n'], " ").trim(), image_path(&doc.images[*image]))),
             },
         }
@@ -190,7 +193,9 @@ figcaption { color: var(--muted); font-size: .9em; text-align: left; margin-top:
 figure.table figcaption { margin: 0 0 .5em; }
 details { text-align: left; font-size: .85em; color: var(--muted); margin-top: .4em; }
 details pre { white-space: pre-wrap; background: var(--card); padding: .8em; border-radius: 4px; }
-.formula { text-align: center; margin: 1.2em 0; }
+.formula { text-align: center; margin: 1.2em 0; position: relative; overflow-x: auto; }
+.formula math { font-size: 1.1em; }
+.eqno { position: absolute; right: 0; top: 50%; transform: translateY(-50%); color: var(--muted); }
 p.fn { font-size: .82em; color: var(--muted); border-top: 1px solid var(--rule); padding-top: .4em; }
 .note { font: 13px "Segoe UI", "Yu Gothic UI", sans-serif; color: var(--muted); border-left: 3px solid #e0a030; padding: .3em .7em; margin-bottom: .6em; text-align: left; }
 .formula img { max-width: 100%; }
@@ -303,10 +308,15 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
                     img.width / 2
                 ));
             }
-            Node::Formula { image, text, latex } => {
+            Node::Formula { image, text, latex, number } => {
                 let img = &doc.images[*image];
-                match latex {
-                    Some(l) => h.push_str(&format!("<div class=\"formula\" data-latex=\"{}\">{}</div>\n", esc_html(l), crate::reflow::output::latex_fallback(l))),
+                let num = number.as_ref().map(|n| format!("<span class=\"eqno\">({})</span>", esc_html(n))).unwrap_or_default();
+                match latex.as_ref().and_then(|l| latex_to_mathml(l).map(|m| (l, m))) {
+                    Some((l, m)) => h.push_str(&format!(
+                        "<div class=\"formula\" data-latex=\"{}\" title=\"LaTeX: {}\">{m}{num}</div>\n",
+                        esc_html(l),
+                        esc_html(l)
+                    )),
                     None => h.push_str(&format!("<div class=\"formula\"><img src=\"{}\" width=\"{}\" alt=\"{}\"></div>\n", esc_html(&(o.image_src)(img)), img.width / 3, esc_html(text))),
                 }
             }
@@ -321,7 +331,11 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
     h
 }
 
-/// Until formula rendering lands (M3), show LaTeX source.
-pub fn latex_fallback(l: &str) -> String {
-    format!("<code>{}</code>", esc_html(l))
+/// LaTeX to MathML Core (rendered natively by Chromium/WebView2).
+pub fn latex_to_mathml(latex: &str) -> Option<String> {
+    use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
+    thread_local! {
+        static CONV: Option<LatexToMathML> = LatexToMathML::new(MathCoreConfig::default()).ok();
+    }
+    CONV.with(|c| c.as_ref()?.convert_with_local_state(latex, MathDisplay::Block).ok().map(|r| r.mathml))
 }

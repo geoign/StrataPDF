@@ -10,7 +10,12 @@ fn main() {
     std::fs::create_dir_all(out.join("images")).unwrap();
     let doc = Document::open(path.as_ref(), std::env::var("STRATA_PW").ok(), Arc::new(|| {})).unwrap();
     let t = std::time::Instant::now();
-    let rx = doc.reflow(ReflowOptions::default(), Arc::new(AtomicBool::new(false)));
+    let mut opts = ReflowOptions::default();
+    if std::env::var("FORMULA").is_ok() {
+        let set = strata_ocr::models::set("pix2text-mfr").unwrap();
+        opts.formula = Some(Arc::new(strata_ocr::formula::Pix2TextMfr::load(&set).unwrap()));
+    }
+    let rx = doc.reflow(opts, Arc::new(AtomicBool::new(false)));
     for ev in rx {
         match ev {
             ReflowEvent::Progress { .. } => {}

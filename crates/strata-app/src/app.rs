@@ -35,11 +35,13 @@ pub struct Settings {
     /// GPU memory for cached tiles.
     pub tile_budget_mb: usize,
     pub ocr_device: strata_core::ocr::Device,
+    /// Convert display formulas to LaTeX in the text view.
+    pub formula_latex: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu }
+        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true }
     }
 }
 
@@ -404,8 +406,10 @@ impl StrataApp {
                     ui.radio_value(&mut d, strata_core::ocr::Device::Cpu, "CPU");
                     if d != self.settings.ocr_device {
                         self.settings.ocr_device = d;
-                        self.ocr.device = d;
-                        self.ocr.reset();
+                        self.ocr.set_device(d);
+                    }
+                    if ui.checkbox(&mut self.settings.formula_latex, "テキスト表示で数式を LaTeX に変換").on_hover_text("Pix2Text MFR（約 120 MB、初回ダウンロード）").changed() && self.settings.formula_latex {
+                        self.ocr.formula.declined = false;
                     }
                     ui.separator();
                     if ui.checkbox(&mut self.fullscreen, "全画面 (F11)").changed() {
@@ -610,6 +614,7 @@ struct Viewer<'a> {
     theme: strata_core::reflow::output::Theme,
     overlay: bool,
     ocr: &'a mut crate::ocr_ui::OcrManager,
+    latex: bool,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -634,6 +639,7 @@ impl TabViewer for Viewer<'_> {
             theme: self.theme,
             overlay: self.overlay,
             ocr: &mut *self.ocr,
+            latex: self.latex,
         };
         tab.ui(ui, &mut svc);
     }
@@ -724,7 +730,7 @@ impl eframe::App for StrataApp {
                 ThemeChoice::Light => strata_core::reflow::output::Theme::Light,
                 ThemeChoice::Dark => strata_core::reflow::output::Theme::Dark,
             };
-            let overlay = ctx.any_popup_open() || self.ocr.status().is_some() || self.ocr.waiting && !self.ocr.is_ready() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
+            let overlay = ctx.any_popup_open() || self.ocr.dialog_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
             let mut viewer = Viewer {
                 pool: &self.pool,
                 tiles: &mut self.tiles,
@@ -736,6 +742,7 @@ impl eframe::App for StrataApp {
                 theme,
                 overlay,
                 ocr: &mut self.ocr,
+                latex: self.settings.formula_latex,
             };
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                 DockArea::new(&mut self.dock)

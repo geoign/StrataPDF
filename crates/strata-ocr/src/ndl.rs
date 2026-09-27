@@ -71,7 +71,7 @@ pub struct NdlOcr {
     pub device_used: Device,
 }
 
-fn session(path: &Path, device: Device) -> Result<(Session, Device), OcrError> {
+pub(crate) fn session(path: &Path, device: Device) -> Result<(Session, Device), OcrError> {
     let mut b = Session::builder()?.with_optimization_level(GraphOptimizationLevel::Level3).map_err(|e| OcrError::Inference(e.to_string()))?;
     let mut used = Device::Cpu;
     if device == Device::Gpu {
