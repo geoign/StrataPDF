@@ -218,7 +218,15 @@ impl PageText {
             }
             let first = l.chars[s].quad;
             let last = l.chars[e - 1].quad;
-            out.push(QuadF { ul: first.ul, ll: first.ll, ur: last.ur, lr: last.lr });
+            if l.vertical {
+                // Columns run top to bottom: span from the first glyph's top edge
+                // to the last glyph's bottom edge.
+                let (fb, lb) = (first.bbox(), last.bbox());
+                let (x0, x1) = (fb.x0.min(lb.x0), fb.x1.max(lb.x1));
+                out.push(QuadF { ul: [x0, fb.y0], ur: [x1, fb.y0], ll: [x0, lb.y1], lr: [x1, lb.y1] });
+            } else {
+                out.push(QuadF { ul: first.ul, ll: first.ll, ur: last.ur, lr: last.lr });
+            }
         }
         out
     }

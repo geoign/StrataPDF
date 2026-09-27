@@ -1330,6 +1330,8 @@ impl DocView {
                 painter.text(pr.center(), egui::Align2::CENTER_CENTER, format!("このページを描画できません\n{e}"), egui::FontId::proportional(13.0), Color32::DARK_RED);
             }
             self.draw_overlays(&painter, p);
+            // Prefetch the page text so the first drag already selects text.
+            let _ = self.text(p);
         }
         want_target.sort_by(|a, b| a.0.total_cmp(&b.0));
 

@@ -91,7 +91,7 @@ impl PageOcr {
     /// Text for selection and copy in the viewer.
     pub fn to_page_text(&self) -> PageText {
         let blocks = self
-            .paragraph_blocks()
+            .paragraphs(false)
             .into_iter()
             .map(|ls| {
                 let lines: Vec<TextLine> = ls
@@ -119,18 +119,30 @@ impl PageOcr {
     /// text one column per block (paragraphs are found from indents later),
     /// horizontal text at indented lines and after short lines.
     fn paragraph_blocks(&self) -> Vec<Vec<&OcrTextLine>> {
+        self.paragraphs(true)
+    }
+
+    /// Paragraphs from indents and short lines. With `split_columns`, vertical
+    /// text is returned one column per group (the reflow heuristics rejoin
+    /// columns themselves); otherwise columns are grouped into paragraphs.
+    fn paragraphs(&self, split_columns: bool) -> Vec<Vec<&OcrTextLine>> {
         let mut out = Vec::new();
         for ls in self.blocks() {
-            if ls.iter().all(|l| l.vertical) {
+            let vertical = ls.iter().all(|l| l.vertical);
+            if vertical && split_columns {
                 out.extend(ls.into_iter().map(|l| vec![l]));
                 continue;
             }
             let bb = ls.iter().skip(1).fold(ls[0].bbox, |a, l| a.union(&l.bbox));
             let mut cur: Vec<&OcrTextLine> = Vec::new();
             for l in ls {
-                let size = l.bbox.height().max(1.0);
-                let indented = l.bbox.x0 - bb.x0 > size * 0.7;
-                let prev_short = cur.last().is_some_and(|p| p.bbox.x1 < bb.x1 - size * 1.5);
+                let (indented, prev_short) = if vertical {
+                    let size = l.bbox.width().max(1.0);
+                    (l.bbox.y0 - bb.y0 > size * 0.6, cur.last().is_some_and(|p| p.bbox.y1 < bb.y1 - size * 1.5))
+                } else {
+                    let size = l.bbox.height().max(1.0);
+                    (l.bbox.x0 - bb.x0 > size * 0.7, cur.last().is_some_and(|p| p.bbox.x1 < bb.x1 - size * 1.5))
+                };
                 if !cur.is_empty() && (indented || prev_short) {
                     out.push(std::mem::take(&mut cur));
                 }
@@ -216,6 +228,13 @@ fn cache_dir() -> Option<PathBuf> {
 
 fn cache_key(path: &Path) -> Option<String> {
     use std::hash::{Hash, Hasher};
+    // The same file opened by a relative path must hit the same entry.
+    // (`canonicalize` returns a verbatim `\\?\` path on Windows; drop the prefix.)
+    let canon = std::fs::canonicalize(path).map(|p| {
+        let s = p.to_string_lossy().into_owned();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+    });
+    let path = &canon.unwrap_or_else(|_| path.to_path_buf());
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     let mut h = std::collections::hash_map::DefaultHasher::new();
