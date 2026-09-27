@@ -36,6 +36,17 @@ cargo build --release -p strata-app
 ビルド成果物は OneDrive を圧迫しないよう `C:\tmp\cargo-target\StrataPDF` に出力する
 （`.cargo/config.toml` で指定）。MuPDF の C ソースは初回だけコンパイルされ、数分かかる。
 
+## インストール（現在のユーザーのみ、管理者権限不要）
+
+```powershell
+pwsh tools\install.ps1          # ビルドして OneDrive\Apps\StrataPDF に配置し、関連付けの候補に登録
+pwsh tools\install.ps1 -NoBuild # ビルド済みのものを配置
+pwsh tools\uninstall.ps1        # 登録を解除（-RemoveFiles で配置ファイルも削除）
+```
+
+登録後、「設定 > アプリ > 既定のアプリ > StrataPDF」で .pdf の既定に選べる。Windows の仕様上、
+既定のアプリをプログラムから直接切り替えることはできない。
+
 ## 構成
 
 | パス | 内容 |
