@@ -178,6 +178,11 @@ pub(crate) fn context() -> *mut fz_context {
     Context::get().inner
 }
 
+/// StrataPDF patch: this thread's raw context, for direct `mupdf_sys` calls.
+pub fn raw_context() -> *mut fz_context {
+    context()
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Mutex;

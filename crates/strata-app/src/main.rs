@@ -4,6 +4,7 @@ mod app;
 mod instance;
 mod layout;
 mod print;
+mod reflow_view;
 mod tiles;
 mod view;
 

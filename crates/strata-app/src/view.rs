@@ -17,6 +17,7 @@ use strata_core::{
 };
 
 use crate::layout::{Layout, LayoutParams, Spread};
+use crate::reflow_view::{ReflowPane, WebMsg};
 use crate::tiles::TileCache;
 
 static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
@@ -64,6 +65,29 @@ pub struct Services<'a> {
     pub pool: &'a RenderPool,
     pub tiles: &'a mut TileCache,
     pub focused: bool,
+    pub window: Option<&'a winit::window::Window>,
+    pub web: Option<&'a mut wry::WebContext>,
+    pub theme: strata_core::reflow::output::Theme,
+    /// A popup or dialog covers the UI: native child windows must hide.
+    pub overlay: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Pdf,
+    Reflow,
+}
+
+/// Requests a view makes to the application (e.g. shortcuts typed in the webview).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewRequest {
+    CloseTab,
+    NextTab,
+    PrevTab,
+    Open,
+    Fullscreen,
+    Print,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -151,6 +175,9 @@ pub struct DocView {
     /// Navigation requested before the first layout (e.g. restored position).
     pending_goto: Option<(u32, Option<f32>)>,
     pub status: String,
+    pub mode: ViewMode,
+    reflow: Option<ReflowPane>,
+    pub requests: Vec<ViewRequest>,
 }
 
 impl DocView {
@@ -194,6 +221,9 @@ impl DocView {
             last_page: 0,
             pending_goto: None,
             status: String::new(),
+            mode: ViewMode::Pdf,
+            reflow: None,
+            requests: Vec::new(),
         }
     }
 
@@ -659,7 +689,125 @@ impl DocView {
 
     // ---------------------------------------------------------------------- ui
 
+    pub fn set_mode(&mut self, mode: ViewMode) {
+        if mode == self.mode {
+            return;
+        }
+        match mode {
+            ViewMode::Reflow => {
+                let page = self.current_page() + 1;
+                let doc = self.doc.clone();
+                self.reflow.get_or_insert_with(|| ReflowPane::start(&doc)).goto_page(page);
+            }
+            ViewMode::Pdf => {
+                if let Some(r) = &mut self.reflow {
+                    r.hide();
+                    let p = r.at_page.saturating_sub(1);
+                    self.mode = mode;
+                    self.goto_page(p, None);
+                    return;
+                }
+            }
+        }
+        self.mode = mode;
+    }
+
+    /// Hide native child windows (the tab is not visible this frame).
+    pub fn hide_native(&mut self) {
+        if let Some(r) = &mut self.reflow {
+            r.hide();
+        }
+    }
+
+    fn reflow_ui(&mut self, ui: &mut Ui, svc: &mut Services) {
+        svc.pool.remove_view(self.id);
+        self.reflow_toolbar(ui);
+        self.status_bar(ui);
+        let ctx = ui.ctx().clone();
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+            let rect = ui.available_rect_before_wrap();
+            ui.allocate_rect(rect, Sense::hover());
+            let Some(pane) = &mut self.reflow else { return };
+            if svc.overlay {
+                pane.hide();
+                ui.painter().rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+            } else {
+                pane.ui(ui, rect, svc.window, svc.web.as_deref_mut(), svc.theme);
+            }
+        });
+        let msgs = self.reflow.as_mut().map(|r| r.messages()).unwrap_or_default();
+        for m in msgs {
+            match m {
+                WebMsg::GotoPdfPage(p) => {
+                    self.set_mode(ViewMode::Pdf);
+                    self.goto_page(p.saturating_sub(1), None);
+                }
+                WebMsg::OpenUrl(u) => ctx.open_url(egui::OpenUrl::new_tab(u)),
+                WebMsg::Key(k) => match k.as_str() {
+                    "ctrl+w" | "ctrl+f4" => self.requests.push(ViewRequest::CloseTab),
+                    "ctrl+tab" => self.requests.push(ViewRequest::NextTab),
+                    "ctrl+shift+tab" => self.requests.push(ViewRequest::PrevTab),
+                    "ctrl+o" => self.requests.push(ViewRequest::Open),
+                    "f11" => self.requests.push(ViewRequest::Fullscreen),
+                    "ctrl+p" => self.requests.push(ViewRequest::Print),
+                    "ctrl+e" => self.set_mode(ViewMode::Pdf),
+                    _ => {}
+                },
+            }
+        }
+        if svc.focused && !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::E)) {
+            self.set_mode(ViewMode::Pdf);
+        }
+    }
+
+    fn mode_switch(&mut self, ui: &mut Ui) {
+        let mut m = self.mode;
+        ui.selectable_value(&mut m, ViewMode::Pdf, "PDF").on_hover_text("ページをそのまま表示");
+        ui.selectable_value(&mut m, ViewMode::Reflow, "テキスト").on_hover_text("段落をつなげて表示 (Ctrl+E)");
+        if m != self.mode {
+            self.set_mode(m);
+        }
+    }
+
+    fn reflow_toolbar(&mut self, ui: &mut Ui) {
+        egui::Panel::top(Id::new(("rtoolbar", self.id))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                self.mode_switch(ui);
+                ui.separator();
+                let ready = self.reflow.as_ref().is_some_and(|r| r.is_ready());
+                let stem = self.doc.info().path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if ui.add_enabled(ready, egui::Button::new("Markdown で保存…")).clicked()
+                    && let Some(path) = rfd::FileDialog::new().add_filter("Markdown", &["md"]).set_file_name(format!("{stem}.md")).save_file()
+                {
+                    self.status = match self.reflow.as_ref().unwrap().export_markdown(&path) {
+                        Ok(()) => format!("保存しました: {}", path.display()),
+                        Err(e) => format!("保存に失敗しました: {e}"),
+                    };
+                }
+                if ui.add_enabled(ready, egui::Button::new("HTML で保存…")).on_hover_text("画像を埋め込んだ 1 ファイルの HTML").clicked()
+                    && let Some(path) = rfd::FileDialog::new().add_filter("HTML", &["html"]).set_file_name(format!("{stem}.html")).save_file()
+                {
+                    self.status = match self.reflow.as_ref().unwrap().export_html(&path, strata_core::reflow::output::Theme::Auto) {
+                        Ok(()) => format!("保存しました: {}", path.display()),
+                        Err(e) => format!("保存に失敗しました: {e}"),
+                    };
+                }
+                if let Some(d) = self.reflow.as_ref().and_then(|r| r.doc.as_ref()) {
+                    ui.separator();
+                    let figs = d.images.len();
+                    let ocr = d.nodes.iter().filter(|n| matches!(n, strata_core::reflow::Node::PageImage { .. })).count();
+                    let extra = if ocr > 0 { format!("・要OCR {ocr} ページ") } else { String::new() };
+                    ui.weak(format!("{} 要素・画像 {figs}{extra}", d.nodes.len()));
+                }
+            });
+        });
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, svc: &mut Services) {
+        if self.mode == ViewMode::Reflow {
+            self.reflow_ui(ui, svc);
+            return;
+        }
         self.poll_search();
         if self.pending_copy {
             self.copy_selection(ui.ctx());
@@ -682,6 +830,8 @@ impl DocView {
         egui::Panel::top(Id::new(("toolbar", self.id))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
+                self.mode_switch(ui);
+                ui.separator();
                 let sb = |s: Sidebar| if s == Sidebar::None { "☰" } else { "☰" };
                 if ui.selectable_label(self.sidebar != Sidebar::None, sb(self.sidebar)).on_hover_text("サイドバー (F9)").clicked() {
                     self.sidebar = if self.sidebar == Sidebar::None { Sidebar::Thumbs } else { Sidebar::None };
@@ -1256,6 +1406,9 @@ impl DocView {
         }
         if consume(Modifiers::COMMAND, Key::F) {
             self.open_search();
+        }
+        if consume(Modifiers::COMMAND, Key::E) {
+            self.set_mode(ViewMode::Reflow);
         }
         if consume(Modifiers::COMMAND, Key::G) {
             ctx.memory_mut(|m| m.request_focus(Id::new(("page_input", self.id))));

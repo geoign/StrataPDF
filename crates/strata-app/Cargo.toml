@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 anyhow = "1"
 arboard = "3"
+base64 = "0.22"
 crossbeam-channel = "0.5"
 directories = "6"
 eframe = { version = "0.36", features = ["persistence"] }
@@ -17,8 +18,11 @@ egui_extras = "0.36"
 env_logger = "0.11.11"
 log = "0.4"
 mupdf.workspace = true
+parking_lot = "0.12"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strata-core = { version = "0.1.0", path = "../strata-core" }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_UI_Controls_Dialogs", "Win32_System_Memory", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_IO"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+wry = "0.57"

@@ -13,7 +13,7 @@ use strata_core::{DocId, DocInfo, Document, OpenError, RenderPool, ViewId, Waker
 
 use crate::layout::Spread;
 use crate::tiles::TileCache;
-use crate::view::{DocView, Fit, Services, Sidebar, ViewPrefs};
+use crate::view::{DocView, Fit, Services, Sidebar, ViewPrefs, ViewRequest};
 
 const SETTINGS_KEY: &str = "strata-settings";
 const MAX_RECENT: usize = 20;
@@ -82,6 +82,7 @@ pub struct StrataApp {
     fullscreen: bool,
     title: String,
     waker: Waker,
+    web: wry::WebContext,
 }
 
 impl StrataApp {
@@ -119,6 +120,7 @@ impl StrataApp {
             fullscreen: false,
             title: String::new(),
             waker,
+            web: wry::WebContext::new(directories::ProjectDirs::from("", "", "StrataPDF").map(|d| d.data_local_dir().join("WebView2"))),
         };
         for f in files {
             app.open(f, None);
@@ -589,6 +591,10 @@ struct Viewer<'a> {
     focused: Option<ViewId>,
     drawn: &'a mut Vec<ViewId>,
     actions: &'a mut Vec<Action>,
+    window: Option<&'a winit::window::Window>,
+    web: &'a mut wry::WebContext,
+    theme: strata_core::reflow::output::Theme,
+    overlay: bool,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -604,7 +610,15 @@ impl TabViewer for Viewer<'_> {
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut DocView) {
         self.drawn.push(tab.id);
-        let mut svc = Services { pool: self.pool, tiles: self.tiles, focused: self.focused == Some(tab.id) };
+        let mut svc = Services {
+            pool: self.pool,
+            tiles: self.tiles,
+            focused: self.focused == Some(tab.id),
+            window: self.window,
+            web: Some(&mut *self.web),
+            theme: self.theme,
+            overlay: self.overlay,
+        };
         tab.ui(ui, &mut svc);
     }
 
@@ -647,8 +661,9 @@ impl TabViewer for Viewer<'_> {
 }
 
 impl eframe::App for StrataApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let window = frame.winit_window().cloned();
         self.tiles.begin_frame();
         for t in self.pool.drain() {
             self.tiles.insert(&ctx, t);
@@ -688,7 +703,23 @@ impl eframe::App for StrataApp {
         if self.dock.iter_all_tabs().next().is_none() {
             self.welcome(ui);
         } else {
-            let mut viewer = Viewer { pool: &self.pool, tiles: &mut self.tiles, focused, drawn: &mut drawn, actions: &mut self.actions };
+            let theme = match self.settings.theme {
+                ThemeChoice::System => strata_core::reflow::output::Theme::Auto,
+                ThemeChoice::Light => strata_core::reflow::output::Theme::Light,
+                ThemeChoice::Dark => strata_core::reflow::output::Theme::Dark,
+            };
+            let overlay = ctx.any_popup_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
+            let mut viewer = Viewer {
+                pool: &self.pool,
+                tiles: &mut self.tiles,
+                focused,
+                drawn: &mut drawn,
+                actions: &mut self.actions,
+                window: window.as_deref(),
+                web: &mut self.web,
+                theme,
+                overlay,
+            };
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                 DockArea::new(&mut self.dock)
                     .id(Id::new("dock"))
@@ -698,11 +729,31 @@ impl eframe::App for StrataApp {
                     .show_inside(ui, &mut viewer);
             });
         }
-        // Hidden tabs must not keep their tile requests alive.
-        let all: Vec<ViewId> = self.dock.iter_all_tabs().map(|(_, t)| t.id).collect();
-        for id in all {
-            if !drawn.contains(&id) {
-                self.pool.remove_view(id);
+        // Hidden tabs must not keep their tile requests alive or show webviews.
+        let mut requests = Vec::new();
+        for (_, t) in self.dock.iter_all_tabs_mut() {
+            if !drawn.contains(&t.id) {
+                self.pool.remove_view(t.id);
+                t.hide_native();
+            }
+            for r in t.requests.drain(..) {
+                requests.push((t.id, r));
+            }
+        }
+        for (id, r) in requests {
+            match r {
+                ViewRequest::CloseTab => {
+                    self.focus_tab(id);
+                    self.close_focused();
+                }
+                ViewRequest::NextTab => self.cycle_tabs(1),
+                ViewRequest::PrevTab => self.cycle_tabs(-1),
+                ViewRequest::Open => self.open_dialog(),
+                ViewRequest::Fullscreen => {
+                    self.fullscreen = !self.fullscreen;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                }
+                ViewRequest::Print => self.actions.push(Action::Print(id)),
             }
         }
         self.run_actions();

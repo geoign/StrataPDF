@@ -275,3 +275,27 @@ pub fn render_page_rgb(dl: &DisplayList, scale: f32, rotate90: bool) -> Result<(
     }
     Ok((pw as u32, ph as u32, out))
 }
+
+/// Render a page-space rectangle of a display list to PNG bytes.
+pub fn render_region_png(dl: &DisplayList, region: crate::geom::RectF, scale: f32) -> Result<(u32, u32, Vec<u8>), String> {
+    let b = dl.bounds();
+    let x0 = region.x0.max(b.x0);
+    let y0 = region.y0.max(b.y0);
+    let x1 = region.x1.min(b.x1);
+    let y1 = region.y1.min(b.y1);
+    if x1 <= x0 || y1 <= y0 {
+        return Err("empty region".into());
+    }
+    let ctm = Matrix::new(scale, 0.0, 0.0, scale, -x0 * scale, -y0 * scale);
+    let irect = IRect { x0: 0, y0: 0, x1: ((x1 - x0) * scale).ceil() as i32, y1: ((y1 - y0) * scale).ceil() as i32 };
+    let e = |e: mupdf::Error| e.to_string();
+    let mut pix = Pixmap::new_with_rect(&Colorspace::device_rgb(), irect, false).map_err(e)?;
+    pix.clear_with(255).map_err(e)?;
+    {
+        let dev = Device::from_pixmap(&pix).map_err(e)?;
+        dl.run(&dev, &ctm, Rect { x0: 0.0, y0: 0.0, x1: irect.x1 as f32, y1: irect.y1 as f32 }).map_err(e)?;
+    }
+    let mut png = Vec::new();
+    pix.write_to(&mut png, mupdf::ImageFormat::PNG).map_err(e)?;
+    Ok((irect.x1 as u32, irect.y1 as u32, png))
+}

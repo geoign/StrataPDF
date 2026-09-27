@@ -3,7 +3,9 @@
 pub mod doc;
 pub mod fonts;
 pub mod geom;
+pub mod reflow;
 pub mod render;
+pub mod rich;
 pub mod text;
 
 pub use doc::{DocClient, DocId, DocInfo, Document, LinkInfo, LinkTarget, OpenError, OutlineItem, Pending, SearchEvent, Waker};

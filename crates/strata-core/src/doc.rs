@@ -160,7 +160,7 @@ impl Drop for Document {
     }
 }
 
-enum Engine {
+pub(crate) enum Engine {
     Pdf(PdfDocument),
     Other(mupdf::Document),
 }
@@ -175,7 +175,7 @@ impl Deref for Engine {
     }
 }
 
-fn open_engine(path: &Path, password: Option<&str>) -> Result<(Engine, Vec<String>), OpenError> {
+pub(crate) fn open_engine(path: &Path, password: Option<&str>) -> Result<(Engine, Vec<String>), OpenError> {
     let p = path.to_string_lossy();
     let mut doc = mupdf::Document::open(p.as_ref()).map_err(|e| OpenError::Failed(e.to_string()))?;
     if doc.needs_password().unwrap_or(false) {
@@ -383,6 +383,12 @@ impl Document {
     }
     pub fn page_count(&self) -> usize {
         self.info.page_count
+    }
+    pub(crate) fn password(&self) -> Option<String> {
+        self.shared.password.clone()
+    }
+    pub(crate) fn waker(&self) -> Waker {
+        self.shared.waker.clone()
     }
     pub fn client(&self) -> DocClient {
         DocClient { id: self.id, tx: self.tx.clone() }

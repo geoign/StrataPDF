@@ -132,6 +132,12 @@ pub struct TextPage {
 unsafe_impl_ffi_wrapper!(TextPage, fz_stext_page, fz_drop_stext_page);
 
 impl TextPage {
+    /// StrataPDF patch: raw access for walking structure/grid blocks that the
+    /// safe iterators do not expose. Valid while `self` lives.
+    pub fn as_raw(&self) -> *mut fz_stext_page {
+        self.inner.as_ptr()
+    }
+
     pub fn to_html(&self, id: i32, full: bool) -> Result<String, Error> {
         let mut buf = Buffer::with_capacity(8192);
 

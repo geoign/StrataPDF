@@ -14,3 +14,5 @@ log.workspace = true
 lru = "0.18"
 ttf-parser = "0.25"
 memmap2 = "0.9"
+mupdf-sys = { version = "0.8", default-features = false }
+unicode-normalization = "0.1"
