@@ -1,0 +1,16 @@
+[package]
+name = "strata-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mupdf.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+log.workspace = true
+lru = "0.18"
+ttf-parser = "0.25"
+memmap2 = "0.9"

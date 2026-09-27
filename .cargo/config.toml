@@ -1,0 +1,6 @@
+# Build output lives outside OneDrive (it grows to several GB).
+[build]
+target-dir = "C:/tmp/cargo-target/StrataPDF"
+
+[env]
+LIBCLANG_PATH = "C:/Program Files/LLVM/bin"

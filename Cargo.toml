@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+mupdf = { version = "0.8", default-features = false, features = [
+    "js", "xps", "svg", "cbz", "img", "html", "epub",
+    "brotli", "base14-fonts", "bundled-fonts-droid",
+] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = "line-tables-only"
+
+# Local patches to upstream crates; see vendor/PATCHES.md.
+[patch.crates-io]
+mupdf = { path = "vendor/mupdf" }
