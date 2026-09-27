@@ -22,7 +22,12 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 900.0]).with_min_inner_size([480.0, 320.0]).with_drag_and_drop(true).with_title("StrataPDF"),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 900.0])
+            .with_min_inner_size([480.0, 320.0])
+            .with_drag_and_drop(true)
+            .with_title("StrataPDF")
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/strata.png")).unwrap_or_default()),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
