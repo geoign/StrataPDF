@@ -22,6 +22,8 @@ pub const LEVELS_PER_OCTAVE: f32 = 4.0;
 pub struct TileKey {
     pub doc: DocId,
     pub page: u32,
+    /// Page edit revision: edited pages get new keys and re-render.
+    pub rev: u32,
     pub level: i16,
     pub tx: u16,
     pub ty: u16,

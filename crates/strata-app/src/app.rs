@@ -58,6 +58,7 @@ struct PasswordPrompt {
 }
 
 enum Action {
+    ConfirmClose(ViewId),
     DuplicateRight(ViewId),
     MoveRight(ViewId),
     MoveDown(ViewId),
@@ -87,6 +88,12 @@ pub struct StrataApp {
     waker: Waker,
     web: wry::WebContext,
     ocr: crate::ocr_ui::OcrManager,
+    /// Tab awaiting a decision about unsaved changes.
+    confirm_close: Option<ViewId>,
+    /// Window close requested while documents have unsaved changes.
+    confirm_quit: bool,
+    allow_quit: bool,
+    quit_after_save: bool,
 }
 
 impl StrataApp {
@@ -126,6 +133,10 @@ impl StrataApp {
             title: String::new(),
             waker,
             ocr: crate::ocr_ui::OcrManager::new(settings_device),
+            confirm_close: None,
+            confirm_quit: false,
+            allow_quit: false,
+            quit_after_save: false,
             web: wry::WebContext::new(directories::ProjectDirs::from("", "", "StrataPDF").map(|d| d.data_local_dir().join("WebView2"))),
         };
         for f in files {
@@ -223,7 +234,17 @@ impl StrataApp {
     }
 
     fn close_focused(&mut self) {
-        let Some(id) = self.focused_view().map(|v| v.id) else { return };
+        let Some((id, doc, dirty)) = self.focused_view().map(|v| (v.id, v.doc_id(), v.dirty())) else { return };
+        // Ask only when this is the last tab showing the edited document.
+        let views_of_doc = self.dock.iter_all_tabs().filter(|(_, t)| t.doc_id() == doc).count();
+        if dirty && views_of_doc == 1 {
+            self.confirm_close = Some(id);
+            return;
+        }
+        self.close_tab(id);
+    }
+
+    fn close_tab(&mut self, id: ViewId) {
         if let Some(tp) = self.tab_path(id)
             && let Some(mut v) = self.dock.remove_tab(tp)
         {
@@ -263,6 +284,7 @@ impl StrataApp {
                         self.split_into(tp, tab, right);
                     }
                 }
+                Action::ConfirmClose(id) => self.confirm_close = Some(id),
                 Action::Properties(id) => {
                     self.props = self.dock.iter_all_tabs().find(|(_, t)| t.id == id).map(|(_, t)| t.doc.info().clone());
                 }
@@ -625,7 +647,7 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn title(&mut self, tab: &mut DocView) -> WidgetText {
-        tab.title.clone().into()
+        if tab.dirty() { format!("● {}", tab.title).into() } else { tab.title.clone().into() }
     }
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut DocView) {
@@ -673,6 +695,10 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn on_close(&mut self, tab: &mut DocView) -> OnCloseResponse {
+        if tab.dirty() {
+            self.actions.push(Action::ConfirmClose(tab.id));
+            return OnCloseResponse::Ignore;
+        }
         tab.close(self.pool);
         OnCloseResponse::Close
     }
@@ -783,6 +809,7 @@ impl eframe::App for StrataApp {
         self.run_actions();
         self.gc_documents();
         self.dialogs(&ctx);
+        self.unsaved_dialogs(&ctx);
         if let Some(e) = self.ocr.ui(&ctx) {
             self.errors.push(e);
         }
@@ -792,6 +819,104 @@ impl eframe::App for StrataApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
+    }
+}
+
+impl StrataApp {
+    fn unsaved_dialogs(&mut self, ctx: &egui::Context) {
+        // Window close with unsaved changes.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit && self.dock.iter_all_tabs().any(|(_, t)| t.dirty()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_quit = true;
+        }
+        if self.confirm_quit {
+            let names: Vec<String> = {
+                let mut seen = HashSet::new();
+                self.dock.iter_all_tabs().filter(|(_, t)| t.dirty() && seen.insert(t.doc_id())).map(|(_, t)| t.title.clone()).collect()
+            };
+            let mut choice = None;
+            egui::Modal::new(Id::new("confirm-quit")).show(ctx, |ui| {
+                ui.heading("保存していない注釈があります");
+                for n in &names {
+                    ui.label(format!("・{n}"));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("すべて上書き保存して終了").clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.button("保存せずに終了").clicked() {
+                        choice = Some(2);
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        choice = Some(0);
+                    }
+                });
+            });
+            match choice {
+                Some(1) => {
+                    let mut seen = HashSet::new();
+                    for (_, t) in self.dock.iter_all_tabs_mut() {
+                        if t.dirty() && seen.insert(t.doc_id()) {
+                            t.save(false);
+                        }
+                    }
+                    self.quit_after_save = true;
+                    self.confirm_quit = false;
+                }
+                Some(2) => {
+                    self.allow_quit = true;
+                    self.confirm_quit = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Some(_) => self.confirm_quit = false,
+                None => {}
+            }
+        }
+        if self.quit_after_save && !self.dock.iter_all_tabs().any(|(_, t)| t.dirty()) {
+            self.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        // Closing one tab with unsaved changes.
+        if let Some(id) = self.confirm_close {
+            let name = self.dock.iter_all_tabs().find(|(_, t)| t.id == id).map(|(_, t)| t.title.clone());
+            let Some(name) = name else {
+                self.confirm_close = None;
+                return;
+            };
+            let mut choice = None;
+            egui::Modal::new(Id::new("confirm-close")).show(ctx, |ui| {
+                ui.heading("注釈を保存しますか？");
+                ui.label(&name);
+                ui.horizontal(|ui| {
+                    if ui.button("上書き保存して閉じる").clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.button("保存せずに閉じる").clicked() {
+                        choice = Some(2);
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        choice = Some(0);
+                    }
+                });
+            });
+            match choice {
+                Some(1) => {
+                    if let Some((_, t)) = self.dock.iter_all_tabs_mut().find(|(_, t)| t.id == id) {
+                        // The save is queued before the document thread shuts down.
+                        t.save(false);
+                    }
+                    self.close_tab(id);
+                    self.confirm_close = None;
+                }
+                Some(2) => {
+                    self.close_tab(id);
+                    self.confirm_close = None;
+                }
+                Some(_) => self.confirm_close = None,
+                None => {}
+            }
+        }
     }
 }
 

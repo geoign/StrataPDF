@@ -18,6 +18,8 @@ use strata_core::{
 
 use crate::layout::{Layout, LayoutParams, Spread};
 use crate::reflow_view::{ReflowPane, WebMsg};
+
+mod annot_ui;
 use crate::tiles::TileCache;
 
 static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
@@ -194,6 +196,7 @@ pub struct DocView {
     /// The current reflow was built with the formula engine.
     reflow_has_latex: bool,
     save_job: Option<Receiver<Result<(usize, std::path::PathBuf), String>>>,
+    annot: annot_ui::AnnotState,
 }
 
 impl DocView {
@@ -244,6 +247,7 @@ impl DocView {
             ocr_request: None,
             reflow_has_latex: false,
             save_job: None,
+            annot: annot_ui::AnnotState::default(),
         }
     }
 
@@ -981,6 +985,7 @@ impl DocView {
     pub fn ui(&mut self, ui: &mut Ui, svc: &mut Services) {
         let ctx = ui.ctx().clone();
         self.poll_ocr(&ctx, svc);
+        self.poll_annot(&ctx);
         if self.mode == ViewMode::Reflow {
             self.reflow_ui(ui, svc);
             return;
@@ -990,6 +995,9 @@ impl DocView {
             self.copy_selection(ui.ctx());
         }
         self.toolbar(ui);
+        if self.annot.bar {
+            self.annot_toolbar(ui);
+        }
         if self.search.open {
             self.search_bar(ui);
         }
@@ -1001,6 +1009,7 @@ impl DocView {
             Sidebar::Thumbs => self.thumbs_panel(ui, svc, &mut wanted_thumbs),
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.canvas(ui, svc, wanted_thumbs));
+        self.annot_dialogs(&ctx);
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
@@ -1075,6 +1084,12 @@ impl DocView {
                 }
                 ui.separator();
                 self.ocr_menu(ui);
+                if ui.selectable_label(self.annot.bar, "注釈").on_hover_text("注釈ツール").clicked() {
+                    self.annot.bar = !self.annot.bar;
+                    if !self.annot.bar {
+                        self.annot.tool = annot_ui::Tool::Select;
+                    }
+                }
                 if ui.selectable_label(self.search.open, "🔍").on_hover_text("検索 (Ctrl+F)").clicked() {
                     if self.search.open {
                         self.search.open = false;
@@ -1220,7 +1235,7 @@ impl DocView {
                         painter.rect_filled(rect.shrink(1.0), 4.0, ui.visuals().selection.bg_fill.gamma_multiply(0.5));
                     }
                     painter.rect_filled(pr, 0.0, Color32::WHITE);
-                    draw_base(&painter, svc.tiles, self.doc.id(), p as u32, size, pr, wanted);
+                    draw_base(&painter, svc.tiles, self.doc.id(), p as u32, self.doc.page_rev(p as u32), size, pr, wanted);
                     painter.rect_stroke(pr, 0.0, Stroke::new(1.0, Color32::from_gray(150)), StrokeKind::Outside);
                     painter.text(pos2(rect.center().x, rect.max.y - label_h * 0.5), egui::Align2::CENTER_CENTER, (p + 1).to_string(), egui::FontId::proportional(12.0), ui.visuals().text_color());
                     if resp.clicked() {
@@ -1297,9 +1312,9 @@ impl DocView {
                 levels.insert(0, base);
             }
             for l in levels {
-                draw_level(&painter, svc.tiles, doc_id, p, size, pr, rect, l, if l == base { Some(&mut want_base) } else { None }, None);
+                draw_level(&painter, svc.tiles, doc_id, p, self.doc.page_rev(p), size, pr, rect, l, if l == base { Some(&mut want_base) } else { None }, None);
             }
-            draw_level(&painter, svc.tiles, doc_id, p, size, pr, rect, target, None, Some(&mut want_target));
+            draw_level(&painter, svc.tiles, doc_id, p, self.doc.page_rev(p), size, pr, rect, target, None, Some(&mut want_target));
             if let Some(e) = svc.tiles.error(doc_id, p) {
                 painter.rect_filled(pr, 0.0, Color32::from_rgb(255, 235, 235));
                 painter.text(pr.center(), egui::Align2::CENTER_CENTER, format!("このページを描画できません\n{e}"), egui::FontId::proportional(13.0), Color32::DARK_RED);
@@ -1322,7 +1337,7 @@ impl DocView {
                     let (c, rr) = tile_grid(size, k);
                     for ty in 0..rr {
                         for tx in 0..c {
-                            let key = TileKey { doc: doc_id, page: p, level: k, tx, ty };
+                            let key = TileKey { doc: doc_id, page: p, rev: self.doc.page_rev(p), level: k, tx, ty };
                             if !svc.tiles.contains(&key) {
                                 want_prefetch.push(key);
                             }
@@ -1339,7 +1354,7 @@ impl DocView {
                         let pr = self.page_screen_rect(p);
                         let target = level_for_scale(self.zoom * ppp).max(base_level(size));
                         let mut v = Vec::new();
-                        collect_level(svc.tiles, doc_id, p, size, pr, ahead, target, &mut v);
+                        collect_level(svc.tiles, doc_id, p, self.doc.page_rev(p), size, pr, ahead, target, &mut v);
                         want_prefetch.extend(v);
                     }
                 }
@@ -1352,7 +1367,7 @@ impl DocView {
                     if (c as u32) * (rr as u32) <= 64 {
                         for ty in 0..rr {
                             for tx in 0..c {
-                                let key = TileKey { doc: doc_id, page: p, level: target, tx, ty };
+                                let key = TileKey { doc: doc_id, page: p, rev: self.doc.page_rev(p), level: target, tx, ty };
                                 if !svc.tiles.contains(&key) {
                                     want_prefetch.push(key);
                                 }
@@ -1399,6 +1414,7 @@ impl DocView {
                 }
             }
         }
+        self.draw_annot_overlay(painter, p);
     }
 
     /// Horizontally center the current row (documents mixing portrait and
@@ -1458,86 +1474,89 @@ impl DocView {
             }
         }
 
-        // Pointer: pan / select / links.
-        let primary_start = resp.drag_started_by(egui::PointerButton::Primary);
-        if primary_start || resp.drag_started_by(egui::PointerButton::Middle) {
-            let start = ctx.input(|i| i.pointer.press_origin()).unwrap_or_default();
-            self.drag = DragMode::Pan;
-            if primary_start && !ctx.input(|i| i.key_down(Key::Space)) {
-                if let Some((dp, d)) = self.hit_text(start)
-                    && d < 12.0
-                {
-                    self.drag = DragMode::Select;
-                    self.sel = Some(Selection { anchor: dp, head: dp });
+        let annot_consumed = self.annot_input(ui, resp);
+        if !annot_consumed {
+            // Pointer: pan / select / links.
+            let primary_start = resp.drag_started_by(egui::PointerButton::Primary);
+            if primary_start || resp.drag_started_by(egui::PointerButton::Middle) {
+                let start = ctx.input(|i| i.pointer.press_origin()).unwrap_or_default();
+                self.drag = DragMode::Pan;
+                if primary_start && !ctx.input(|i| i.key_down(Key::Space)) {
+                    if let Some((dp, d)) = self.hit_text(start)
+                        && d < 12.0
+                    {
+                        self.drag = DragMode::Select;
+                        self.sel = Some(Selection { anchor: dp, head: dp });
+                    }
                 }
             }
-        }
-        if resp.dragged() {
-            match self.drag {
-                DragMode::Pan => {
-                    self.scroll -= resp.drag_delta();
-                    ctx.set_cursor_icon(CursorIcon::Grabbing);
-                }
-                DragMode::Select => {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        if let Some((dp, _)) = self.hit_text(pos)
-                            && let Some(s) = &mut self.sel
-                        {
-                            s.head = dp;
-                        }
-                        // Auto-scroll near the edges.
-                        let dy = if pos.y < vp.min.y { pos.y - vp.min.y } else if pos.y > vp.max.y { pos.y - vp.max.y } else { 0.0 };
-                        if dy != 0.0 {
-                            self.scroll.y += dy * 0.3;
-                            ctx.request_repaint();
-                        }
+            if resp.dragged() {
+                match self.drag {
+                    DragMode::Pan => {
+                        self.scroll -= resp.drag_delta();
+                        ctx.set_cursor_icon(CursorIcon::Grabbing);
                     }
+                    DragMode::Select => {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            if let Some((dp, _)) = self.hit_text(pos)
+                                && let Some(s) = &mut self.sel
+                            {
+                                s.head = dp;
+                            }
+                            // Auto-scroll near the edges.
+                            let dy = if pos.y < vp.min.y { pos.y - vp.min.y } else if pos.y > vp.max.y { pos.y - vp.max.y } else { 0.0 };
+                            if dy != 0.0 {
+                                self.scroll.y += dy * 0.3;
+                                ctx.request_repaint();
+                            }
+                        }
+                        ctx.set_cursor_icon(CursorIcon::Text);
+                    }
+                    DragMode::None => {}
+                }
+            }
+            if resp.drag_stopped() {
+                self.drag = DragMode::None;
+            }
+            if resp.double_clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    self.select_word(p);
+                }
+            } else if resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    if let Some(t) = self.link_at(p) {
+                        self.follow_link(&ctx, &t);
+                    } else {
+                        self.sel = None;
+                    }
+                }
+            }
+            if let Some(h) = hover
+                && self.drag == DragMode::None
+            {
+                if self.link_at(h).is_some() {
+                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                } else if matches!(self.hit_text(h), Some((_, d)) if d < 4.0) {
                     ctx.set_cursor_icon(CursorIcon::Text);
                 }
-                DragMode::None => {}
             }
-        }
-        if resp.drag_stopped() {
-            self.drag = DragMode::None;
-        }
-        if resp.double_clicked() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                self.select_word(p);
-            }
-        } else if resp.clicked() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                if let Some(t) = self.link_at(p) {
-                    self.follow_link(&ctx, &t);
-                } else {
-                    self.sel = None;
+            resp.context_menu(|ui| {
+                if ui.add_enabled(self.sel.is_some(), egui::Button::new("コピー (Ctrl+C)")).clicked() {
+                    self.copy_selection(ui.ctx());
+                    ui.close();
                 }
-            }
+                if ui.button("すべて選択 (Ctrl+A)").clicked() {
+                    self.select_all();
+                    ui.close();
+                }
+                if ui.button("このページのテキストをコピー").clicked() {
+                    let p = self.current_page();
+                    self.sel = Some(Selection { anchor: DocPos { page: p, pos: CHAR_POS_START }, head: DocPos { page: p, pos: CHAR_POS_END } });
+                    self.copy_selection(ui.ctx());
+                    ui.close();
+                }
+            });
         }
-        if let Some(h) = hover
-            && self.drag == DragMode::None
-        {
-            if self.link_at(h).is_some() {
-                ctx.set_cursor_icon(CursorIcon::PointingHand);
-            } else if matches!(self.hit_text(h), Some((_, d)) if d < 4.0) {
-                ctx.set_cursor_icon(CursorIcon::Text);
-            }
-        }
-        resp.context_menu(|ui| {
-            if ui.add_enabled(self.sel.is_some(), egui::Button::new("コピー (Ctrl+C)")).clicked() {
-                self.copy_selection(ui.ctx());
-                ui.close();
-            }
-            if ui.button("すべて選択 (Ctrl+A)").clicked() {
-                self.select_all();
-                ui.close();
-            }
-            if ui.button("このページのテキストをコピー").clicked() {
-                let p = self.current_page();
-                self.sel = Some(Selection { anchor: DocPos { page: p, pos: CHAR_POS_START }, head: DocPos { page: p, pos: CHAR_POS_END } });
-                self.copy_selection(ui.ctx());
-                ui.close();
-            }
-        });
 
         if focused && !ctx.egui_wants_keyboard_input() {
             self.handle_keys(&ctx);
@@ -1574,6 +1593,7 @@ impl DocView {
         let vw = self.viewport.width();
         let line = 48.0;
         let page_step = (vh - 48.0).max(vh * 0.5);
+        self.annot_keys(ctx);
         let consume = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
 
         if consume(Modifiers::COMMAND, Key::C) {
@@ -1726,6 +1746,7 @@ fn draw_level(
     tiles: &mut TileCache,
     doc: DocId,
     page: u32,
+    rev: u32,
     size: SizeF,
     page_rect: Rect,
     clip: Rect,
@@ -1738,32 +1759,33 @@ fn draw_level(
     let center = clip.center();
     for ty in ys {
         for tx in xs.clone() {
-            let key = TileKey { doc, page, level, tx, ty };
-            match tiles.get(&key) {
-                Some(t) => {
-                    let r = tile_screen_rect(page_rect, size, level, tx, ty, t.w, t.h);
-                    painter.image(t.tex.id(), r, uv, Color32::WHITE);
+            let key = TileKey { doc, page, rev, level, tx, ty };
+            let have = tiles.contains(&key);
+            if !have {
+                if let Some(v) = want_all.as_deref_mut() {
+                    v.push(key);
                 }
-                None => {
-                    if let Some(v) = want_all.as_deref_mut() {
-                        v.push(key);
-                    }
-                    if let Some(v) = want_by_dist.as_deref_mut() {
-                        let r = tile_screen_rect(page_rect, size, level, tx, ty, TILE_PX, TILE_PX);
-                        v.push((r.center().distance_sq(center), key));
-                    }
+                if let Some(v) = want_by_dist.as_deref_mut() {
+                    let r = tile_screen_rect(page_rect, size, level, tx, ty, TILE_PX, TILE_PX);
+                    v.push((r.center().distance_sq(center), key));
                 }
+            }
+            // While an edited page re-renders, show its previous revision.
+            let shown = if have || rev == 0 { key } else { TileKey { rev: rev - 1, ..key } };
+            if let Some(t) = tiles.get(&shown) {
+                let r = tile_screen_rect(page_rect, size, level, tx, ty, t.w, t.h);
+                painter.image(t.tex.id(), r, uv, Color32::WHITE);
             }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_level(tiles: &TileCache, doc: DocId, page: u32, size: SizeF, page_rect: Rect, clip: Rect, level: i16, out: &mut Vec<TileKey>) {
+fn collect_level(tiles: &TileCache, doc: DocId, page: u32, rev: u32, size: SizeF, page_rect: Rect, clip: Rect, level: i16, out: &mut Vec<TileKey>) {
     let Some((xs, ys)) = visible_tiles(page_rect, size, level, clip) else { return };
     for ty in ys {
         for tx in xs.clone() {
-            let key = TileKey { doc, page, level, tx, ty };
+            let key = TileKey { doc, page, rev, level, tx, ty };
             if !tiles.contains(&key) {
                 out.push(key);
             }
@@ -1772,9 +1794,9 @@ fn collect_level(tiles: &TileCache, doc: DocId, page: u32, size: SizeF, page_rec
 }
 
 /// Draw the page's base-level tiles into `rect` (thumbnails).
-fn draw_base(painter: &egui::Painter, tiles: &mut TileCache, doc: DocId, page: u32, size: SizeF, rect: Rect, wanted: &mut Vec<TileKey>) {
+fn draw_base(painter: &egui::Painter, tiles: &mut TileCache, doc: DocId, page: u32, rev: u32, size: SizeF, rect: Rect, wanted: &mut Vec<TileKey>) {
     let level = base_level(size);
-    draw_level(painter, tiles, doc, page, size, rect, rect, level, Some(wanted), None);
+    draw_level(painter, tiles, doc, page, rev, size, rect, rect, level, Some(wanted), None);
 }
 
 fn dedup_keep_order(v: &mut Vec<TileKey>) {

@@ -94,8 +94,37 @@ pub enum SearchEvent {
 
 type Reply<T> = Sender<Result<T, String>>;
 
+/// An annotation edit request.
+#[derive(Clone, Debug)]
+pub enum AnnotOp {
+    Create { page: u32, spec: crate::annot::AnnotSpec },
+    Modify { page: u32, id: i32, spec: crate::annot::AnnotSpec },
+    Delete { page: u32, id: i32 },
+    Undo,
+    Redo,
+}
+
+/// Page affected by an edit, and the id of a created annotation.
+#[derive(Clone, Copy, Debug)]
+pub struct AnnotResult {
+    pub page: Option<u32>,
+    pub id: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SaveOptions {
+    pub path: PathBuf,
+    /// Append changes to the original file instead of rewriting it.
+    pub incremental: bool,
+    /// Write without encryption (full saves only).
+    pub decrypt: bool,
+}
+
 enum Cmd {
     DisplayList(u32, Reply<Arc<DisplayList>>, bool),
+    Annots(u32, Reply<Arc<Vec<crate::annot::AnnotInfo>>>, bool),
+    Edit(AnnotOp, Reply<AnnotResult>, bool),
+    Save(SaveOptions, Reply<()>, bool),
     Text(u32, Reply<Arc<PageText>>, bool),
     Links(u32, Reply<Arc<Vec<LinkInfo>>>, bool),
     Outline(Reply<Arc<Vec<OutlineItem>>>, bool),
@@ -130,6 +159,17 @@ struct Shared {
     closed: AtomicBool,
     waker: Waker,
     ocr: Arc<crate::ocr::OcrStore>,
+    edit: Arc<EditState>,
+}
+
+/// Edit bookkeeping shared between the document thread and the UI.
+#[derive(Default)]
+pub(crate) struct EditState {
+    /// Per-page edit revision (part of tile keys, so edited pages re-render).
+    page_revs: RwLock<std::collections::HashMap<u32, u32>>,
+    dirty: AtomicBool,
+    can_undo: AtomicBool,
+    can_redo: AtomicBool,
 }
 
 /// Cheap, clonable request channel to a document thread (used by render workers).
@@ -335,6 +375,8 @@ impl Document {
         let (tx, rx) = unbounded::<Cmd>();
         let ocr_store = Arc::new(crate::ocr::OcrStore::open(path));
         let thread_ocr = ocr_store.clone();
+        let edit = Arc::new(EditState::default());
+        let thread_edit = edit.clone();
         let path_buf = path.to_path_buf();
         let pw = password.clone();
         let wk = waker.clone();
@@ -354,7 +396,7 @@ impl Document {
                 if init_tx.send(Ok((info, first))).is_err() {
                     return;
                 }
-                doc_thread(eng, rx, wk, thread_ocr);
+                doc_thread(eng, rx, wk, thread_ocr, thread_edit);
             })
             .map_err(|e| OpenError::Failed(e.to_string()))?;
 
@@ -368,6 +410,7 @@ impl Document {
             closed: AtomicBool::new(false),
             waker,
             ocr: ocr_store,
+            edit,
         });
         if info.page_count > 1 {
             let sh = shared.clone();
@@ -391,6 +434,29 @@ impl Document {
     pub(crate) fn password(&self) -> Option<String> {
         self.shared.password.clone()
     }
+    pub fn annotations(&self, page: u32) -> Pending<Arc<Vec<crate::annot::AnnotInfo>>> {
+        self.request(|r| Cmd::Annots(page, r, true))
+    }
+    pub fn edit(&self, op: AnnotOp) -> Pending<AnnotResult> {
+        self.request(|r| Cmd::Edit(op, r, true))
+    }
+    pub fn save(&self, opts: SaveOptions) -> Pending<()> {
+        self.request(|r| Cmd::Save(opts, r, true))
+    }
+    /// Edit revision of a page (0 until the page is edited).
+    pub fn page_rev(&self, page: u32) -> u32 {
+        self.shared.edit.page_revs.read().get(&page).copied().unwrap_or(0)
+    }
+    pub fn is_dirty(&self) -> bool {
+        self.shared.edit.dirty.load(Ordering::Acquire)
+    }
+    pub fn can_undo(&self) -> bool {
+        self.shared.edit.can_undo.load(Ordering::Acquire)
+    }
+    pub fn can_redo(&self) -> bool {
+        self.shared.edit.can_redo.load(Ordering::Acquire)
+    }
+
     /// OCR results of this document (shared with background jobs).
     pub fn ocr_store(&self) -> &Arc<crate::ocr::OcrStore> {
         &self.shared.ocr
@@ -541,7 +607,8 @@ fn poor_text(t: &PageText) -> bool {
     n < 20 || bad * 10 > n * 3
 }
 
-fn doc_thread(eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::ocr::OcrStore>) {
+fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::ocr::OcrStore>, edit: Arc<EditState>) {
+    let mut history = crate::annot::History::default();
     let cap = |n| NonZeroUsize::new(n).unwrap();
     let mut dl_cache: LruCache<u32, Arc<DisplayList>> = LruCache::new(cap(64));
     let mut text_cache: LruCache<u32, Arc<PageText>> = LruCache::new(cap(256));
@@ -617,6 +684,72 @@ fn doc_thread(eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::ocr:
                         link_cache.put(p, l.clone());
                     }
                     res
+                };
+                send(r, v, wake, &waker);
+            }
+            Cmd::Annots(p, r, wake) => {
+                let v = match &eng {
+                    Engine::Pdf(pdf) => crate::annot::list(pdf, p).map(Arc::new).map_err(|e| e.to_string()),
+                    Engine::Other(_) => Ok(Arc::new(Vec::new())),
+                };
+                send(r, v, wake, &waker);
+            }
+            Cmd::Edit(op, r, wake) => {
+                let v = match &mut eng {
+                    Engine::Pdf(pdf) => {
+                        use crate::annot::Edit;
+                        let res: Result<AnnotResult, mupdf::Error> = (|| {
+                            Ok(match op {
+                                AnnotOp::Create { page, spec } => {
+                                    let id = crate::annot::create(pdf, page, &spec)?;
+                                    history.push(Edit::Created { page, id, spec });
+                                    AnnotResult { page: Some(page), id: Some(id) }
+                                }
+                                AnnotOp::Modify { page, id, spec } => {
+                                    let before = crate::annot::modify(pdf, page, id, &spec)?;
+                                    history.push(Edit::Modified { page, id, before, after: spec });
+                                    AnnotResult { page: Some(page), id: Some(id) }
+                                }
+                                AnnotOp::Delete { page, id } => {
+                                    let spec = crate::annot::delete(pdf, page, id)?;
+                                    history.push(Edit::Deleted { page, id, spec });
+                                    AnnotResult { page: Some(page), id: None }
+                                }
+                                AnnotOp::Undo => AnnotResult { page: history.undo(pdf)?, id: None },
+                                AnnotOp::Redo => AnnotResult { page: history.redo(pdf)?, id: None },
+                            })
+                        })();
+                        if let Ok(AnnotResult { page: Some(p), .. }) = &res {
+                            dl_cache.pop(p);
+                            *edit.page_revs.write().entry(*p).or_insert(0) += 1;
+                            edit.dirty.store(true, Ordering::Release);
+                        }
+                        edit.can_undo.store(history.can_undo(), Ordering::Release);
+                        edit.can_redo.store(history.can_redo(), Ordering::Release);
+                        res.map_err(|e| e.to_string())
+                    }
+                    Engine::Other(_) => Err("注釈は PDF にのみ追加できます".into()),
+                };
+                send(r, v, wake, &waker);
+            }
+            Cmd::Save(opts, r, wake) => {
+                let v = match &eng {
+                    Engine::Pdf(pdf) => {
+                        let mut w = mupdf::pdf::PdfWriteOptions::default();
+                        if opts.incremental {
+                            w.set_incremental(true);
+                        } else {
+                            w.set_garbage_level(1).set_compress(true);
+                            // MuPDF's default keeps the encryption.
+                            w.set_encryption(if opts.decrypt { mupdf::pdf::Encryption::None } else { mupdf::pdf::Encryption::Keep });
+                        }
+                        let res = pdf.save_with_options(&opts.path.to_string_lossy(), w).map_err(|e| e.to_string());
+                        if res.is_ok() {
+                            edit.dirty.store(false, Ordering::Release);
+                        }
+                        res
+                    }
+                    Engine::Other(_) => Err("PDF 以外は保存できません".into()),
                 };
                 send(r, v, wake, &waker);
             }

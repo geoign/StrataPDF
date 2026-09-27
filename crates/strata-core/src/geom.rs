@@ -52,7 +52,7 @@ impl From<mupdf::Rect> for RectF {
 
 /// Quadrilateral in the order MuPDF uses: upper-left, upper-right, lower-left, lower-right.
 /// Vertical text and rotated text produce non-axis-aligned quads.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QuadF {
     pub ul: [f32; 2],
     pub ur: [f32; 2],
