@@ -40,6 +40,10 @@ pub struct OcrRegionInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PageOcr {
     pub page: u32,
+    /// OCR was requested for this page although it has a text layer: prefer
+    /// the OCR text over the existing one.
+    #[serde(default)]
+    pub forced: bool,
     pub engine: String,
     pub vertical: bool,
     pub lines: Vec<OcrTextLine>,
@@ -87,7 +91,7 @@ impl PageOcr {
     /// Text for selection and copy in the viewer.
     pub fn to_page_text(&self) -> PageText {
         let blocks = self
-            .blocks()
+            .paragraph_blocks()
             .into_iter()
             .map(|ls| {
                 let lines: Vec<TextLine> = ls
@@ -279,6 +283,7 @@ pub(crate) fn ocr_page(eng: &Engine, page: u32, ocr: &dyn OcrEngine, dpi: f32) -
     let to_pt = |r: [f32; 4]| RectF { x0: r[0] / scale + b.x0, y0: r[1] / scale + b.y0, x1: r[2] / scale + b.x0, y1: r[3] / scale + b.y0 };
     Ok(PageOcr {
         page,
+        forced: false,
         engine: ocr.name().to_string(),
         vertical: res.vertical,
         lines: res.lines.into_iter().map(|l| OcrTextLine { bbox: to_pt(l.bbox), text: l.text, vertical: l.vertical, block: l.block.map(|b| b as u32) }).collect(),
@@ -342,7 +347,8 @@ impl Document {
                         return;
                     }
                     match ocr_page(&eng, *p, engine.as_ref(), OCR_DPI) {
-                        Ok(r) => {
+                        Ok(mut r) => {
+                            r.forced = scope == OcrScope::All;
                             store.insert(r);
                             let _ = tx.send(OcrEvent::Page(*p));
                         }

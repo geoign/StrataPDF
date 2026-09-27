@@ -23,7 +23,7 @@ fn main() {
     let mut keys = Vec::new();
     for page in 0..info.page_count.min(4) as u32 {
         let (c, r) = tile_grid(sizes[page as usize], level);
-        for ty in 0..r { for tx in 0..c { keys.push(TileKey { doc: doc.id(), page, level, tx, ty }); } }
+        for ty in 0..r { for tx in 0..c { keys.push(TileKey { doc: doc.id(), page, rev: 0, level, tx, ty }); } }
     }
     let n = keys.len();
     let t1 = Instant::now();

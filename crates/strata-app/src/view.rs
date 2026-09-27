@@ -719,16 +719,21 @@ impl DocView {
         }
         match mode {
             ViewMode::Reflow => {
-                let page = self.current_page() + 1;
+                // The page-space position at the top of the viewport.
+                let top = self.viewport.min + vec2(self.viewport.width() * 0.5, 4.0);
+                let (page, y) = match self.anchor_at(top) {
+                    Some((p, off)) => (p, off.y.max(0.0)),
+                    None => (self.current_page(), 0.0),
+                };
                 let doc = self.doc.clone();
-                self.reflow.get_or_insert_with(|| ReflowPane::start(&doc, None)).goto_page(page);
+                self.reflow.get_or_insert_with(|| ReflowPane::start(&doc, None)).goto_pos(page + 1, y);
             }
             ViewMode::Pdf => {
                 if let Some(r) = &mut self.reflow {
                     r.hide();
-                    let p = r.at_page.saturating_sub(1);
+                    let (p, y) = (r.at_page.saturating_sub(1), r.at_y);
                     self.mode = mode;
-                    self.goto_page(p, None);
+                    self.goto_page(p, Some(y));
                     return;
                 }
             }
@@ -745,10 +750,10 @@ impl DocView {
 
     fn rebuild_reflow(&mut self, formula: Option<Arc<dyn strata_ocr::formula::FormulaEngine>>) {
         let doc = self.doc.clone();
-        let at = self.reflow.as_ref().map(|r| r.at_page).unwrap_or(self.current_page() + 1);
+        let (at, y) = self.reflow.as_ref().map(|r| (r.at_page, r.at_y)).unwrap_or((self.current_page() + 1, 0.0));
         self.reflow_has_latex = formula.is_some();
         let mut pane = ReflowPane::start(&doc, formula);
-        pane.goto_page(at);
+        pane.goto_pos(at, y);
         if let Some(old) = &mut self.reflow {
             old.hide();
         }
@@ -765,6 +770,11 @@ impl DocView {
             }
         }
         self.reflow_toolbar(ui);
+        if self.mode != ViewMode::Reflow {
+            // Switched to the PDF view from the toolbar: drawing the text view in
+            // the rest of this frame would show the webview again.
+            return;
+        }
         self.status_bar(ui);
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -1596,7 +1606,9 @@ impl DocView {
         self.annot_keys(ctx);
         let consume = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
 
-        if consume(Modifiers::COMMAND, Key::C) {
+        // egui turns Ctrl+C into an `Event::Copy` instead of a key press.
+        let copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        if copy || consume(Modifiers::COMMAND, Key::C) {
             self.copy_selection(ctx);
         }
         if consume(Modifiers::COMMAND, Key::A) {

@@ -234,6 +234,11 @@ if (document.body.classList.contains('vertical')) {
   window.addEventListener('wheel', e => { if (!e.ctrlKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) { window.scrollBy(-e.deltaY, 0); e.preventDefault(); } }, {passive: false});
 }
 window.strataSetTheme = t => { const r = document.documentElement; r.classList.remove('light', 'dark'); if (t) r.classList.add(t); };
+window.strataGotoPos = (p, y) => {
+  let best = null;
+  for (const el of document.querySelectorAll('[data-p="' + p + '"]')) { best = el; if (+el.dataset.y >= y - 4) break; }
+  if (best) best.scrollIntoView({block: 'start', inline: 'start'}); else window.strataGotoPage(p);
+};
 window.strataGotoPage = p => { const t = document.getElementById('page-' + p); if (t) t.scrollIntoView({block: 'start', inline: 'start'}); };
 "#;
 
@@ -259,7 +264,8 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
         if doc.vertical { "vertical" } else { "" }
     ));
     let mut in_list = false;
-    for n in &doc.nodes {
+    for (ni, n) in doc.nodes.iter().enumerate() {
+        let a = doc.anchors.get(ni).map(|(p, y)| format!(" data-p=\"{}\" data-y=\"{:.0}\"", p + 1, y)).unwrap_or_default();
         let is_item = matches!(n, Node::ListItem { .. });
         if in_list && !is_item {
             h.push_str("</ul>\n");
@@ -277,12 +283,12 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
                     h.push_str(&format!("<span class=\"pm-anchor\" id=\"page-{p}\"></span>\n"));
                 }
             }
-            Node::Heading { level, spans } => h.push_str(&format!("<h{level}>{}</h{level}>\n", spans_html(spans).trim())),
-            Node::Paragraph { spans } => h.push_str(&format!("<p>{}</p>\n", spans_html(spans).trim())),
-            Node::ListItem { spans } => h.push_str(&format!("<li>{}</li>\n", spans_html(&strip_marker(spans)).trim())),
+            Node::Heading { level, spans } => h.push_str(&format!("<h{level}{a}>{}</h{level}>\n", spans_html(spans).trim())),
+            Node::Paragraph { spans } => h.push_str(&format!("<p{a}>{}</p>\n", spans_html(spans).trim())),
+            Node::ListItem { spans } => h.push_str(&format!("<li{a}>{}</li>\n", spans_html(&strip_marker(spans)).trim())),
             Node::Figure { image, caption } => {
                 let img = &doc.images[*image];
-                h.push_str(&format!("<figure><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\">", esc_html(&(o.image_src)(img)), img.width / 2));
+                h.push_str(&format!("<figure{a}><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\">", esc_html(&(o.image_src)(img)), img.width / 2));
                 if !caption.is_empty() {
                     h.push_str(&format!("<figcaption>{}</figcaption>", spans_html(caption)));
                 }

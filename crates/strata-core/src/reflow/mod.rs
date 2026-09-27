@@ -94,6 +94,17 @@ pub struct ReflowDoc {
     pub vertical: bool,
     pub nodes: Vec<Node>,
     pub images: Vec<ReflowImage>,
+    /// Source position of each node: (0-based page, top y in page space).
+    /// Used to keep the reading position when switching views.
+    pub anchors: Vec<(u32, f32)>,
+}
+
+impl ReflowDoc {
+    fn fill_anchors(&mut self, a: (u32, f32)) {
+        while self.anchors.len() < self.nodes.len() {
+            self.anchors.push(a);
+        }
+    }
 }
 
 /// Region label from a layout-analysis model (not used by the heuristics yet).
@@ -744,7 +755,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
         let mut rich = RichPage::from_text_page(&tp, b.width(), b.height());
         // OCR text replaces an unusable text layer.
         if let Some(o) = ocr.get(p as u32)
-            && needs_ocr(&rich).is_some()
+            && (o.forced || needs_ocr(&rich).is_some())
         {
             rich = o.to_rich(b.width(), b.height());
         }
@@ -804,7 +815,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
         if !vertical {
             ordered = merge_display_math(ordered, &p.rich.fonts, body);
         }
+        doc.fill_anchors((p.page, 0.0));
         doc.nodes.push(Node::PageStart { page: p.page });
+        doc.fill_anchors((p.page, 0.0));
         let dl = eng.load_page(p.page as i32).and_then(|pg| pg.to_display_list(true)).ok();
         let crop = |bbox: RectF, scale: f32, doc: &mut ReflowDoc| -> Option<usize> {
             let dl = dl.as_ref()?;
@@ -822,13 +835,18 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
             if let Some(img) = crop(full, opts.image_scale, &mut doc) {
                 doc.nodes.push(Node::PageImage { image: img, reason });
             }
+            doc.fill_anchors((p.page, 0.0));
             progress(n + pi + 1, total);
             continue;
         }
 
+        let mut last_anchor = (p.page, 0.0f32);
         let mut i = 0;
         while i < ordered.len() {
             let u = &ordered[i];
+            // Nodes created for this unit start at its top edge.
+            doc.fill_anchors(last_anchor);
+            last_anchor = (p.page, if vertical { 0.0 } else { u.bbox.y0 });
             if u.kind == UnitKind::Figure {
                 // Caption right after (or before) the figure.
                 let mut caption = Vec::new();
@@ -1053,8 +1071,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
             }
             i += 1;
         }
+        doc.fill_anchors(last_anchor);
         progress(n + pi + 1, total);
     }
+    let last = doc.anchors.last().copied().unwrap_or((0, 0.0));
+    doc.fill_anchors(last);
     if doc.title.is_empty()
         && let Some(Node::Heading { spans, .. }) = doc.nodes.iter().find(|n| matches!(n, Node::Heading { .. }))
     {

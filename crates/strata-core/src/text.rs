@@ -107,6 +107,7 @@ impl PageText {
                             lines.push(TextLine { bbox: l.bounds().into(), vertical, chars });
                         }
                     }
+                    stack_vertical(&mut lines, bbox);
                     blocks.push(Block::Text { bbox, lines });
                 }
                 TextBlockType::Image => blocks.push(Block::Image { bbox }),
@@ -114,6 +115,24 @@ impl PageText {
             }
         }
         PageText { blocks, fonts }
+    }
+
+    /// Separator between two consecutive lines of a selection: nothing between
+    /// wrapped CJK lines, a space between wrapped Latin lines, a newline between blocks.
+    fn line_separator(prev: &TextLine, next: &TextLine, same_block: bool) -> &'static str {
+        if !same_block {
+            return "\n";
+        }
+        let (Some(a), Some(b)) = (prev.chars.iter().rev().find(|c| !c.c.is_whitespace()), next.chars.iter().find(|c| !c.c.is_whitespace())) else {
+            return "\n";
+        };
+        if is_cjk(a.c) || is_cjk(b.c) || prev.vertical {
+            ""
+        } else if a.c == '-' {
+            ""
+        } else {
+            " "
+        }
     }
 
     pub fn font(&self, id: u16) -> Option<&FontInfo> {
@@ -163,17 +182,17 @@ impl PageText {
     pub fn text_between(&self, a: CharPos, b: CharPos) -> String {
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
         let mut out = String::new();
-        let mut first = true;
+        let mut prev: Option<(u32, &TextLine)> = None;
         for (bi, li, l) in self.lines() {
             let start = CharPos { block: bi, line: li, ch: 0 };
             let end = CharPos { block: bi, line: li, ch: l.chars.len() as u32 };
             if end <= a || start >= b {
                 continue;
             }
-            if !first {
-                out.push('\n');
+            if let Some((pb, pl)) = prev {
+                out.push_str(Self::line_separator(pl, l, pb == bi));
             }
-            first = false;
+            prev = Some((bi, l));
             let s = if bi == a.block && li == a.line { a.ch as usize } else { 0 };
             let e = if bi == b.block && li == b.line { b.ch as usize } else { l.chars.len() };
             out.extend(l.chars[s.min(l.chars.len())..e.min(l.chars.len())].iter().map(|c| c.c));
@@ -212,5 +231,57 @@ impl PageText {
 
     pub fn char_at(&self, p: CharPos) -> Option<&TextChar> {
         self.line(p.block, p.line)?.chars.get(p.ch as usize)
+    }
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
+}
+
+/// Vertical text written glyph by glyph (Chromium, Word, some OCR layers)
+/// arrives as a stack of one-character lines; rebuild the column as one
+/// vertical line so selection and copy work per column instead of per glyph.
+fn stack_vertical(lines: &mut Vec<TextLine>, bbox: RectF) {
+    if lines.len() < 2 || lines.iter().any(|l| l.vertical) {
+        return;
+    }
+    let count = |l: &TextLine| l.chars.iter().filter(|c| !c.c.is_whitespace()).count();
+    let single = lines.iter().filter(|l| count(l) <= 1).count();
+    let size = lines.iter().flat_map(|l| l.chars.iter().map(|c| c.size)).fold(0.0f32, f32::max).max(1.0);
+    let tall = bbox.height() > bbox.width() * 2.0 && bbox.width() < size * 1.8;
+    if !(tall && single * 10 >= lines.len() * 8) {
+        return;
+    }
+    let mut chars: Vec<TextChar> = lines.drain(..).flat_map(|l| l.chars).filter(|c| !c.c.is_whitespace()).collect();
+    if chars.is_empty() {
+        return;
+    }
+    chars.sort_by(|a, b| a.quad.bbox().y0.total_cmp(&b.quad.bbox().y0));
+    let lb = chars.iter().skip(1).fold(chars[0].quad.bbox(), |r, c| r.union(&c.quad.bbox()));
+    lines.push(TextLine { bbox: lb, vertical: true, chars });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::QuadF;
+
+    fn ch(c: char, x: f32, y: f32) -> TextChar {
+        TextChar { c, quad: QuadF { ul: [x, y], ur: [x + 10.0, y], ll: [x, y + 10.0], lr: [x + 10.0, y + 10.0] }, origin: [x, y + 10.0], size: 10.0, font: 0, argb: 0 }
+    }
+
+    #[test]
+    fn stacked_glyphs_become_one_column_and_copy_without_breaks() {
+        let col = |x: f32, s: &str| -> Vec<TextLine> {
+            s.chars().enumerate().map(|(i, c)| TextLine { bbox: ch(c, x, i as f32 * 10.0).quad.bbox(), vertical: false, chars: vec![ch(c, x, i as f32 * 10.0)] }).collect()
+        };
+        let mut l1 = col(100.0, "吾輩は猫");
+        stack_vertical(&mut l1, RectF { x0: 100.0, y0: 0.0, x1: 110.0, y1: 40.0 });
+        assert_eq!(l1.len(), 1);
+        assert!(l1[0].vertical);
+        let mut l2 = col(80.0, "である");
+        stack_vertical(&mut l2, RectF { x0: 80.0, y0: 0.0, x1: 90.0, y1: 30.0 });
+        let t = PageText { blocks: vec![Block::Text { bbox: RectF::default(), lines: vec![l1.remove(0), l2.remove(0)] }], fonts: vec![] };
+        assert_eq!(t.plain_text(), "吾輩は猫である");
     }
 }

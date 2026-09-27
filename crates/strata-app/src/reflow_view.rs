@@ -37,9 +37,10 @@ pub struct ReflowPane {
     bounds: Option<egui::Rect>,
     visible: bool,
     theme: Option<Theme>,
-    /// 1-based page the reflowed view currently shows.
+    /// 1-based page and page-space y of the first visible block.
     pub at_page: u32,
-    pending_goto: Option<u32>,
+    pub at_y: f32,
+    pending_goto: Option<(u32, f32)>,
 }
 
 const JS_BRIDGE: &str = r#"
@@ -52,13 +53,13 @@ const JS_BRIDGE: &str = r#"
   let last = 0;
   const report = () => {
     const vertical = document.body.classList.contains('vertical');
-    let cur = 1;
-    // Markers already scrolled past: above the top (horizontal) or right of the view (vertical-rl).
-    for (const pm of document.querySelectorAll('.pm, .pm-anchor')) {
-      const r = pm.getBoundingClientRect();
-      if (vertical ? r.left > window.innerWidth - 80 : r.top < 80) cur = +pm.id.slice(5); else break;
+    // First block whose leading edge is inside the view (right edge for vertical-rl).
+    let pos = null;
+    for (const el of document.querySelectorAll('[data-p]')) {
+      const r = el.getBoundingClientRect();
+      if (vertical ? r.right <= window.innerWidth + 1 : r.bottom > 4) { pos = el.dataset.p + ':' + el.dataset.y; break; }
     }
-    if (cur !== last) { last = cur; send('at:' + cur); }
+    if (pos && pos !== last) { last = pos; send('pos:' + pos); }
   };
   let t = null;
   window.addEventListener('scroll', () => { if (!t) t = setTimeout(() => { t = null; report(); }, 150); }, {passive: true});
@@ -85,6 +86,7 @@ impl ReflowPane {
             visible: false,
             theme: None,
             at_page: 1,
+            at_y: 0.0,
             pending_goto: None,
         }
     }
@@ -129,9 +131,11 @@ impl ReflowPane {
         store.insert("/index.html".into(), ("text/html; charset=utf-8", Arc::new(html.into_bytes())));
     }
 
-    /// Scroll the reflowed view to a 1-based page once it is ready.
-    pub fn goto_page(&mut self, page: u32) {
-        self.pending_goto = Some(page);
+    /// Scroll the reflowed view to a 1-based page and page-space y once it is ready.
+    pub fn goto_pos(&mut self, page: u32, y: f32) {
+        self.pending_goto = Some((page, y));
+        self.at_page = page;
+        self.at_y = y;
     }
 
     pub fn messages(&mut self) -> Vec<WebMsg> {
@@ -139,8 +143,9 @@ impl ReflowPane {
         while let Ok(m) = self.msg_rx.try_recv() {
             if let Some(p) = m.strip_prefix("page:").and_then(|p| p.parse().ok()) {
                 out.push(WebMsg::GotoPdfPage(p));
-            } else if let Some(p) = m.strip_prefix("at:").and_then(|p| p.parse().ok()) {
-                self.at_page = p;
+            } else if let Some((p, y)) = m.strip_prefix("pos:").and_then(|s| s.split_once(':')) {
+                self.at_page = p.parse().unwrap_or(self.at_page);
+                self.at_y = y.parse().unwrap_or(0.0);
             } else if let Some(u) = m.strip_prefix("open:") {
                 out.push(WebMsg::OpenUrl(u.to_string()));
             } else if let Some(k) = m.strip_prefix("key:") {
@@ -227,10 +232,10 @@ impl ReflowPane {
             let _ = w.evaluate_script(&format!("window.strataSetTheme && window.strataSetTheme('{t}')"));
             self.theme = Some(theme);
         }
-        if let Some(p) = self.pending_goto.take() {
-            // The page may still be loading; the script defines strataGotoPage at the end.
+        if let Some((p, y)) = self.pending_goto.take() {
+            // The page may still be loading; the script defines strataGotoPos at the end.
             let _ = w.evaluate_script(&format!(
-                "(function g(n){{ if (window.strataGotoPage) window.strataGotoPage({p}); else if (n < 50) setTimeout(() => g(n + 1), 100); }})(0)"
+                "(function g(n){{ if (window.strataGotoPos) window.strataGotoPos({p}, {y}); else if (n < 50) setTimeout(() => g(n + 1), 100); }})(0)"
             ));
         }
     }
@@ -239,8 +244,8 @@ impl ReflowPane {
         if self.visible
             && let Some(w) = &self.webview
         {
-            let _ = w.set_visible(false);
             let _ = w.focus_parent();
+            let _ = w.set_visible(false);
         }
         self.visible = false;
     }

@@ -519,7 +519,10 @@ impl Document {
                         return;
                     }
                     let mut quads: Vec<QuadF> = Vec::new();
-                    if let Ok(page) = eng.load_page(p as i32)
+                    let forced = sh.ocr.get(p as u32).filter(|o| o.forced);
+                    if let Some(o) = &forced {
+                        quads = o.search(&needle);
+                    } else if let Ok(page) = eng.load_page(p as i32)
                         && let Ok(hits) = page.search(&needle, 4096)
                     {
                         quads = hits.iter().map(|q| QuadF::from(q.clone())).collect();
@@ -656,7 +659,7 @@ fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::
                 };
                 // OCR text stands in for an unusable text layer.
                 let v = match (&v, ocr.get(p)) {
-                    (Ok(t), Some(o)) if poor_text(t) => Ok(Arc::new(o.to_page_text())),
+                    (Ok(t), Some(o)) if o.forced || poor_text(t) => Ok(Arc::new(o.to_page_text())),
                     (Err(_), Some(o)) => Ok(Arc::new(o.to_page_text())),
                     _ => v,
                 };
