@@ -187,6 +187,19 @@ fn is_math_font(name: &str) -> bool {
     KEYS.iter().any(|k| n.contains(k))
 }
 
+/// Bold or italic from the font, including naming conventions MuPDF does not
+/// recognise: "AdvOTc022ae45.B" (Adobe-subset suffixes .B, .I, .BI),
+/// "Minion-Semibold", "Helvetica-BoldOblique".
+fn font_bold(f: &FontInfo) -> bool {
+    let n = f.name.to_ascii_lowercase();
+    f.bold || n.contains("bold") || n.contains("semibold") || n.contains("heavy") || n.contains("black") || n.ends_with(".b") || n.ends_with(".bi") || n.ends_with("-bd") || n.ends_with(",bd")
+}
+
+fn font_italic(f: &FontInfo) -> bool {
+    let n = f.name.to_ascii_lowercase();
+    f.italic || n.contains("italic") || n.contains("oblique") || n.ends_with(".i") || n.ends_with(".bi") || n.ends_with("-it")
+}
+
 fn is_math_char(c: char) -> bool {
     matches!(c as u32, 0x2200..=0x22FF | 0x2A00..=0x2AFF | 0x1D400..=0x1D7FF | 0x2190..=0x21FF | 0x27C0..=0x27EF | 0x0391..=0x03C9)
         || "=+±×÷≤≥≈∝∞∑∏∫√∂∇".contains(c)
@@ -441,7 +454,34 @@ fn vector_figures(blocks: &[RichBlock], page_area: f32) -> Vec<RectF> {
         .collect()
 }
 
-fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_pages: usize, opts: &ReflowOptions, vertical: bool) -> Vec<Unit> {
+/// Line numbers of a manuscript (review copies, discussion papers): a column of
+/// short number-only blocks at the same x. Returns their indices among `units`.
+fn line_number_column(units: &[Unit], body: f32) -> Vec<usize> {
+    let numbers: Vec<usize> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| {
+            let t = u.text();
+            let t = t.trim();
+            u.kind == UnitKind::Text && u.lines.len() == 1 && (1..=4).contains(&t.len()) && t.chars().all(|c| c.is_ascii_digit()) && u.bbox.width() < body * 2.5
+        })
+        .map(|(i, _)| i)
+        .collect();
+    // Group by right edge (numbers are right-aligned).
+    let mut groups: Vec<(f32, Vec<usize>)> = Vec::new();
+    for i in numbers {
+        let x = units[i].bbox.x1;
+        match groups.iter_mut().find(|g| (g.0 - x).abs() < 3.0) {
+            Some(g) => g.1.push(i),
+            None => groups.push((x, vec![i])),
+        }
+    }
+    groups.into_iter().filter(|g| g.1.len() >= 8).flat_map(|g| g.1).collect()
+}
+
+/// Text and figure units of a page, and whether the page is a line-numbered
+/// manuscript (then usually double-spaced).
+fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_pages: usize, opts: &ReflowOptions, vertical: bool) -> (Vec<Unit>, bool) {
     let h = p.rich.height;
     let w = p.rich.width;
     let threshold = (n_pages as f32 * 0.25).ceil().max(2.0) as usize;
@@ -485,7 +525,9 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                     })
                     .cloned()
                     .collect();
-                if !kept.is_empty() {
+                // Whitespace-only blocks (spacing in manuscripts) would become empty
+                // paragraphs that stop paragraph joining.
+                if kept.iter().any(|l| l.chars.iter().any(|c| !c.c.is_whitespace())) {
                     let bbox = kept.iter().skip(1).fold(kept[0].bbox, |a, l| a.union(&l.bbox));
                     units.push(Unit { kind: UnitKind::Text, bbox, lines: kept });
                 }
@@ -511,8 +553,49 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             None => figs.push(u.bbox),
         }
     }
+    let mut texts: Vec<Option<Unit>> = units.into_iter().filter(|u| u.kind == UnitKind::Text).map(Some).collect();
+    // Labels around a figure (axis ticks, legends, panel letters, a chart title)
+    // lie just outside the drawing: take short blocks within a few lines of it
+    // into the figure, growing it so that chained labels follow, and so that
+    // the figure image shows them. Captions and headings stay text.
+    let label_like = |u: &Unit| {
+        let t = u.text();
+        let n = t.chars().count();
+        // A heading next to a figure ("Attention Visualizations" above a chart) is
+        // larger than body text, or bold words at body size; panel letters and
+        // legend titles are smaller or single letters.
+        let size = u.size();
+        let bold = u.frac(|c| c.bold || p.rich.fonts.get(c.font as usize).is_some_and(font_bold));
+        let words = t.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 3).count();
+        let heading_like = words >= 2 && (size >= body * 1.1 || (bold >= 0.8 && size >= body * 0.95));
+        !heading_like
+            && caption_kind(&t).is_none()
+            && numbered_heading_depth(&t).is_none()
+            && ((u.lines.len() <= 2 && n <= 60) || (size < body * 0.9 && u.lines.len() <= 6 && n <= 200))
+    };
+    let margin = body * 2.5;
+    for _ in 0..4 {
+        let mut grew = false;
+        for slot in texts.iter_mut() {
+            let Some(u) = slot else { continue };
+            if !label_like(u) {
+                continue;
+            }
+            if let Some(f) = figs.iter_mut().find(|f| {
+                let near = RectF { x0: f.x0 - margin, y0: f.y0 - margin, x1: f.x1 + margin, y1: f.y1 + margin };
+                overlap_frac(&u.bbox, &near) > 0.8
+            }) {
+                *f = f.union(&u.bbox);
+                *slot = None;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
     let mut out: Vec<Unit> = Vec::new();
-    for u in units.into_iter().filter(|u| u.kind == UnitKind::Text) {
+    for u in texts.into_iter().flatten() {
         let inside = figs.iter().any(|f| overlap_frac(&u.bbox, f) > 0.8);
         let bodyish = u.lines.len() >= 3 && (u.size() - body).abs() < body * 0.1;
         if inside && !bodyish {
@@ -521,7 +604,14 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         out.push(u);
     }
     out.extend(figs.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new() }));
-    out
+    let numbers = line_number_column(&out, body);
+    let manuscript = !numbers.is_empty();
+    let mut i = 0;
+    out.retain(|_| {
+        i += 1;
+        !numbers.contains(&(i - 1))
+    });
+    (out, manuscript)
 }
 
 fn caption_kind(t: &str) -> Option<bool> {
@@ -566,7 +656,10 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
         }
     }
     let rest: String = chars.collect();
-    (saw_digit && rest.starts_with(char::is_whitespace) && rest.trim().chars().next().is_some_and(|c| c.is_alphabetic())).then_some(depth)
+    // "2.1 | Methods" (Wiley) as well as "2.1 Methods".
+    let title = rest.trim_start();
+    let title = title.strip_prefix('|').map(str::trim_start).unwrap_or(title);
+    (saw_digit && rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())).then_some(depth)
 }
 
 fn is_list_marker(t: &str) -> bool {
@@ -607,12 +700,11 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
         }
         for c in &l.chars {
             let f = fonts.get(c.font as usize);
-            let name = f.map(|f| f.name.to_ascii_lowercase()).unwrap_or_default();
             let small = c.size < med * 0.8 && !vertical;
             let cy = (c.bbox.y0 + c.bbox.y1) * 0.5;
             let style = Style {
-                bold: c.bold || f.is_some_and(|f| f.bold) || name.contains("bold"),
-                italic: f.is_some_and(|f| f.italic) || name.contains("italic") || name.contains("oblique"),
+                bold: c.bold || f.is_some_and(font_bold),
+                italic: f.is_some_and(font_italic),
                 sup: small && cy < lcy - med * 0.1,
                 sub: small && cy > lcy + med * 0.1,
                 mono: f.is_some_and(|f| f.monospaced),
@@ -677,7 +769,51 @@ fn continues(prev: &str, next: &str) -> bool {
     if next.starts_with(['\u{3000}', ' ']) {
         return false;
     }
-    first.is_lowercase() || is_cjk(first) || first.is_ascii_digit() || matches!(first, ',' | ';' | '(' | '、')
+    first.is_lowercase() || is_cjk(first) || first.is_ascii_digit() || matches!(first, ',' | ';' | '(' | '[' | '、')
+}
+
+/// Whether a text unit starts or ends its column: no other text of the same
+/// column lies above (below) it, or only a figure does. Full-width blocks such
+/// as an abstract above two columns do not count as the same column.
+fn column_edges(units: &[Unit], i: usize) -> (bool, bool) {
+    let u = &units[i];
+    let same_column = |o: &Unit| {
+        let overlap = u.bbox.x1.min(o.bbox.x1) - u.bbox.x0.max(o.bbox.x0);
+        overlap > 0.3 * u.bbox.width().min(o.bbox.width()) && o.bbox.width() < u.bbox.width() * 1.5
+    };
+    let (mut above, mut below) = (f32::NEG_INFINITY, f32::INFINITY);
+    for (j, o) in units.iter().enumerate() {
+        if j == i || o.kind != UnitKind::Text || !same_column(o) {
+            continue;
+        }
+        if o.bbox.y1 <= u.bbox.y0 + 2.0 {
+            above = above.max(o.bbox.y1);
+        }
+        if o.bbox.y0 >= u.bbox.y1 - 2.0 {
+            below = below.min(o.bbox.y0);
+        }
+    }
+    let figure_between = |a: f32, b: f32| {
+        units.iter().any(|o| {
+            let overlap = u.bbox.x1.min(o.bbox.x1) - u.bbox.x0.max(o.bbox.x0);
+            o.kind == UnitKind::Figure && overlap > 0.3 * u.bbox.width() && o.bbox.y0 >= a - 2.0 && o.bbox.y1 <= b + 2.0
+        })
+    };
+    let top = above == f32::NEG_INFINITY || figure_between(above, u.bbox.y0);
+    let bottom = below == f32::INFINITY || figure_between(u.bbox.y1, below);
+    (top, bottom)
+}
+
+/// Where the last paragraph unit sat, for joining a sentence cut by a column,
+/// page or figure break that resumes with a capital letter.
+struct LastPara {
+    node: usize,
+    /// It was the last text of its column and its last line ran to the column edge.
+    cut_at_edge: bool,
+    /// Its last line ran to the right edge of the unit.
+    last_full: bool,
+    page: u32,
+    bbox: RectF,
 }
 
 fn math_fraction(u: &Unit, fonts: &[FontInfo]) -> f32 {
@@ -798,11 +934,14 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
     let mut title_size = 0.0f32;
     // Vertical text: did the last paragraph column run to the bottom of the text area?
     let mut last_col_full = false;
+    let mut last_para: Option<LastPara> = None;
     for (pi, p) in pages.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let mut units = page_units(p, body, &repeated, pages.len(), opts, vertical);
+        let (mut units, manuscript) = page_units(p, body, &repeated, pages.len(), opts, vertical);
+        // Double-spaced manuscripts leave a blank line's height between lines.
+        let line_gap = if manuscript { body * 1.8 } else { body * 0.6 };
         let rects: Vec<RectF> = units.iter().map(|u| u.bbox).collect();
         let order = order::reading_order(&rects, vertical);
         let mut ordered: Vec<Unit> = Vec::with_capacity(units.len());
@@ -915,8 +1054,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
             }
             let math = math_fraction(u, &p.rich.fonts);
             let short = text.chars().count() < 160 && u.lines.len() <= 3;
-            let bold = u.frac(|c| c.bold || p.rich.fonts.get(c.font as usize).is_some_and(|f| f.bold || f.name.to_ascii_lowercase().contains("bold")));
-            let italic = u.frac(|c| p.rich.fonts.get(c.font as usize).is_some_and(|f| f.italic || f.name.to_ascii_lowercase().contains("italic")));
+            let bold = u.frac(|c| c.bold || p.rich.fonts.get(c.font as usize).is_some_and(font_bold));
+            let italic = u.frac(|c| p.rich.fonts.get(c.font as usize).is_some_and(font_italic));
             let numbered = numbered_heading_depth(&text);
             // Words set in text fonts mean prose with inline math, not a display formula.
             // Only lowercase words count: operator names such as "MultiHead" or
@@ -1037,9 +1176,15 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
             } else if !vertical && size <= body * 0.92 && u.bbox.y0 > p.rich.height * 0.6 && u.lines.len() <= 8 {
                 doc.nodes.push(Node::Footnote { spans });
             } else {
-                // Continuation across a column or page break; figures, tables and
-                // footnotes that interrupt a paragraph are floats and are skipped.
-                let prev = doc.nodes.iter().rposition(|n| !matches!(n, Node::PageStart { .. } | Node::Figure { .. } | Node::Table { .. } | Node::Footnote { .. }));
+                // Continuation across a column or page break; figures, tables,
+                // footnotes and stray captions that interrupt a paragraph are floats
+                // and are skipped.
+                let prev = doc.nodes.iter().rposition(|n| match n {
+                    Node::PageStart { .. } | Node::Figure { .. } | Node::Table { .. } | Node::Footnote { .. } => false,
+                    Node::Paragraph { spans } => caption_kind(&spans_text(spans)).is_none(),
+                    _ => true,
+                });
+                let (at_top, at_bottom) = column_edges(&ordered, i);
                 let merge = match prev.map(|ix| &doc.nodes[ix]) {
                     Some(Node::Paragraph { spans: prev_spans }) => {
                         if vertical {
@@ -1047,11 +1192,42 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                             let indented = u.bbox.y0 > top + body * 0.5;
                             last_col_full && !indented
                         } else {
-                            continues(&spans_text(prev_spans), &text)
+                            let prev_text = spans_text(prev_spans);
+                            // A sentence cut at the edge of a column and resumed at the top
+                            // of the next one, even with a capital. Only body text continues
+                            // a paragraph: figure labels near a column top are short.
+                            let cut = last_para.as_ref().is_some_and(|l| Some(l.node) == prev && l.cut_at_edge);
+                            let first_indented = u.lines.first().is_some_and(|l| l.bbox.x0 - u.bbox.x0 > body * 0.6);
+                            let bodyish = (size - body).abs() <= body * 0.1 && (u.lines.len() >= 2 || text.chars().count() >= 40);
+                            // The next lines of the same column, split off by the extractor
+                            // (it breaks blocks at a change of font, such as an italic
+                            // species name at the start of a line).
+                            let adjacent = last_para.as_ref().is_some_and(|l| {
+                                Some(l.node) == prev
+                                    && l.page == p.page
+                                    && l.last_full
+                                    && u.bbox.x0 < l.bbox.x1
+                                    && u.bbox.x1 > l.bbox.x0
+                                    && (u.bbox.x0 - l.bbox.x0).abs() < body
+                                    && u.bbox.y0 >= l.bbox.y1 - 2.0
+                                    && u.bbox.y0 - l.bbox.y1 < line_gap
+                            });
+                            continues(&prev_text, &text)
+                                || (!ends_sentence(&prev_text) && !first_indented && bodyish && ((cut && at_top) || adjacent))
                         }
                     }
                     _ => false,
                 };
+                // For the next unit: did this one stop at the edge of its column?
+                let last_full = match u.lines.last() {
+                    Some(l) if u.lines.len() >= 2 => l.bbox.x1 >= u.bbox.x1 - body * 1.5,
+                    Some(l) => {
+                        let widest = ordered.iter().filter(|o| o.kind == UnitKind::Text).map(|o| o.bbox.width()).fold(0.0f32, f32::max);
+                        l.bbox.width() >= widest * 0.8
+                    }
+                    None => false,
+                };
+                let cut_at_edge = at_bottom && last_full;
                 if vertical {
                     let (_, bottom) = vertical_text_area(&ordered, body);
                     last_col_full = u.bbox.y1 >= bottom - body * 1.5;
@@ -1065,8 +1241,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                         }
                         prev.extend(spans);
                     }
+                    last_para = Some(LastPara { node: idx, cut_at_edge, last_full, page: p.page, bbox: u.bbox });
                 } else {
                     doc.nodes.push(Node::Paragraph { spans });
+                    last_para = Some(LastPara { node: doc.nodes.len() - 1, cut_at_edge, last_full, page: p.page, bbox: u.bbox });
                 }
             }
             i += 1;

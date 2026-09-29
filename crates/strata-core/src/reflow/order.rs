@@ -42,14 +42,19 @@ fn gutters(rects: &[RectF], idx: &[usize], min_gap: f32) -> Vec<(f32, f32)> {
 }
 
 /// Horizontal bands that share the same column gutters belong to one
-/// multi-column region; cutting between them would interleave the columns.
+/// multi-column region; cutting between them would interleave the columns. A
+/// band with a single column (a subheading in one column, level with a gap in
+/// the other) belongs to the region too, as long as nothing in it crosses a
+/// gutter; otherwise it would split the region and interleave the columns.
 fn merge_column_bands(rects: &[RectF], bands: Vec<Vec<usize>>, min_gap: f32) -> Vec<Vec<usize>> {
     let mut out: Vec<Vec<usize>> = Vec::new();
     for b in bands {
         if let Some(last) = out.last_mut() {
             let g1 = gutters(rects, last, min_gap);
             let g2 = gutters(rects, &b, min_gap);
-            let compatible = !g1.is_empty() && g1.len() == g2.len() && g1.iter().zip(&g2).all(|(a, b)| a.0.max(b.0) < a.1.min(b.1));
+            let same_gutters = g1.len() == g2.len() && g1.iter().zip(&g2).all(|(a, b)| a.0.max(b.0) < a.1.min(b.1));
+            let within_columns = g2.is_empty() && b.iter().all(|&i| g1.iter().all(|g| rects[i].x1 <= g.1 || rects[i].x0 >= g.0));
+            let compatible = !g1.is_empty() && (same_gutters || within_columns);
             if compatible {
                 last.extend(b);
                 continue;
@@ -115,6 +120,24 @@ mod tests {
         // title, then left column (2 paras) and right column (2 paras) with aligned gaps
         let rects = [r(50.0, 10.0, 550.0, 40.0), r(300.0, 60.0, 550.0, 200.0), r(50.0, 60.0, 280.0, 200.0), r(50.0, 210.0, 280.0, 400.0), r(300.0, 210.0, 550.0, 400.0)];
         assert_eq!(reading_order(&rects, false), vec![0, 2, 3, 1, 4]);
+    }
+
+    #[test]
+    fn subheading_in_one_column_does_not_interleave() {
+        // Carey et al. 2010, p. 263: figure on top; below it two columns where a
+        // one-line subheading in the left column sits level with a gap in the right.
+        let rects = [
+            r(51.0, 53.5, 161.6, 170.8),  // 0 caption
+            r(232.0, 53.9, 544.4, 341.0), // 1 figure
+            r(51.0, 370.4, 289.1, 541.4), // 2 left: "the proximal area…"
+            r(306.1, 370.4, 544.3, 454.2), // 3 right
+            r(306.1, 457.6, 544.2, 553.8), // 4 right
+            r(51.0, 557.2, 105.2, 566.3), // 5 left: "Unit D (Fall)"
+            r(51.0, 582.1, 289.1, 715.7), // 6 left
+            r(306.1, 582.4, 525.4, 591.2), // 7 right: heading
+            r(306.1, 607.1, 544.4, 715.7), // 8 right
+        ];
+        assert_eq!(reading_order(&rects, false), vec![0, 1, 2, 5, 6, 3, 4, 7, 8]);
     }
 
     #[test]
