@@ -467,8 +467,13 @@ fn majority_class(lines: &[(RichLine, Option<(usize, usize)>)]) -> Option<(usize
 fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
     let mut out: Vec<Unit> = Vec::with_capacity(units.len());
     for u in units {
+        // Type of a clearly different size (a section label over a title) stays apart.
+        let size = u.size();
         if let Some(g) = u.group
-            && let Some(o) = out.iter_mut().find(|o| o.group == Some(g) && o.kind == UnitKind::Text && o.bbox.x0 < u.bbox.x1 && u.bbox.x0 < o.bbox.x1)
+            && let Some(o) = out.iter_mut().find(|o| {
+                let os = o.size();
+                o.group == Some(g) && o.kind == UnitKind::Text && o.bbox.x0 < u.bbox.x1 && u.bbox.x0 < o.bbox.x1 && (os - size).abs() <= os.max(size) * 0.15
+            })
         {
             o.bbox = o.bbox.union(&u.bbox);
             o.lines.extend(u.lines);
@@ -957,6 +962,30 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
     let mut spans = merged;
     spans.retain(|s| !s.text.is_empty());
     spans
+}
+
+/// Letters set apart with spacing ("G E O P H YS I C S") joined into the word.
+/// A run of at least four one- or two-letter capital tokens, most of them single.
+fn collapse_letterspacing(s: &str) -> String {
+    let tokens: Vec<&str> = s.split(' ').collect();
+    let caps = |t: &str| (1..=2).contains(&t.chars().count()) && t.chars().all(|c| c.is_uppercase());
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let mut j = i;
+        while j < tokens.len() && caps(tokens[j]) {
+            j += 1;
+        }
+        let singles = tokens[i..j].iter().filter(|t| t.chars().count() == 1).count();
+        if j - i >= 4 && singles * 3 >= (j - i) * 2 {
+            out.push(tokens[i..j].concat());
+            i = j;
+        } else {
+            out.push(tokens[i].to_string());
+            i += 1;
+        }
+    }
+    out.join(" ")
 }
 
 fn spans_text(spans: &[Span]) -> String {
@@ -1502,7 +1531,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     }
                     last_heading = Some((ix, p.page, bbox.union(&u.bbox), hsize));
                 } else {
-                    doc.nodes.push(Node::Heading { level: level as u8, spans });
+                    let spans = spans.into_iter().map(|mut s| {
+                        s.text = collapse_letterspacing(&s.text);
+                        s
+                    });
+                    doc.nodes.push(Node::Heading { level: level as u8, spans: spans.collect() });
                     if u.class.is_some() {
                         last_heading = Some((doc.nodes.len() - 1, p.page, u.bbox, size));
                     }
@@ -1619,6 +1652,13 @@ mod tests {
         assert_eq!(caption_kind("Table 2"), Some(true));
         assert_eq!(caption_kind("Tables are"), None);
         assert_eq!(caption_kind("図3 地質図"), Some(false));
+    }
+
+    #[test]
+    fn letterspacing() {
+        assert_eq!(collapse_letterspacing("G E O P H YS I C S Delayed submarine"), "GEOPHYSICS Delayed submarine");
+        assert_eq!(collapse_letterspacing("Units A B and C"), "Units A B and C");
+        assert_eq!(collapse_letterspacing("R E S U L T S"), "RESULTS");
     }
 
     #[test]

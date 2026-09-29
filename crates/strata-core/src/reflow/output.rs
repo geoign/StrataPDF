@@ -188,6 +188,8 @@ main { max-width: 46em; margin: 0 auto; padding: 2.5em 1.5em 6em; position: rela
 h1, h2, h3, h4, h5, h6 { font-family: "Segoe UI", "Yu Gothic UI", "Yu Gothic", "Meiryo", sans-serif; line-height: 1.35; margin: 1.6em 0 .6em; }
 h1 { font-size: 1.7em; } h2 { font-size: 1.35em; } h3 { font-size: 1.15em; } h4, h5, h6 { font-size: 1em; }
 p { margin: 0 0 .9em; text-align: justify; hyphens: auto; }
+/* Long URLs and identifiers wrap instead of widening the page. */
+p, li, figcaption, h1, h2, h3, h4, h5, h6 { overflow-wrap: anywhere; }
 a { color: var(--link); text-decoration: none; } a:hover { text-decoration: underline; }
 sup, sub { font-size: .72em; line-height: 0; }
 figure { margin: 1.6em 0; text-align: center; }

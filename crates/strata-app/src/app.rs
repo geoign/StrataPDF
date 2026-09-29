@@ -100,6 +100,8 @@ pub struct StrataApp {
     quit_after_save: bool,
     /// A menu or combo box was open at the end of the last frame.
     popup_open: bool,
+    /// A confirmation dialog is open (last frame).
+    modal_open: bool,
 }
 
 impl StrataApp {
@@ -146,6 +148,7 @@ impl StrataApp {
             allow_quit: false,
             quit_after_save: false,
             popup_open: false,
+            modal_open: false,
             web: wry::WebContext::new(directories::ProjectDirs::from("", "", "StrataPDF").map(|d| d.data_local_dir().join("WebView2"))),
         };
         for f in files {
@@ -225,7 +228,16 @@ impl StrataApp {
         }
     }
 
+    /// The tab with keyboard focus; without one (egui_dock focuses a tab group only
+    /// once it is clicked, and none after a tab closes), the active tab of the
+    /// first group, so that Ctrl+W still closes the tab on screen.
     fn focused_view(&mut self) -> Option<&mut DocView> {
+        if self.dock.find_active_focused().is_none() {
+            let first = self.dock.iter_all_tabs().next().map(|(tp, _)| tp);
+            if let Some(tp) = first {
+                self.dock.set_focused_node_and_surface(egui_dock::NodePath { surface: tp.surface, node: tp.node });
+            }
+        }
         self.dock.find_active_focused().map(|(_, t)| t)
     }
 
@@ -661,7 +673,8 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn title(&mut self, tab: &mut DocView) -> WidgetText {
-        if tab.dirty() { format!("● {}", tab.title).into() } else { tab.title.clone().into() }
+        let t = short_title(&tab.title);
+        if tab.dirty() { format!("● {t}").into() } else { t.into() }
     }
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut DocView) {
@@ -724,6 +737,42 @@ impl TabViewer for Viewer<'_> {
     }
 }
 
+/// A tab title short enough that several tabs and their close buttons fit:
+/// "Ikegami et al. 2018 - The erup…mec arc.pdf".
+fn short_title(t: &str) -> String {
+    const MAX: usize = 36;
+    let n = t.chars().count();
+    if n <= MAX {
+        return t.to_string();
+    }
+    let head: String = t.chars().take(MAX - 12).collect();
+    let tail: String = t.chars().skip(n - 11).collect();
+    format!("{}…{}", head.trim_end(), tail.trim_start())
+}
+
+/// Open a web link with the shell, as Explorer does. Browsers installed as
+/// packages (the Microsoft Store Firefox) must be started through the shell:
+/// run directly, they miss their profile. Only web and mail links are opened.
+pub(crate) fn open_link(url: &str) {
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")) {
+        log::warn!("not opening link {url}");
+        return;
+    }
+    let wide: Vec<u16> = url.trim().encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: null-terminated UTF-16 strings that outlive the call.
+    unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::PCWSTR(wide.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    }
+}
+
 impl eframe::App for StrataApp {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -772,7 +821,15 @@ impl eframe::App for StrataApp {
                 ThemeChoice::Light => strata_core::reflow::output::Theme::Light,
                 ThemeChoice::Dark => strata_core::reflow::output::Theme::Dark,
             };
-            let overlay = self.popup_open || self.ocr.dialog_open() || self.translate.dialog_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
+            let overlay = self.popup_open
+                || self.confirm_close.is_some()
+                || self.confirm_quit
+                || self.ocr.dialog_open()
+                || self.translate.dialog_open()
+                || self.password.is_some()
+                || self.props.is_some()
+                || self.show_about
+                || !self.errors.is_empty();
             let mut viewer = Viewer {
                 pool: &self.pool,
                 tiles: &mut self.tiles,
@@ -841,6 +898,26 @@ impl eframe::App for StrataApp {
         if popup != self.popup_open {
             self.popup_open = popup;
             ctx.request_repaint();
+        }
+        // Dialogs opened this frame hide the webviews in the next one.
+        let modal = self.confirm_close.is_some() || self.confirm_quit;
+        if modal != self.modal_open {
+            self.modal_open = modal;
+            ctx.request_repaint();
+        }
+        let links: Vec<String> = ctx.output_mut(|o| {
+            let mut links = Vec::new();
+            o.commands.retain(|c| match c {
+                egui::OutputCommand::OpenUrl(u) => {
+                    links.push(u.url.clone());
+                    false
+                }
+                _ => true,
+            });
+            links
+        });
+        for l in links {
+            open_link(&l);
         }
     }
 
