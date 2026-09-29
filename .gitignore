@@ -2,3 +2,4 @@
 /corpus/files/
 *.pdb
 /.vs
+/.cargo/config.toml

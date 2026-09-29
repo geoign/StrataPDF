@@ -1,0 +1,65 @@
+StrataPDF: notices for native (non-Rust) components
+====================================================
+
+StrataPDF is licensed under the GNU Affero General Public License v3.0 or later
+(see LICENSE.txt). Source code: https://github.com/geoign/StrataPDF
+
+Notices for the Rust crates are in THIRD-PARTY-NOTICES.html.
+
+
+MuPDF
+-----
+Copyright (C) Artifex Software, Inc. Licensed under the GNU Affero General
+Public License v3.0. https://mupdf.com/
+
+MuPDF includes the following libraries, statically linked into StrataPDF.exe:
+
+- FreeType. Portions of this software are copyright (C) The FreeType Project
+  (https://freetype.org). All rights reserved. Used under the FreeType License.
+- This software is based in part on the work of the Independent JPEG Group
+  (libjpeg).
+- HarfBuzz (MIT), Little CMS 2 (MIT), OpenJPEG (BSD-2-Clause), zlib (zlib),
+  jbig2dec (AGPL-3.0), Gumbo (Apache-2.0), lcms2mt, extract (AGPL-3.0),
+  and the fonts bundled with MuPDF (Noto, URW base 35: SIL OFL 1.1 / AGPL-3.0
+  with font exception).
+
+
+ONNX Runtime
+------------
+MIT License
+
+Copyright (c) Microsoft Corporation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+DirectML (DirectML.dll)
+-----------------------
+Copyright (c) Microsoft Corporation. Redistributed as the runtime component of
+the Microsoft.AI.DirectML package under its license terms:
+https://www.nuget.org/packages/Microsoft.AI.DirectML/
+
+
+Models (downloaded on first use, not included in this package)
+--------------------------------------------------------------
+- NDLOCR-Lite (National Diet Library, Japan), CC BY 4.0:
+  https://github.com/ndl-lab/ndlocr-lite
+  The OCR pipeline of StrataPDF is a Rust port of its inference code.
+- Pix2Text MFR 1.5 (breezedeus), MIT:
+  https://huggingface.co/breezedeus/pix2text-mfr-1.5

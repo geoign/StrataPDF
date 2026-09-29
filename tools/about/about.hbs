@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>StrataPDF third-party notices</title>
+<style>
+body { font-family: sans-serif; max-width: 60em; margin: 2em auto; padding: 0 1em; }
+pre { white-space: pre-wrap; background: #f4f4f4; padding: 1em; font-size: 0.85em; }
+li { margin-bottom: 0.2em; }
+</style>
+</head>
+<body>
+<h1>Third-party notices</h1>
+<p>StrataPDF is licensed under AGPL-3.0-or-later. It includes the following Rust crates.
+MuPDF (Artifex Software, AGPL-3.0) is built from the <code>mupdf-sys</code> crate.
+ONNX Runtime (Microsoft, MIT) is linked by the <code>ort</code> crate, and DirectML.dll is the
+Microsoft DirectML redistributable runtime.</p>
+<h2>Licenses used</h2>
+<ul>
+{{#each overview}}
+<li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+<h2>Licenses</h2>
+{{#each licenses}}
+<h3 id="{{id}}">{{name}}</h3>
+<p>Used by:</p>
+<ul>
+{{#each used_by}}
+<li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+{{/each}}
+</body>
+</html>

@@ -1,12 +1,16 @@
-# StrataPDF の登録を解除する。-RemoveFiles で配置したファイルも削除する。
+﻿# StrataPDF の登録を解除する。-RemoveFiles で配置したファイルも削除する。
 # ユーザーデータ（%LOCALAPPDATA%\StrataPDF の OCR モデル・キャッシュ）は残す。
 param(
-    [string]$Dest = "$env:USERPROFILE\OneDrive\Apps\StrataPDF",
+    [string]$Dest,
     [switch]$RemoveFiles
 )
 $ErrorActionPreference = 'Continue'
 $classes = 'HKCU:\Software\Classes'
 $progId = 'StrataPDF.Document'
+if (-not $Dest) {
+    $cmd = (Get-ItemProperty "$classes\$progId\shell\open\command" -ErrorAction SilentlyContinue).'(default)'
+    if ($cmd -match '^"([^"]+)"') { $Dest = Split-Path -Parent $Matches[1] }
+}
 
 Remove-Item "$classes\$progId" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$classes\Applications\StrataPDF.exe" -Recurse -Force -ErrorAction SilentlyContinue
@@ -17,8 +21,8 @@ Remove-Item 'HKCU:\Software\StrataPDF' -Recurse -Force -ErrorAction SilentlyCont
 Remove-ItemProperty 'HKCU:\Software\RegisteredApplications' -Name 'StrataPDF' -ErrorAction SilentlyContinue
 Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\StrataPDF.lnk" -Force -ErrorAction SilentlyContinue
 
-if ($RemoveFiles) {
-    Get-Process StrataPDF -ErrorAction SilentlyContinue | Stop-Process -Force
+if ($RemoveFiles -and $Dest) {
+    Get-Process StrataPDF -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Dest) } | Stop-Process -Force
     Remove-Item $Dest -Recurse -Force -ErrorAction SilentlyContinue
 }
 

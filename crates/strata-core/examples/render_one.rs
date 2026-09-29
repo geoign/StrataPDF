@@ -10,6 +10,8 @@ fn main() {
     let pix = page
         .to_pixmap(&Matrix::new_scale(2.0, 2.0), &Colorspace::device_rgb(), false, true)
         .expect("render");
-    pix.save_as("C:/tmp/strata_render_one.png", mupdf::ImageFormat::PNG).expect("save");
+    let out = std::env::temp_dir().join("strata_render_one.png");
+    pix.save_as(out.to_str().unwrap(), mupdf::ImageFormat::PNG).expect("save");
+    println!("{}", out.display());
     println!("{}x{} total={:?}", pix.width(), pix.height(), t0.elapsed());
 }

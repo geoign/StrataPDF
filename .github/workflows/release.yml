@@ -1,0 +1,84 @@
+# Builds the Windows package. A tag "v*" publishes it as a GitHub release;
+# a manual run only uploads the zip as a workflow artifact.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Build
+        run: cargo build --release --locked -p strata-app
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $out = 'dist\StrataPDF'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item target\release\strata-app.exe "$out\StrataPDF.exe"
+
+          # DirectML.dll: copied (or symlinked) next to the build output by the ort crate.
+          $dml = Get-Item target\release\DirectML.dll -ErrorAction SilentlyContinue
+          if ($dml -and $dml.LinkType) { $dml = Get-Item ($dml.Target | Select-Object -First 1) }
+          if (-not $dml) { $dml = Get-ChildItem "$env:LOCALAPPDATA\ort.pyke.io" -Recurse -Filter DirectML.dll | Select-Object -First 1 }
+          if (-not $dml) { throw 'DirectML.dll not found' }
+          Copy-Item $dml.FullName "$out\DirectML.dll"
+
+          Copy-Item LICENSE "$out\LICENSE.txt"
+          Copy-Item tools\about\NOTICES-NATIVE.txt "$out\NOTICES-NATIVE.txt"
+          cargo about generate -c tools/about/about.toml -m crates/strata-app/Cargo.toml tools/about/about.hbs -o "$out\THIRD-PARTY-NOTICES.html"
+          if ($LASTEXITCODE -ne 0) { throw 'cargo about failed' }
+          Copy-Item tools\install.ps1, tools\uninstall.ps1 $out
+
+          $readme = @"
+          StrataPDF $ver
+
+          Windows 向けの PDF ビューア。StrataPDF.exe をそのまま起動できる。
+          関連付けの候補とスタートメニューに登録するには、このフォルダーを置き場所へ移してから次を実行する。
+
+            powershell -ExecutionPolicy Bypass -File .\install.ps1
+            powershell -ExecutionPolicy Bypass -File .\uninstall.ps1   （登録の解除）
+
+          ライセンス: AGPL-3.0-or-later（LICENSE.txt）。同梱物の表記は THIRD-PARTY-NOTICES.html と NOTICES-NATIVE.txt。
+          ソースコード: https://github.com/geoign/StrataPDF/tree/$ver
+          "@
+          if ($env:GITHUB_REF_TYPE -ne 'tag') { $readme = $readme -replace '/tree/dev-[0-9a-f]+', "/tree/$env:GITHUB_SHA" }
+          [IO.File]::WriteAllText("$PWD\$out\README.txt", $readme.Replace("`n", "`r`n"), [Text.UTF8Encoding]::new($true))
+
+          $zip = "dist\StrataPDF-$ver-windows-x64.zip"
+          Compress-Archive -Path $out -DestinationPath $zip
+          "ZIP=$zip" | Out-File -Append $env:GITHUB_ENV
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StrataPDF-windows-x64
+          path: ${{ env.ZIP }}
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true

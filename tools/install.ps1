@@ -1,45 +1,66 @@
-# StrataPDF の配置と、現在のユーザーへの登録（管理者権限は不要）。
+﻿# StrataPDF の配置と、現在のユーザーへの登録（管理者権限は不要）。
+#
+# 配布版（Releases の zip）: 展開したフォルダーの install.ps1 を実行すると、そのフォルダーの
+# StrataPDF.exe をその場で登録する。先にフォルダーを置き場所へ移しておくこと。
+#
+# ソースから:
 #   pwsh tools\install.ps1            ビルドしてから配置
 #   pwsh tools\install.ps1 -NoBuild   ビルド済みの実行ファイルを配置
+#   配置先の既定は、登録済みならその場所、未登録なら %LOCALAPPDATA%\Programs\StrataPDF。
+#
 # 登録後、Windows の「設定 > アプリ > 既定のアプリ」で StrataPDF を .pdf の既定に選べる。
 param(
-    [string]$Dest = "$env:USERPROFILE\OneDrive\Apps\StrataPDF",
+    [string]$Dest,
     [switch]$NoBuild
 )
 $ErrorActionPreference = 'Stop'
-$repo = Split-Path -Parent $PSScriptRoot
-$target = 'C:\tmp\cargo-target\StrataPDF\release'
+$progId = 'StrataPDF.Document'
+$classes = 'HKCU:\Software\Classes'
 
-if (-not $NoBuild) {
+$packaged = Test-Path (Join-Path $PSScriptRoot 'StrataPDF.exe')
+if ($packaged) {
+    # 配布版：その場で登録する。
+    if (-not $Dest) { $Dest = $PSScriptRoot }
+    $Dest = (Resolve-Path $Dest).Path
+    if ($Dest -ne $PSScriptRoot) { throw '配布版は展開したフォルダーで登録する。フォルダーごと移してから実行すること' }
+} else {
+    if (-not $Dest) {
+        # 登録済みの場所を引き継ぐ。
+        $cmd = (Get-ItemProperty "$classes\$progId\shell\open\command" -ErrorAction SilentlyContinue).'(default)'
+        if ($cmd -match '^"([^"]+)"') { $Dest = Split-Path -Parent $Matches[1] }
+        else { $Dest = "$env:LOCALAPPDATA\Programs\StrataPDF" }
+    }
+    $repo = Split-Path -Parent $PSScriptRoot
     Push-Location $repo
     try {
-        cargo build --release -p strata-app
-        if ($LASTEXITCODE -ne 0) { throw 'cargo build が失敗しました' }
+        if (-not $NoBuild) {
+            cargo build --release -p strata-app
+            if ($LASTEXITCODE -ne 0) { throw 'cargo build が失敗しました' }
+        }
+        $target = Join-Path ((cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory) 'release'
     } finally { Pop-Location }
-}
 
-# 配置先で動いている StrataPDF を終了してから上書きする。
-Get-Process StrataPDF -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Dest) } | Stop-Process -Force
-Start-Sleep -Milliseconds 300
+    # 配置先で動いている StrataPDF を終了してから上書きする。
+    Get-Process StrataPDF -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Dest) } | Stop-Process -Force
+    Start-Sleep -Milliseconds 300
 
-New-Item -ItemType Directory -Force $Dest | Out-Null
-Copy-Item "$target\strata-app.exe" "$Dest\StrataPDF.exe" -Force
-# DirectML.dll はビルド出力ではシンボリックリンクなので、実体をコピーする。
-$dml = Get-Item "$target\DirectML.dll"
-if ($dml.LinkType) { $dml = Get-Item ($dml.Target | Select-Object -First 1) }
-Copy-Item $dml.FullName "$Dest\DirectML.dll" -Force
-@"
-StrataPDF（私的利用に限る）
+    New-Item -ItemType Directory -Force $Dest | Out-Null
+    Copy-Item "$target\strata-app.exe" "$Dest\StrataPDF.exe" -Force
+    # DirectML.dll はビルド出力ではシンボリックリンクなので、実体をコピーする。
+    $dml = Get-Item "$target\DirectML.dll"
+    if ($dml.LinkType) { $dml = Get-Item ($dml.Target | Select-Object -First 1) }
+    Copy-Item $dml.FullName "$Dest\DirectML.dll" -Force
+    @"
+StrataPDF（ソースからのビルド）
 
-MuPDF（AGPL-3.0）を含むため、このフォルダの内容を他者に配布しないこと。
-ソース: $repo
+ライセンス: AGPL-3.0-or-later（描画エンジン MuPDF を含む）
+ソース: https://github.com/geoign/StrataPDF
 登録の解除: pwsh "$repo\tools\uninstall.ps1"
 "@ | Set-Content -Encoding utf8 "$Dest\README.txt"
+}
 
 $exe = "$Dest\StrataPDF.exe"
-$progId = 'StrataPDF.Document'
 $exts = '.pdf', '.epub', '.xps', '.oxps', '.cbz'
-$classes = 'HKCU:\Software\Classes'
 
 function Set-Default([string]$path, [string]$value) {
     if (-not (Test-Path $path)) { New-Item $path -Force | Out-Null }
