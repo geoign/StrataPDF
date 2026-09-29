@@ -14,6 +14,7 @@
 //! blocks that mix them. The heuristics remain for what it does not cover and
 //! for pages without its labels.
 
+mod hyphen;
 mod order;
 pub mod output;
 
@@ -186,6 +187,9 @@ struct PageData {
     dl: Option<mupdf::DisplayList>,
     /// The text came from OCR.
     ocr: bool,
+    /// The text is OCR output (ours, or a text layer over a page scan): type
+    /// sizes are estimates.
+    scan: bool,
     /// Lines found by the layout model: box, class and region (empty without it).
     layout: Vec<(RectF, usize, usize)>,
 }
@@ -463,7 +467,9 @@ fn majority_class(lines: &[(RichLine, Option<(usize, usize)>)]) -> Option<(usize
 }
 
 /// Blocks of one layout region (the extractor splits some paragraphs, captions
-/// and reference entries into a block per line) become one unit, if they share a column.
+/// and reference entries into a block per line) become one unit, if they share
+/// a column. A reference list taken for one region is split into its entries
+/// again by [`regroup_references`].
 fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
     let mut out: Vec<Unit> = Vec::with_capacity(units.len());
     for u in units {
@@ -472,7 +478,15 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
         if let Some(g) = u.group
             && let Some(o) = out.iter_mut().find(|o| {
                 let os = o.size();
-                o.group == Some(g) && o.kind == UnitKind::Text && o.bbox.x0 < u.bbox.x1 && u.bbox.x0 < o.bbox.x1 && (os - size).abs() <= os.max(size) * 0.15
+                o.group == Some(g)
+                    && o.kind == UnitKind::Text
+                    && o.bbox.x0 < u.bbox.x1
+                    && u.bbox.x0 < o.bbox.x1
+                    && (os - size).abs() <= os.max(size) * 0.15
+                    // Within one column: joining must not widen the wider block by more
+                    // than a few ems (ragged line ends do; a region spanning two columns
+                    // would otherwise interleave them).
+                    && o.bbox.union(&u.bbox).width() <= o.bbox.width().max(u.bbox.width()) + size.max(os) * 4.0
             })
         {
             o.bbox = o.bbox.union(&u.bbox);
@@ -482,6 +496,101 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
         }
         out.push(u);
     }
+    out
+}
+
+/// "Almendros, J., Wilcock, W., ..." or "Av´e Lallemant, H.G., ...": the start of a
+/// reference entry (a surname, a comma, then initials).
+fn author_start(t: &str) -> bool {
+    let mut words = t.split_whitespace();
+    // The surname may have several words ("Av´e Lallemant,", "de Ronde,").
+    for _ in 0..3 {
+        let Some(w) = words.next() else { return false };
+        if w.ends_with(',') && w.chars().filter(|c| c.is_alphabetic()).count() >= 2 {
+            return words.next().is_some_and(|i| {
+                let letters: Vec<char> = i.chars().filter(|c| c.is_alphabetic()).collect();
+                !letters.is_empty() && letters.iter().all(|c| c.is_uppercase()) && letters.len() <= 3 && i.contains('.')
+            });
+        }
+    }
+    false
+}
+
+/// Reference lists set with a hanging indent, rebuilt from their lines: the
+/// extractor cuts them into blocks that do not follow the entries (a block per
+/// continuation line, or every other line of a column in one block). A column
+/// where at least three lines start with a name and initials at the same left
+/// edge is such a list; its blocks of the same type size whose lines either
+/// start an entry at that edge or are indented are pooled, their lines sorted
+/// top to bottom, and each line at the edge starts an entry. Body text (plain
+/// lines at the edge), headings and entries without personal names keep their blocks.
+fn regroup_references(units: Vec<Unit>) -> Vec<Unit> {
+    let text: Vec<usize> = (0..units.len()).filter(|&i| units[i].kind == UnitKind::Text && !units[i].lines.is_empty()).collect();
+    let starts: Vec<(RectF, f32)> = text
+        .iter()
+        .flat_map(|&i| units[i].lines.iter().map(move |l| (l, i)))
+        .filter(|(l, _)| author_start(&l.text()))
+        .map(|(l, i)| (l.bbox, units[i].size()))
+        .collect();
+    // Left edges shared by at least three entry starts.
+    let mut edges: Vec<(f32, f32, f32, usize)> = Vec::new(); // left, right, size, count
+    for (b, size) in &starts {
+        match edges.iter_mut().find(|e| (e.0 - b.x0).abs() < 1.5) {
+            Some(e) => {
+                e.1 = e.1.max(b.x1);
+                e.3 += 1;
+            }
+            None => edges.push((b.x0, b.x1, *size, 1)),
+        }
+    }
+    let edges: Vec<(f32, f32, f32)> = edges.into_iter().filter(|e| e.3 >= 3).map(|e| (e.0, e.1, e.2)).collect();
+    if edges.is_empty() {
+        return units;
+    }
+    let mut slots: Vec<Option<Unit>> = units.into_iter().map(Some).collect();
+    let mut rebuilt: Vec<Unit> = Vec::new();
+    for (left, right, size) in edges {
+        let tol = size * 0.5;
+        let at_edge = |x: f32| (x - left).abs() < tol;
+        let indented = |x: f32| x - left > tol && x - left < size * 4.0;
+        // Blocks of the list: every line at the edge or the indent, same size, within the column.
+        let members: Vec<usize> = text
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let Some(u) = slots[i].as_ref() else { return false };
+                !matches!(u.class, Some(TITLE | SECTION_HEADER | PICTURE | CAPTION))
+                    && (u.size() - size).abs() <= size * 0.1
+                    && u.lines.iter().all(|l| (at_edge(l.bbox.x0) || indented(l.bbox.x0)) && l.bbox.x1 <= right + size * 2.0)
+                    // Lines at the edge mostly start entries (body text has plain lines
+                    // there; some entries start with an organisation's name).
+                    && {
+                        let edge: Vec<&RichLine> = u.lines.iter().filter(|l| at_edge(l.bbox.x0)).collect();
+                        edge.iter().filter(|l| author_start(&l.text())).count() * 5 >= edge.len() * 3
+                    }
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let first = members[0];
+        let (class, group) = slots[first].as_ref().map(|u| (u.class, u.group)).unwrap_or((None, None));
+        let mut lines: Vec<RichLine> = members.iter().filter_map(|&i| slots[i].take()).flat_map(|u| u.lines).collect();
+        lines.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0).then(a.bbox.x0.total_cmp(&b.bbox.x0)));
+        let mut entries: Vec<Vec<RichLine>> = Vec::new();
+        for l in lines {
+            match entries.last_mut() {
+                Some(e) if !at_edge(l.bbox.x0) => e.push(l),
+                _ => entries.push(vec![l]),
+            }
+        }
+        for e in entries {
+            let bbox = e.iter().skip(1).fold(e[0].bbox, |a, l| a.union(&l.bbox));
+            rebuilt.push(Unit { kind: UnitKind::Text, bbox, lines: e, class, group });
+        }
+    }
+    let mut out: Vec<Unit> = slots.into_iter().flatten().collect();
+    out.extend(rebuilt);
     out
 }
 
@@ -670,7 +779,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         k += 1;
         !numbers.contains(&(k - 1))
     });
-    let mut units = merge_regions(units);
+    let mut units = regroup_references(merge_regions(units));
     for r in vector_figures(&p.rich.blocks, page_area) {
         units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None });
     }
@@ -817,7 +926,19 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             _ => k += 1,
         }
     }
-    out.extend(figs.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None, group: None }));
+    // Figures found by different means overlap (the panels of a figure and the
+    // drawing around them): one figure each.
+    let mut merged: Vec<RectF> = Vec::with_capacity(figs.len());
+    for f in figs {
+        merged.push(f);
+        loop {
+            let last = *merged.last().unwrap();
+            let Some(j) = (0..merged.len() - 1).find(|&j| overlap_frac(&last, &merged[j]) > 0.5 || overlap_frac(&merged[j], &last) > 0.5) else { break };
+            let o = merged.remove(j);
+            *merged.last_mut().unwrap() = last.union(&o);
+        }
+    }
+    out.extend(merged.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None, group: None }));
     (out, manuscript)
 }
 
@@ -879,25 +1000,48 @@ fn is_list_marker(t: &str) -> bool {
     }
 }
 
+/// Join text that ends in a hyphen to the text that follows it (the next line,
+/// or the next part of a paragraph): without a space, dropping the hyphen of a
+/// word broken in two and keeping that of a compound. Returns false, and does
+/// nothing, when `prev` does not end in a hyphen after a letter or digit.
+fn join_hyphenated(prev: &mut Vec<Span>, next: &str, lex: &hyphen::Lexicon) -> bool {
+    while prev.len() > 1 && prev.last().is_some_and(|s| s.text.trim().is_empty()) {
+        prev.pop();
+    }
+    let Some(s) = prev.last_mut() else { return false };
+    let t = s.text.trim_end();
+    let Some(h) = t.chars().last().filter(|&c| hyphen::is_hyphen(c)) else { return false };
+    let before = t[..t.len() - h.len_utf8()].chars().last();
+    if !before.is_some_and(char::is_alphanumeric) || next.trim_start().is_empty() {
+        return false;
+    }
+    let keep = match (hyphen::word_before_hyphen(t), hyphen::word_after(next)) {
+        _ if h == '\u{00AD}' => false,
+        (Some(a), Some(b)) => lex.keep_hyphen(a, b),
+        // Before a capital or a digit ("Plio-" / "Pleistocene", "1980-" / "1990"),
+        // or after a digit ("SO2-" / "rich"): a compound.
+        _ => true,
+    };
+    let len = t.len();
+    s.text.truncate(len);
+    if !keep {
+        s.text.truncate(len - h.len_utf8());
+    }
+    true
+}
+
 /// Split a unit's characters into styled spans.
-fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: bool) -> Vec<Span> {
+fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: bool, lex: &hyphen::Lexicon) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     let mut prev_last: Option<char> = None;
-    let mut prev_joined = false;
     for (li, l) in u.lines.iter().enumerate() {
         let med = line_size(l);
         let lcy = (l.bbox.y0 + l.bbox.y1) * 0.5;
         let first = l.chars.first().map(|c| c.c);
-        if li > 0 && prev_joined {
-            // MuPDF flags the line ending in a hyphen; drop the hyphen and join.
-            if let Some(s) = spans.last_mut()
-                && s.text.ends_with(['-', '\u{2010}', '\u{2011}', '\u{00AD}'])
-            {
-                s.text.pop();
-            }
+        if li > 0 && !vertical && join_hyphenated(&mut spans, &l.text(), lex) {
+            // Joined at a hyphen, without a space.
         } else if li > 0 {
-            // A real hyphen at the line end ("Species-" / "Poor") joins without a space.
-            let join_tight = vertical || prev_last == Some('-') || matches!((prev_last, first), (Some(a), Some(b)) if is_cjk(a) || is_cjk(b));
+            let join_tight = vertical || matches!((prev_last, first), (Some(a), Some(b)) if is_cjk(a) || is_cjk(b));
             if !join_tight
                 && let Some(s) = spans.last_mut()
                 && !s.text.ends_with(' ')
@@ -930,7 +1074,6 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
             }
         }
         prev_last = l.chars.last().map(|c| c.c);
-        prev_joined = l.joined;
     }
     for s in &mut spans {
         if s.style.sup || s.style.sub {
@@ -1050,6 +1193,8 @@ struct LastPara {
     last_full: bool,
     page: u32,
     bbox: RectF,
+    /// Type size of its last unit.
+    size: f32,
 }
 
 fn math_fraction(u: &Unit, fonts: &[FontInfo]) -> f32 {
@@ -1197,13 +1342,18 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             })
             .unwrap_or_default();
         let ocr = from_ocr || needs_ocr(&rich).is_some();
-        pages.push(PageData { page: p as u32, rich, links, dl: page.to_display_list(true).ok(), ocr, layout: Vec::new() });
+        let area = b.width() * b.height();
+        let over_scan = rich.blocks.iter().any(|b| matches!(b, RichBlock::Image { bbox } if bbox.width() * bbox.height() > area * 0.7))
+            && rich.blocks.iter().map(|b| if let RichBlock::Text { lines, .. } = b { lines.iter().map(|l| l.chars.len()).sum() } else { 0 }).sum::<usize>() > 100;
+        let scan = ocr || over_scan;
+        pages.push(PageData { page: p as u32, rich, links, dl: page.to_display_list(true).ok(), ocr, scan, layout: Vec::new() });
         if p % 4 == 0 {
             progress(p + 1, total);
         }
     }
     let body = body_size(&pages);
     let repeated = repeated_margin_lines(&pages);
+    let lex = hyphen::Lexicon::build(pages.iter().map(|p| &p.rich));
     let (mut vchars, mut hchars) = (0usize, 0usize);
     for p in &pages {
         for b in &p.rich.blocks {
@@ -1228,6 +1378,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // Vertical text: did the last paragraph column run to the bottom of the text area?
     let mut last_col_full = false;
     let mut last_para: Option<LastPara> = None;
+    // Type size (of the last unit) and page of each paragraph node.
+    let mut para_size: HashMap<usize, (f32, u32)> = HashMap::new();
+    // The last float caption: its node, type size, box and page (for a caption
+    // continued in the next column).
+    let mut last_caption: Option<(usize, f32, RectF, u32)> = None;
     // The last heading from the layout model: node, page, box and size, for
     // headings that the extractor split into one block per line.
     let mut last_heading: Option<(usize, u32, RectF, f32)> = None;
@@ -1249,6 +1404,18 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         }
         if !vertical {
             ordered = merge_display_math(ordered, &p.rich.fonts, body);
+        }
+        // `STRATA_DEBUG_UNITS=<page>` (1-based): the ordered units of that page on stderr.
+        if std::env::var("STRATA_DEBUG_UNITS").ok().and_then(|v| v.parse::<u32>().ok()) == Some(p.page + 1) {
+            for u in &ordered {
+                let t = u.text();
+                let head: String = t.chars().take(60).collect();
+                let tail: String = t.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
+                eprintln!(
+                    "{:?} [{:.0},{:.0},{:.0},{:.0}] lines={} size={:.1} class={:?} group={:?} | {head} … {tail}",
+                    u.kind, u.bbox.x0, u.bbox.y0, u.bbox.x1, u.bbox.y1, u.lines.len(), u.size(), u.class.map(|c| strata_ocr::layout::CLASSES[c]), u.group
+                );
+            }
         }
         doc.fill_anchors((p.page, 0.0));
         doc.nodes.push(Node::PageStart { page: p.page });
@@ -1288,9 +1455,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     && next.kind == UnitKind::Text
                     && caption_kind(&next.text()) == Some(false)
                 {
-                    caption = spans_of(next, &p.rich.fonts, &p.links, vertical);
+                    caption = spans_of(next, &p.rich.fonts, &p.links, vertical, &lex);
                     if let Some(img) = crop(u.bbox, opts.image_scale, &mut doc) {
                         doc.nodes.push(Node::Figure { image: img, caption });
+                        last_caption = Some((doc.nodes.len() - 1, next.size(), next.bbox, p.page));
                     }
                     i += 2;
                     continue;
@@ -1310,7 +1478,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             match caption_kind(&text).filter(|&table| !(running_text && table && !leads_to_table)) {
                 Some(true) => {
                     // Table: caption, then small-font units until body text resumes.
-                    let caption = spans_of(u, &p.rich.fonts, &p.links, vertical);
+                    let caption = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
                     let mut j = i + 1;
                     let mut region: Option<RectF> = None;
                     let mut rows = Vec::new();
@@ -1330,7 +1498,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         j += 1;
                     }
                     match region.and_then(|r| crop(r, opts.image_scale, &mut doc)) {
-                        Some(img) => doc.nodes.push(Node::Table { image: img, caption, rows }),
+                        Some(img) => {
+                            doc.nodes.push(Node::Table { image: img, caption, rows });
+                            last_caption = Some((doc.nodes.len() - 1, size, u.bbox, p.page));
+                        }
                         None => doc.nodes.push(Node::Paragraph { spans: caption }),
                     }
                     i = j;
@@ -1338,11 +1509,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
                 Some(false) => {
                     // Figure caption whose figure came earlier: attach if possible.
-                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical);
+                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
                     if let Some(Node::Figure { caption, .. }) = doc.nodes.last_mut()
                         && caption.is_empty()
                     {
                         *caption = spans;
+                        last_caption = Some((doc.nodes.len() - 1, size, u.bbox, p.page));
                     } else {
                         doc.nodes.push(Node::Paragraph { spans });
                     }
@@ -1351,13 +1523,15 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
                 None if u.class == Some(CAPTION) => {
                     // The rest of a caption ("(b) PPL image of ...") belongs to the float before it.
-                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical);
+                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
+                    let last = doc.nodes.len().saturating_sub(1);
                     match doc.nodes.last_mut() {
                         Some(Node::Figure { caption, .. } | Node::Table { caption, .. }) => {
-                            if !caption.is_empty() {
+                            if !caption.is_empty() && !join_hyphenated(caption, &text, &lex) {
                                 caption.push(Span { text: " ".into(), style: Style::default(), link: None });
                             }
                             caption.extend(spans);
+                            last_caption = Some((last, size, u.bbox, p.page));
                         }
                         _ => doc.nodes.push(Node::Paragraph { spans }),
                     }
@@ -1365,6 +1539,30 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     continue;
                 }
                 None => {}
+            }
+            // A caption set across two columns under a wide float: its second part
+            // starts beside the first, at the same height and in the same (non-body)
+            // type size, while the caption so far stops mid-sentence.
+            if !vertical
+                && let Some((ix, csize, cbox, cpage)) = last_caption
+                && cpage == p.page
+                && (size - csize).abs() <= csize * 0.05
+                && (size - body).abs() > body * 0.05
+                && (u.bbox.y0 - cbox.y0).abs() < csize * 1.5
+                && u.bbox.x0 >= cbox.x1 - 1.0
+                && !matches!(u.class, Some(TITLE | SECTION_HEADER))
+                && let Some(Node::Figure { caption, .. } | Node::Table { caption, .. }) = doc.nodes.get_mut(ix)
+                && !caption.is_empty()
+                && !ends_sentence(&spans_text(caption))
+            {
+                let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
+                if !join_hyphenated(caption, &text, &lex) {
+                    caption.push(Span { text: " ".into(), style: Style::default(), link: None });
+                }
+                caption.extend(spans);
+                last_caption = Some((ix, csize, cbox.union(&u.bbox), cpage));
+                i += 1;
+                continue;
             }
             let math = math_fraction(u, &p.rich.fonts);
             let short = text.chars().count() < 160 && u.lines.len() <= 3;
@@ -1477,7 +1675,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             } else {
                 None
             };
-            let mut spans = spans_of(u, &p.rich.fonts, &p.links, vertical);
+            let mut spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
             // Run-in heading: "4.1.1. Porous flow bands  Body text..." in one block.
             if level.is_none() {
                 let lead: usize = spans.iter().take_while(|s| s.style.bold || s.style.italic || s.text.trim().is_empty()).count();
@@ -1548,11 +1746,30 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 // Continuation across a column or page break; figures, tables,
                 // footnotes and stray captions that interrupt a paragraph are floats
                 // and are skipped.
-                let prev = doc.nodes.iter().rposition(|n| match n {
-                    Node::PageStart { .. } | Node::Figure { .. } | Node::Table { .. } | Node::Footnote { .. } => false,
-                    Node::Paragraph { spans } => caption_kind(&spans_text(spans)).is_none(),
-                    _ => true,
-                });
+                // Paragraphs in another type size (affiliations, editorial notes,
+                // captions the model took for text) interrupt running text like
+                // floats: a few of them, on this page or the one before, are skipped.
+                let mut skipped = 0;
+                let prev = doc
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(ix, n)| match n {
+                        Node::PageStart { .. } | Node::Figure { .. } | Node::Table { .. } | Node::Footnote { .. } => false,
+                        Node::Paragraph { spans } if caption_kind(&spans_text(spans)).is_some() => false,
+                        Node::Paragraph { .. }
+                            if !vertical
+                                && !p.scan
+                                && skipped < 3
+                                && para_size.get(ix).is_some_and(|&(s, pg)| pg + 1 >= p.page && (s - size).abs() > s.max(size) * 0.12) =>
+                        {
+                            skipped += 1;
+                            false
+                        }
+                        _ => true,
+                    })
+                    .map(|(ix, _)| ix);
                 let (at_top, at_bottom) = column_edges(&ordered, i);
                 let merge = match prev.map(|ix| &doc.nodes[ix]) {
                     Some(Node::Paragraph { spans: prev_spans }) => {
@@ -1583,8 +1800,13 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                                     && u.bbox.y0 >= l.bbox.y1 - 2.0
                                     && u.bbox.y0 - l.bbox.y1 < line_gap
                             });
-                            continues(&prev_text, &text)
-                                || (!ends_sentence(&prev_text) && !first_indented && bodyish && ((cut && at_top) || adjacent))
+                            // Running text continues in its own type size: a caption or a note
+                            // set smaller (or a display line set larger) is no continuation.
+                            // OCR sizes are estimates.
+                            // A short fragment (the end of a sentence in a math font) is exempt.
+                            let fragment = u.lines.len() == 1 && text.chars().count() <= 30;
+                            let same_size = p.scan || fragment || last_para.as_ref().is_none_or(|l| Some(l.node) != prev || (l.size - size).abs() <= l.size.max(size) * 0.12);
+                            same_size && (continues(&prev_text, &text) || (!ends_sentence(&prev_text) && !first_indented && bodyish && ((cut && at_top) || adjacent)))
                         }
                     }
                     _ => false,
@@ -1607,15 +1829,22 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     let idx = prev.unwrap();
                     if let Node::Paragraph { spans: prev } = &mut doc.nodes[idx] {
                         let cjk = spans_text(prev).chars().last().is_some_and(is_cjk);
-                        if !cjk && !vertical {
+                        if !cjk && !vertical && !join_hyphenated(prev, &text, &lex) {
                             prev.push(Span { text: " ".into(), style: Style::default(), link: None });
                         }
                         prev.extend(spans);
                     }
-                    last_para = Some(LastPara { node: idx, cut_at_edge, last_full, page: p.page, bbox: u.bbox });
+                    // A short fragment (math, a last word) keeps the paragraph's size.
+                    let size = match &last_para {
+                        Some(l) if l.node == idx && u.lines.len() == 1 && text.chars().count() <= 30 => l.size,
+                        _ => size,
+                    };
+                    last_para = Some(LastPara { node: idx, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size });
+                    para_size.insert(idx, (size, p.page));
                 } else {
                     doc.nodes.push(Node::Paragraph { spans });
-                    last_para = Some(LastPara { node: doc.nodes.len() - 1, cut_at_edge, last_full, page: p.page, bbox: u.bbox });
+                    last_para = Some(LastPara { node: doc.nodes.len() - 1, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size });
+                    para_size.insert(doc.nodes.len() - 1, (size, p.page));
                 }
             }
             i += 1;
@@ -1652,6 +1881,16 @@ mod tests {
         assert_eq!(caption_kind("Table 2"), Some(true));
         assert_eq!(caption_kind("Tables are"), None);
         assert_eq!(caption_kind("図3 地質図"), Some(false));
+    }
+
+    #[test]
+    fn reference_starts() {
+        assert!(author_start("Almendros, J., Wilcock, W., Soule, D."));
+        assert!(author_start("Av´e Lallemant, H.G., Oldow, J.S., 2000."));
+        assert!(author_start("Arai, K., Matsuda, H."));
+        assert!(!author_start("Bru˜na, J.L."[..0].trim()));
+        assert!(!author_start("Geophysical investigation of rifting and volcanism"));
+        assert!(!author_start("In contrast, the northern part"));
     }
 
     #[test]
