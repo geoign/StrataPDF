@@ -64,7 +64,7 @@ jobs:
           ソースコード: https://github.com/geoign/StrataPDF/tree/$ver
           "@
           if ($env:GITHUB_REF_TYPE -ne 'tag') { $readme = $readme -replace '/tree/dev-[0-9a-f]+', "/tree/$env:GITHUB_SHA" }
-          [IO.File]::WriteAllText("$PWD\$out\README.txt", $readme.Replace("`n", "`r`n"), [Text.UTF8Encoding]::new($true))
+          [IO.File]::WriteAllText("$PWD\$out\README.txt", ($readme -replace "`r?`n", "`r`n"), [Text.UTF8Encoding]::new($true))
 
           $zip = "dist\StrataPDF-$ver-windows-x64.zip"
           Compress-Archive -Path $out -DestinationPath $zip
