@@ -24,7 +24,12 @@ pub struct LayoutParams {
     pub viewport_w: f32,
     pub gap: f32,
     pub margin: f32,
+    /// Put as many spreads side by side as fit the viewport (zoomed-out spread views).
+    pub multi: bool,
 }
+
+/// Gap between spreads placed side by side, in multiples of `gap`.
+const SPREAD_GAP: f32 = 4.0;
 
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -64,40 +69,68 @@ pub fn rows_of(n: usize, spread: Spread) -> Vec<Vec<u32>> {
     }
 }
 
+/// The spread (reading-order pages shown together) containing `page`.
+pub fn group_of(page: u32, n: usize, spread: Spread) -> Vec<u32> {
+    let n = n as u32;
+    let start = match spread {
+        Spread::Single => page,
+        Spread::Double => page & !1,
+        Spread::DoubleCover if page == 0 => return vec![0],
+        Spread::DoubleCover => page - (page - 1) % 2,
+    };
+    let len = if spread == Spread::Single { 1 } else { 2 };
+    (start..(start + len).min(n)).collect()
+}
+
 impl Layout {
     pub fn build(sizes: &[SizeF], p: &LayoutParams) -> Layout {
         let groups = rows_of(sizes.len(), p.spread);
         let z = p.zoom;
         let row_w = |g: &[u32]| g.iter().map(|&i| sizes[i as usize].w * z).sum::<f32>() + p.gap * (g.len().saturating_sub(1)) as f32;
         let max_w = groups.iter().map(|g| row_w(g)).fold(0.0f32, f32::max);
-        let width = (max_w + 2.0 * p.margin).max(p.viewport_w);
+        // Each spread gets a cell `max_w` wide; zoomed out, several cells share a row.
+        let cell_gap = p.gap * SPREAD_GAP;
+        let per_row = if p.multi && p.spread != Spread::Single && max_w > 0.0 {
+            (((p.viewport_w - 2.0 * p.margin + cell_gap) / (max_w + cell_gap)).floor() as usize).max(1)
+        } else {
+            1
+        };
+        let row_span = per_row as f32 * max_w + (per_row - 1) as f32 * cell_gap;
+        let width = (row_span + 2.0 * p.margin).max(p.viewport_w);
+        let x_start = (width - row_span) * 0.5;
         let mut page_rects = vec![Rect::NOTHING; sizes.len()];
         let mut page_row = vec![0u32; sizes.len()];
-        let mut rows = Vec::with_capacity(groups.len());
+        let mut rows = Vec::with_capacity(groups.len().div_ceil(per_row));
         let mut y = p.margin;
-        for (ri, g) in groups.into_iter().enumerate() {
-            let h = g.iter().map(|&i| sizes[i as usize].h * z).fold(0.0f32, f32::max);
-            let w = row_w(&g);
-            let mut x = ((width - w) * 0.5).max(p.margin);
-            // A lone page in a spread layout keeps its side of the gutter, so that
-            // pages do not jump sideways between rows.
-            if g.len() == 1 && p.spread != Spread::Single && w < max_w {
-                // In reading order, which pages are the left-hand page of a spread?
-                let lone_left = (g[0] % 2 == 1) == (p.spread == Spread::DoubleCover);
-                let on_left = lone_left != p.r2l;
-                let center = width * 0.5;
-                x = if on_left { center - p.gap * 0.5 - w } else { center + p.gap * 0.5 };
+        for (ri, cells) in groups.chunks(per_row).enumerate() {
+            let pages: Vec<u32> = cells.concat();
+            let h = pages.iter().map(|&i| sizes[i as usize].h * z).fold(0.0f32, f32::max);
+            for (ci, g) in cells.iter().enumerate() {
+                // Right-to-left books fill a row from the right.
+                let slot = if p.r2l { per_row - 1 - ci } else { ci };
+                let cell_x = x_start + slot as f32 * (max_w + cell_gap);
+                let w = row_w(g);
+                let mut x = cell_x + (max_w - w) * 0.5;
+                // A lone page in a spread layout keeps its side of the gutter, so that
+                // pages do not jump sideways between rows.
+                if g.len() == 1 && p.spread != Spread::Single && w < max_w {
+                    // In reading order, which pages are the left-hand page of a spread?
+                    let lone_left = (g[0] % 2 == 1) == (p.spread == Spread::DoubleCover);
+                    let on_left = lone_left != p.r2l;
+                    let center = cell_x + max_w * 0.5;
+                    x = if on_left { center - p.gap * 0.5 - w } else { center + p.gap * 0.5 };
+                }
+                let order: Vec<u32> = if p.r2l { g.iter().rev().copied().collect() } else { g.clone() };
+                for &i in &order {
+                    let s = sizes[i as usize];
+                    let (pw, ph) = (s.w * z, s.h * z);
+                    let top = y + (h - ph) * 0.5;
+                    page_rects[i as usize] = Rect::from_min_size(pos2(x, top), vec2(pw, ph));
+                    page_row[i as usize] = ri as u32;
+                    x += pw + p.gap;
+                }
             }
-            let order: Vec<u32> = if p.r2l { g.iter().rev().copied().collect() } else { g.clone() };
-            for &i in &order {
-                let s = sizes[i as usize];
-                let (pw, ph) = (s.w * z, s.h * z);
-                let top = y + (h - ph) * 0.5;
-                page_rects[i as usize] = Rect::from_min_size(pos2(x, top), vec2(pw, ph));
-                page_row[i as usize] = ri as u32;
-                x += pw + p.gap;
-            }
-            rows.push(Row { y0: y, y1: y + h, pages: g });
+            rows.push(Row { y0: y, y1: y + h, pages });
             y += h + p.gap;
         }
         let height = y - p.gap + p.margin;
@@ -139,7 +172,37 @@ mod tests {
     }
 
     fn params(spread: Spread, r2l: bool) -> LayoutParams {
-        LayoutParams { zoom: 1.0, spread, r2l, viewport_w: 800.0, gap: 10.0, margin: 10.0 }
+        LayoutParams { zoom: 1.0, spread, r2l, viewport_w: 800.0, gap: 10.0, margin: 10.0, multi: false }
+    }
+
+    #[test]
+    fn spread_of_a_page() {
+        assert_eq!(group_of(3, 10, Spread::Double), vec![2, 3]);
+        assert_eq!(group_of(3, 10, Spread::DoubleCover), vec![3, 4]);
+        assert_eq!(group_of(0, 10, Spread::DoubleCover), vec![0]);
+        assert_eq!(group_of(9, 10, Spread::DoubleCover), vec![9]);
+        assert_eq!(group_of(4, 5, Spread::Double), vec![4]);
+    }
+
+    #[test]
+    fn zoomed_out_spreads_share_rows() {
+        // Spreads are 1200 wide: three fit a 4000-wide viewport.
+        let p = LayoutParams { viewport_w: 4000.0, multi: true, ..params(Spread::DoubleCover, false) };
+        let l = Layout::build(&a4(9), &p);
+        assert_eq!(l.rows.iter().map(|r| r.pages.clone()).collect::<Vec<_>>(), vec![vec![0, 1, 2, 3, 4], vec![5, 6, 7, 8]]);
+        // Reading order runs left to right, and the cover keeps its right-hand side.
+        let x = |i: usize| l.page_rects[i].min.x;
+        assert!(x(0) < x(1) && x(1) < x(2) && x(2) < x(3));
+        assert!(x(1) - l.page_rects[0].max.x < 10.0 * SPREAD_GAP + 1.0);
+        // Columns line up between rows.
+        assert_eq!(x(1), x(7));
+        // Right to left: the first spread sits at the right edge.
+        let l = Layout::build(&a4(9), &LayoutParams { r2l: true, ..p });
+        let x = |i: usize| l.page_rects[i].min.x;
+        assert!(x(0) > x(1) && x(1) > x(2) && x(2) > x(3));
+        // Not zoomed out enough: one spread per row, as before.
+        let l = Layout::build(&a4(9), &LayoutParams { viewport_w: 2000.0, ..p });
+        assert_eq!(l.rows.len(), 5);
     }
 
     #[test]

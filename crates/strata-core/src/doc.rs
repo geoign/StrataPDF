@@ -128,6 +128,8 @@ enum Cmd {
     Text(u32, Reply<Arc<PageText>>, bool),
     Links(u32, Reply<Arc<Vec<LinkInfo>>>, bool),
     Outline(Reply<Arc<Vec<OutlineItem>>>, bool),
+    Images(u32, Reply<Arc<Vec<crate::images::PageImage>>>, bool),
+    SaveImage { page: u32, index: usize, as_jpeg: bool, path: PathBuf, reply: Reply<(u32, u32)> },
 }
 
 /// Result of an asynchronous request; poll it once per frame.
@@ -494,6 +496,14 @@ impl Document {
     pub fn outline(&self) -> Pending<Arc<Vec<OutlineItem>>> {
         self.request(|r| Cmd::Outline(r, true))
     }
+    /// Images drawn on a page, in drawing order.
+    pub fn images(&self, page: u32) -> Pending<Arc<Vec<crate::images::PageImage>>> {
+        self.request(|r| Cmd::Images(page, r, true))
+    }
+    /// Save the `index`-th image of `images(page)` to a file (see [`crate::images::save`]).
+    pub fn save_image(&self, page: u32, index: usize, as_jpeg: bool, path: PathBuf) -> Pending<(u32, u32)> {
+        self.request(|reply| Cmd::SaveImage { page, index, as_jpeg, path, reply })
+    }
 
     /// Full-text search on a separate document instance. Stops when `cancel` is set
     /// or the receiver is dropped.
@@ -617,6 +627,12 @@ fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::
     let mut text_cache: LruCache<u32, Arc<PageText>> = LruCache::new(cap(256));
     let mut link_cache: LruCache<u32, Arc<Vec<LinkInfo>>> = LruCache::new(cap(256));
     let mut outline: Option<Arc<Vec<OutlineItem>>> = None;
+    let mut image_cache: LruCache<u32, Arc<Vec<crate::images::PageImage>>> = LruCache::new(cap(64));
+    // Structured text that keeps image references (for listing and saving images).
+    let image_page = |eng: &Engine, dl_cache: &mut LruCache<u32, Arc<DisplayList>>, p: u32| match dl_cache.get(&p) {
+        Some(dl) => dl.to_text_page(crate::images::flags()),
+        None => eng.load_page(p as i32).and_then(|pg| pg.to_text_page(crate::images::flags())),
+    };
 
     fn send<T>(r: Reply<T>, v: Result<T, String>, wake: bool, waker: &Waker) {
         if r.send(v).is_ok() && wake {
@@ -724,6 +740,7 @@ fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::
                         })();
                         if let Ok(AnnotResult { page: Some(p), .. }) = &res {
                             dl_cache.pop(p);
+                            image_cache.pop(p);
                             *edit.page_revs.write().entry(*p).or_insert(0) += 1;
                             edit.dirty.store(true, Ordering::Release);
                         }
@@ -766,6 +783,23 @@ fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::
                     }
                 };
                 send(r, v, wake, &waker);
+            }
+            Cmd::Images(p, r, wake) => {
+                let v = match image_cache.get(&p) {
+                    Some(l) => Ok(l.clone()),
+                    None => {
+                        let res = image_page(&eng, &mut dl_cache, p).map(|tp| Arc::new(crate::images::list(&tp))).map_err(|e| e.to_string());
+                        if let Ok(l) = &res {
+                            image_cache.put(p, l.clone());
+                        }
+                        res
+                    }
+                };
+                send(r, v, wake, &waker);
+            }
+            Cmd::SaveImage { page, index, as_jpeg, path, reply } => {
+                let v = image_page(&eng, &mut dl_cache, page).map_err(|e| e.to_string()).and_then(|tp| crate::images::save(&tp, index, as_jpeg, &path));
+                send(reply, v, true, &waker);
             }
         }
     }

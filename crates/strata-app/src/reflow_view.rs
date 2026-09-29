@@ -22,6 +22,8 @@ pub enum WebMsg {
     GotoPdfPage(u32),
     OpenUrl(String),
     Key(String),
+    /// Change the font size: +1 larger, -1 smaller, 0 default.
+    Font(i32),
 }
 
 pub struct ReflowPane {
@@ -37,6 +39,7 @@ pub struct ReflowPane {
     bounds: Option<egui::Rect>,
     visible: bool,
     theme: Option<Theme>,
+    font: Option<f32>,
     /// 1-based page and page-space y of the first visible block.
     pub at_page: u32,
     pub at_y: f32,
@@ -46,19 +49,53 @@ pub struct ReflowPane {
 const JS_BRIDGE: &str = r#"
 (() => {
   const send = m => window.ipc && window.ipc.postMessage(m);
+  const vertical = () => document.body.classList.contains('vertical');
+  // One screen forward (dir 1) or back (-1); vertical-rl text advances to the left.
+  window.strataPage = dir => {
+    if (vertical()) window.scrollBy({left: -dir * window.innerWidth * 0.9, behavior: 'smooth'});
+    else window.scrollBy({top: dir * Math.max(window.innerHeight - 48, window.innerHeight * 0.5), behavior: 'smooth'});
+  };
   document.addEventListener('keydown', e => {
     const k = (e.ctrlKey ? 'ctrl+' : '') + (e.shiftKey ? 'shift+' : '') + e.key.toLowerCase();
-    if (['ctrl+w', 'ctrl+tab', 'ctrl+shift+tab', 'ctrl+o', 'ctrl+e', 'f11', 'ctrl+p', 'ctrl+f4'].includes(k)) { e.preventDefault(); send('key:' + k); }
+    if (['ctrl+w', 'ctrl+tab', 'ctrl+shift+tab', 'ctrl+o', 'ctrl+e', 'f11', 'ctrl+p', 'ctrl+f4'].includes(k)) { e.preventDefault(); send('key:' + k); return; }
+    if (e.ctrlKey && !e.altKey) {
+      const f = {'+': 1, '=': 1, ';': 1, '-': -1, '0': 0}[e.key];
+      if (f !== undefined) { e.preventDefault(); send('font:' + f); }
+      return;
+    }
+    // Horizontal text scrolls natively; vertical text needs the page keys mapped.
+    if (vertical() && !e.altKey && [' ', 'PageDown', 'PageUp'].includes(e.key)) {
+      e.preventDefault();
+      strataPage(e.key === 'PageUp' || (e.key === ' ' && e.shiftKey) ? -1 : 1);
+    }
   });
-  let last = 0;
-  const report = () => {
-    const vertical = document.body.classList.contains('vertical');
-    // First block whose leading edge is inside the view (right edge for vertical-rl).
-    let pos = null;
+  let zoomAcc = 0;
+  window.addEventListener('wheel', e => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    zoomAcc += e.deltaY;
+    if (Math.abs(zoomAcc) >= 50) { send('font:' + (zoomAcc < 0 ? 1 : -1)); zoomAcc = 0; }
+  }, {passive: false});
+  // First block whose leading edge is inside the view (right edge for vertical-rl).
+  const firstVisible = () => {
     for (const el of document.querySelectorAll('[data-p]')) {
       const r = el.getBoundingClientRect();
-      if (vertical ? r.right <= window.innerWidth + 1 : r.bottom > 4) { pos = el.dataset.p + ':' + el.dataset.y; break; }
+      if (vertical() ? r.right <= window.innerWidth + 1 : r.bottom > 4) return el;
     }
+    return null;
+  };
+  let scale = 1;
+  window.strataSetFont = s => {
+    if (s === scale) return;
+    const keep = firstVisible();
+    scale = s;
+    document.body.style.fontSize = (17 * s) + 'px';
+    if (keep) keep.scrollIntoView({block: 'start', inline: 'start'});
+  };
+  let last = 0;
+  const report = () => {
+    const el = firstVisible();
+    const pos = el && el.dataset.p + ':' + el.dataset.y;
     if (pos && pos !== last) { last = pos; send('pos:' + pos); }
   };
   let t = null;
@@ -85,6 +122,7 @@ impl ReflowPane {
             bounds: None,
             visible: false,
             theme: None,
+            font: None,
             at_page: 1,
             at_y: 0.0,
             pending_goto: None,
@@ -150,14 +188,17 @@ impl ReflowPane {
                 out.push(WebMsg::OpenUrl(u.to_string()));
             } else if let Some(k) = m.strip_prefix("key:") {
                 out.push(WebMsg::Key(k.to_string()));
+            } else if let Some(d) = m.strip_prefix("font:").and_then(|d| d.parse().ok()) {
+                out.push(WebMsg::Font(d));
             }
         }
         out
     }
 
-    fn build_webview(&mut self, window: &winit::window::Window, ctx: &mut wry::WebContext, rect: egui::Rect) -> Result<wry::WebView, String> {
+    fn build_webview(&mut self, egui_ctx: &egui::Context, window: &winit::window::Window, ctx: &mut wry::WebContext, rect: egui::Rect) -> Result<wry::WebView, String> {
         let store = self.store.clone();
         let tx = self.msg_tx.clone();
+        let egui_ctx = egui_ctx.clone();
         wry::WebViewBuilder::new_with_web_context(ctx)
             .with_bounds(to_wry(rect))
             .with_custom_protocol("strata".into(), move |_id, req| {
@@ -173,6 +214,8 @@ impl ReflowPane {
             })
             .with_ipc_handler(move |req| {
                 let _ = tx.send(req.body().clone());
+                // Handle it now, not on whatever input next wakes the UI.
+                egui_ctx.request_repaint();
             })
             .with_navigation_handler(|url| url.starts_with("http://strata.") || url.starts_with("about:"))
             .with_devtools(cfg!(debug_assertions))
@@ -181,8 +224,17 @@ impl ReflowPane {
             .map_err(|e| e.to_string())
     }
 
-    /// Draw progress in egui, or place the webview over `rect`.
-    pub fn ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: Option<&winit::window::Window>, ctx: Option<&mut wry::WebContext>, theme: Theme) {
+    /// Scroll one screen forward (`dir` > 0) or back.
+    pub fn page(&self, dir: i32) {
+        if let Some(w) = &self.webview {
+            let _ = w.evaluate_script(&format!("window.strataPage && window.strataPage({dir})"));
+        }
+    }
+
+    /// Draw progress in egui, or place the webview over `rect` (and give it the
+    /// keyboard when it appears in the focused tab).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: Option<&winit::window::Window>, ctx: Option<&mut wry::WebContext>, theme: Theme, font: f32, focused: bool) {
         self.poll();
         if let Some(e) = &self.error {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, format!("テキスト化できませんでした\n{e}"), egui::FontId::proportional(15.0), egui::Color32::RED);
@@ -202,8 +254,11 @@ impl ReflowPane {
         }
         if self.webview.is_none() {
             let (Some(window), Some(ctx)) = (window, ctx) else { return };
-            match self.build_webview(window, ctx, rect) {
+            match self.build_webview(ui.ctx(), window, ctx, rect) {
                 Ok(w) => {
+                    if focused {
+                        let _ = w.focus();
+                    }
                     self.webview = Some(w);
                     self.bounds = Some(rect);
                     self.visible = true;
@@ -221,6 +276,9 @@ impl ReflowPane {
         }
         if !self.visible {
             let _ = w.set_visible(true);
+            if focused {
+                let _ = w.focus();
+            }
             self.visible = true;
         }
         if self.theme != Some(theme) {
@@ -231,6 +289,13 @@ impl ReflowPane {
             };
             let _ = w.evaluate_script(&format!("window.strataSetTheme && window.strataSetTheme('{t}')"));
             self.theme = Some(theme);
+        }
+        if self.font != Some(font) {
+            // Before the position below, which it would otherwise move.
+            let _ = w.evaluate_script(&format!(
+                "(function g(n){{ if (window.strataSetFont) window.strataSetFont({font}); else if (n < 50) setTimeout(() => g(n + 1), 100); }})(0)"
+            ));
+            self.font = Some(font);
         }
         if let Some((p, y)) = self.pending_goto.take() {
             // The page may still be loading; the script defines strataGotoPos at the end.

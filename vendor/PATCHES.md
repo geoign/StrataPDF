@@ -6,3 +6,5 @@
 - `src/text_page.rs`: `TextPage::as_raw()` exposes the `fz_stext_page` pointer so that
   structure and grid blocks (segmentation, table hunting) can be walked.
 - `src/context.rs`: `raw_context()` exposes the calling thread's `fz_context` for direct FFI calls.
+- `src/image.rs`: `Image::from_raw_keep()` wraps an image found in a structured-text page
+  (used to save embedded images).

@@ -24,6 +24,15 @@ impl<T> Image<T> {
         }
     }
 
+    /// Wrap a borrowed image pointer (e.g. from a structured-text image block),
+    /// taking a new reference.
+    ///
+    /// # Safety
+    /// `image` must be a live `fz_image` of the calling thread's context.
+    pub unsafe fn from_raw_keep(image: *mut fz_image) -> Self {
+        unsafe { Self::from_raw(fz_keep_image(context(), image)) }
+    }
+
     pub fn width(&self) -> u32 {
         unsafe { (*self.inner).w as u32 }
     }

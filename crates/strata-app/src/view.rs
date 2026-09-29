@@ -11,6 +11,7 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 use strata_core::render::{TILE_PX, level_for_scale, level_scale, tile_grid};
+use strata_core::images::PageImage;
 use strata_core::text::CharPos;
 use strata_core::{
     DocId, Document, LinkInfo, LinkTarget, OutlineItem, PageText, Pending, QuadF, RenderPool, SearchEvent, SizeF, TileKey, ViewId,
@@ -76,6 +77,8 @@ pub struct Services<'a> {
     pub ocr: &'a mut crate::ocr_ui::OcrManager,
     /// Convert display formulas to LaTeX in the text view.
     pub latex: bool,
+    /// Font size of the text view (shared by all tabs, saved in the settings).
+    pub text_scale: &'a mut f32,
 }
 
 struct OcrJob {
@@ -176,6 +179,10 @@ pub struct DocView {
     viewport: Rect,
     texts: HashMap<u32, Pending<Arc<PageText>>>,
     links: HashMap<u32, Pending<Arc<Vec<LinkInfo>>>>,
+    images: HashMap<u32, Pending<Arc<Vec<PageImage>>>>,
+    /// Page and page-space point of the last right click (for the context menu).
+    menu_at: Option<(u32, f32, f32)>,
+    image_save: Option<(Pending<(u32, u32)>, std::path::PathBuf)>,
     outline: Option<Pending<Arc<Vec<OutlineItem>>>>,
     sel: Option<Selection>,
     drag: DragMode,
@@ -231,6 +238,9 @@ impl DocView {
             viewport: Rect::NOTHING,
             texts: HashMap::new(),
             links: HashMap::new(),
+            images: HashMap::new(),
+            menu_at: None,
+            image_save: None,
             outline: None,
             sel: None,
             drag: DragMode::None,
@@ -287,7 +297,8 @@ impl DocView {
     // ------------------------------------------------------------------ layout
 
     fn params(&self, viewport_w: f32) -> LayoutParams {
-        LayoutParams { zoom: self.zoom, spread: self.spread, r2l: self.r2l, viewport_w, gap: GAP, margin: MARGIN }
+        // Fitting sizes one spread to the view, so only free zoom can show several.
+        LayoutParams { zoom: self.zoom, spread: self.spread, r2l: self.r2l, viewport_w, gap: GAP, margin: MARGIN, multi: self.fit == Fit::Free }
     }
 
     fn ensure_layout(&mut self, viewport_w: f32) {
@@ -354,14 +365,13 @@ impl DocView {
         (v.x, v.y)
     }
 
-    /// Row used for fit-to-width/page: the current row.
+    /// Pages used for fit-to-width/page: the current spread.
     fn fit_row_size(&self) -> Option<(f32, f32)> {
-        let row = if self.layout.rows.is_empty() {
-            crate::layout::rows_of(self.sizes.len(), self.spread).into_iter().next()?
-        } else {
-            let r = if self.paged { self.cur_row } else { self.layout.row_at(self.scroll.y + self.viewport.height() * 0.3) };
-            self.layout.rows.get(r)?.pages.clone()
-        };
+        if self.sizes.is_empty() {
+            return None;
+        }
+        // The spread, not the layout row: a zoomed-out row holds several spreads.
+        let row = crate::layout::group_of(self.current_page(), self.sizes.len(), self.spread);
         let w: f32 = row.iter().map(|&p| self.sizes[p as usize].w).sum::<f32>();
         let h = row.iter().map(|&p| self.sizes[p as usize].h).fold(0.0, f32::max);
         Some((w, h))
@@ -489,6 +499,44 @@ impl DocView {
         }
     }
 
+    fn page_images(&mut self, page: u32) -> Option<Arc<Vec<PageImage>>> {
+        let doc = &self.doc;
+        let p = self.images.entry(page).or_insert_with(|| doc.images(page));
+        match p.poll() {
+            Some(Ok(l)) => Some(l.clone()),
+            _ => None,
+        }
+    }
+
+    /// Ask where to save an embedded image, then save it on the document thread.
+    fn save_image_as(&mut self, page: u32, index: usize, im: &PageImage) {
+        let stem = self.doc.info().path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = format!("{stem}_p{}_{}", page + 1, index + 1);
+        let dialog = if im.jpeg {
+            rfd::FileDialog::new().add_filter("JPEG（埋め込みデータのまま）", &["jpg", "jpeg"]).add_filter("PNG", &["png"]).set_file_name(format!("{name}.jpg"))
+        } else {
+            rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{name}.png"))
+        };
+        let Some(mut path) = dialog.save_file() else { return };
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let as_jpeg = im.jpeg && (ext == "jpg" || ext == "jpeg");
+        if !as_jpeg && ext != "png" {
+            path.set_extension("png");
+        }
+        self.image_save = Some((self.doc.save_image(page, index, as_jpeg, path.clone()), path));
+        self.status = "画像を保存しています…".into();
+    }
+
+    fn poll_image_save(&mut self) {
+        let Some((pending, path)) = &mut self.image_save else { return };
+        let Some(r) = pending.poll() else { return };
+        self.status = match r {
+            Ok((w, h)) => format!("画像（{w}×{h}）を保存しました: {}", path.display()),
+            Err(e) => format!("画像を保存できませんでした: {e}"),
+        };
+        self.image_save = None;
+    }
+
     fn trim_caches(&mut self, center: u32) {
         let keep = |p: &u32| p.abs_diff(center) <= 40;
         if self.texts.len() > 200 && self.sel.is_none() && !self.pending_copy {
@@ -496,6 +544,9 @@ impl DocView {
         }
         if self.links.len() > 200 {
             self.links.retain(|p, _| keep(p));
+        }
+        if self.images.len() > 100 {
+            self.images.retain(|p, _| keep(p));
         }
     }
 
@@ -772,7 +823,7 @@ impl DocView {
                 self.rebuild_reflow(Some(f));
             }
         }
-        self.reflow_toolbar(ui);
+        self.reflow_toolbar(ui, svc.text_scale);
         if self.mode != ViewMode::Reflow {
             // Switched to the PDF view from the toolbar: drawing the text view in
             // the rest of this frame would show the webview again.
@@ -788,7 +839,7 @@ impl DocView {
                 pane.hide();
                 ui.painter().rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
             } else {
-                pane.ui(ui, rect, svc.window, svc.web.as_deref_mut(), svc.theme);
+                pane.ui(ui, rect, svc.window, svc.web.as_deref_mut(), svc.theme, *svc.text_scale, svc.focused);
             }
         });
         let msgs = self.reflow.as_mut().map(|r| r.messages()).unwrap_or_default();
@@ -799,6 +850,7 @@ impl DocView {
                     self.goto_page(p.saturating_sub(1), None);
                 }
                 WebMsg::OpenUrl(u) => ctx.open_url(egui::OpenUrl::new_tab(u)),
+                WebMsg::Font(d) => step_text_scale(svc.text_scale, d),
                 WebMsg::Key(k) => match k.as_str() {
                     "ctrl+w" | "ctrl+f4" => self.requests.push(ViewRequest::CloseTab),
                     "ctrl+tab" => self.requests.push(ViewRequest::NextTab),
@@ -811,8 +863,30 @@ impl DocView {
                 },
             }
         }
-        if svc.focused && !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::E)) {
-            self.set_mode(ViewMode::Pdf);
+        // Keys that reach the main window while the webview does not have the focus.
+        if svc.focused && !ctx.egui_wants_keyboard_input() {
+            use egui::Modifiers;
+            let consume = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
+            if consume(Modifiers::COMMAND, Key::E) {
+                self.set_mode(ViewMode::Pdf);
+                return;
+            }
+            if consume(Modifiers::COMMAND, Key::Plus) || consume(Modifiers::COMMAND, Key::Equals) || consume(Modifiers::COMMAND | Modifiers::SHIFT, Key::Semicolon) {
+                step_text_scale(svc.text_scale, 1);
+            }
+            if consume(Modifiers::COMMAND, Key::Minus) {
+                step_text_scale(svc.text_scale, -1);
+            }
+            if consume(Modifiers::COMMAND, Key::Num0) {
+                step_text_scale(svc.text_scale, 0);
+            }
+            let back = consume(Modifiers::SHIFT, Key::Space) || consume(Modifiers::NONE, Key::PageUp);
+            let fwd = consume(Modifiers::NONE, Key::Space) || consume(Modifiers::NONE, Key::PageDown);
+            if let Some(pane) = &self.reflow
+                && (back || fwd)
+            {
+                pane.page(if fwd { 1 } else { -1 });
+            }
         }
     }
 
@@ -956,10 +1030,20 @@ impl DocView {
         }
     }
 
-    fn reflow_toolbar(&mut self, ui: &mut Ui) {
+    fn reflow_toolbar(&mut self, ui: &mut Ui, text_scale: &mut f32) {
         egui::Panel::top(Id::new(("rtoolbar", self.id))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 self.mode_switch(ui);
+                ui.separator();
+                if ui.button("A－").on_hover_text("文字を小さく (Ctrl+- / Ctrl+ホイール)").clicked() {
+                    step_text_scale(text_scale, -1);
+                }
+                if ui.button(format!("{:.0}%", *text_scale * 100.0)).on_hover_text("標準の大きさに戻す (Ctrl+0)").clicked() {
+                    step_text_scale(text_scale, 0);
+                }
+                if ui.button("A＋").on_hover_text("文字を大きく (Ctrl++ / Ctrl+ホイール)").clicked() {
+                    step_text_scale(text_scale, 1);
+                }
                 ui.separator();
                 let ready = self.reflow.as_ref().is_some_and(|r| r.is_ready());
                 let stem = self.doc.info().path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1000,6 +1084,7 @@ impl DocView {
         self.poll_ocr(&ctx, svc);
         self.poll_annot(&ctx);
         self.poll_table(&ctx, svc.ocr);
+        self.poll_image_save();
         if self.mode == ViewMode::Reflow {
             self.reflow_ui(ui, svc);
             return;
@@ -1560,7 +1645,28 @@ impl DocView {
                     ctx.set_cursor_icon(CursorIcon::Text);
                 }
             }
+            if resp.secondary_clicked() {
+                self.menu_at = resp.interact_pointer_pos().and_then(|s| {
+                    let c = self.to_content(s);
+                    let page = self.layout.page_at(c)?;
+                    let (x, y) = self.screen_to_page(page, s);
+                    self.layout.page_rects[page as usize].contains(c).then_some((page, x, y))
+                });
+            }
             resp.context_menu(|ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                // The image under the click (the topmost one); the list arrives a frame or two later.
+                if let Some((page, x, y)) = self.menu_at
+                    && let Some(list) = self.page_images(page)
+                    && let Some(i) = list.iter().rposition(|im| im.bbox.contains(x, y))
+                {
+                    let im = &list[i];
+                    if ui.button("名前を付けて画像を保存…").on_hover_text(format!("{}×{} ピクセル", im.width, im.height)).clicked() {
+                        ui.close();
+                        self.save_image_as(page, i, im);
+                    }
+                    ui.separator();
+                }
                 if ui.add_enabled(self.sel.is_some(), egui::Button::new("コピー (Ctrl+C)")).clicked() {
                     self.copy_selection(ui.ctx());
                     ui.close();
@@ -1677,11 +1783,12 @@ impl DocView {
             let n = self.page_count() as u32;
             self.goto_page(n.saturating_sub(1), None);
         }
-        if consume(Modifiers::NONE, Key::PageDown) || consume(Modifiers::NONE, Key::Space) {
-            if self.paged && fits { self.step_rows(1) } else { self.scroll_by(page_step) }
-        }
+        // Shift+Space first: a shortcut without Shift also matches it pressed with Shift.
         if consume(Modifiers::NONE, Key::PageUp) || consume(Modifiers::SHIFT, Key::Space) {
             if self.paged && fits { self.step_rows(-1) } else { self.scroll_by(-page_step) }
+        }
+        if consume(Modifiers::NONE, Key::PageDown) || consume(Modifiers::NONE, Key::Space) {
+            if self.paged && fits { self.step_rows(1) } else { self.scroll_by(page_step) }
         }
         if consume(Modifiers::NONE, Key::ArrowDown) {
             if self.paged && fits { self.step_rows(1) } else { self.scroll_by(line) }
@@ -1709,6 +1816,17 @@ impl DocView {
         self.search.stop();
         pool.remove_view(self.id);
     }
+}
+
+/// Step the text view's font size up (`dir` > 0), down (< 0) or back to 100% (0).
+fn step_text_scale(scale: &mut f32, dir: i32) {
+    const STEPS: [f32; 14] = [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8, 2.0, 2.4, 2.8, 3.2];
+    let s = *scale;
+    *scale = match dir.signum() {
+        1 => STEPS.iter().copied().find(|&v| v > s * 1.01).unwrap_or(s),
+        -1 => STEPS.iter().rev().copied().find(|&v| v < s * 0.99).unwrap_or(s),
+        _ => 1.0,
+    };
 }
 
 fn outline_items(ui: &mut Ui, items: &[OutlineItem], parent: Id, target: &mut Option<LinkTarget>) {

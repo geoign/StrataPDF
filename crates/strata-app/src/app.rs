@@ -37,11 +37,13 @@ pub struct Settings {
     pub ocr_device: strata_core::ocr::Device,
     /// Convert display formulas to LaTeX in the text view.
     pub formula_latex: bool,
+    /// Font size of the text view relative to the default.
+    pub text_scale: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true }
+        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true, text_scale: 1.0 }
     }
 }
 
@@ -573,7 +575,7 @@ impl StrataApp {
                 ui.separator();
                 egui::Grid::new("keys").num_columns(2).show(ui, |ui| {
                     for (k, v) in [
-                        ("↓ ↑ / PgDn PgUp / Space", "スクロール（ページ送り表示ではめくる）"),
+                        ("↓ ↑ / PgDn PgUp / Space Shift+Space", "スクロール（ページ送り表示ではめくる）"),
                         ("← →", "前後のページ（右綴じ見開きでは逆向き）"),
                         ("Home / End", "先頭 / 末尾"),
                         ("Ctrl+ホイール / Ctrl + −", "拡大・縮小"),
@@ -583,6 +585,7 @@ impl StrataApp {
                         ("Ctrl+C / Ctrl+A", "コピー / すべて選択"),
                         ("ドラッグ", "文字の上なら選択、それ以外はスクロール"),
                         ("中ボタン / Space+ドラッグ", "スクロール"),
+                        ("テキスト表示: Ctrl+ホイール / Ctrl + −", "文字の拡大・縮小（Ctrl+0 で標準）"),
                         ("Ctrl+Tab", "タブ切り替え"),
                         ("Ctrl+W", "タブを閉じる"),
                         ("F9", "サイドバー"),
@@ -637,6 +640,7 @@ struct Viewer<'a> {
     overlay: bool,
     ocr: &'a mut crate::ocr_ui::OcrManager,
     latex: bool,
+    text_scale: &'a mut f32,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -662,6 +666,7 @@ impl TabViewer for Viewer<'_> {
             overlay: self.overlay,
             ocr: &mut *self.ocr,
             latex: self.latex,
+            text_scale: &mut *self.text_scale,
         };
         tab.ui(ui, &mut svc);
     }
@@ -769,6 +774,7 @@ impl eframe::App for StrataApp {
                 overlay,
                 ocr: &mut self.ocr,
                 latex: self.settings.formula_latex,
+                text_scale: &mut self.settings.text_scale,
             };
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                 DockArea::new(&mut self.dock)
