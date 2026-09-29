@@ -186,8 +186,8 @@ struct PageData {
     dl: Option<mupdf::DisplayList>,
     /// The text came from OCR.
     ocr: bool,
-    /// Lines found by the layout model and their classes (empty without it).
-    layout: Vec<(RectF, usize)>,
+    /// Lines found by the layout model: box, class and region (empty without it).
+    layout: Vec<(RectF, usize, usize)>,
 }
 
 fn is_cjk(c: char) -> bool {
@@ -374,6 +374,8 @@ struct Unit {
     lines: Vec<RichLine>,
     /// Layout class of most of its text.
     class: Option<usize>,
+    /// Layout region of most of its text.
+    group: Option<usize>,
 }
 
 impl Unit {
@@ -430,18 +432,18 @@ fn overlap_frac(inner: &RectF, outer: &RectF) -> f32 {
     (x1 - x0) * (y1 - y0) / a
 }
 
-/// Layout class of a line: that of the layout line holding most of its characters.
-fn line_class(layout: &[(RectF, usize)], l: &RichLine) -> Option<usize> {
-    let cand: Vec<&(RectF, usize)> = layout.iter().filter(|(r, _)| overlap_frac(&l.bbox, r) > 0.0).collect();
+/// Layout class and region of a line: those of the layout line holding most of its characters.
+fn line_class(layout: &[(RectF, usize, usize)], l: &RichLine) -> Option<(usize, usize)> {
+    let cand: Vec<&(RectF, usize, usize)> = layout.iter().filter(|(r, ..)| overlap_frac(&l.bbox, r) > 0.0).collect();
     match cand.len() {
         0 => None,
-        1 => Some(cand[0].1),
+        1 => Some((cand[0].1, cand[0].2)),
         _ => {
-            let mut votes: HashMap<usize, usize> = HashMap::new();
+            let mut votes: HashMap<(usize, usize), usize> = HashMap::new();
             for c in &l.chars {
                 let (x, y) = ((c.bbox.x0 + c.bbox.x1) / 2.0, (c.bbox.y0 + c.bbox.y1) / 2.0);
-                if let Some((_, k)) = cand.iter().find(|(r, _)| r.x0 <= x && x <= r.x1 && r.y0 <= y && y <= r.y1) {
-                    *votes.entry(*k).or_default() += 1;
+                if let Some((_, k, g)) = cand.iter().find(|(r, ..)| r.x0 <= x && x <= r.x1 && r.y0 <= y && y <= r.y1) {
+                    *votes.entry((*k, *g)).or_default() += 1;
                 }
             }
             votes.into_iter().max_by_key(|&(k, n)| (n, std::cmp::Reverse(k))).map(|(k, _)| k)
@@ -449,15 +451,33 @@ fn line_class(layout: &[(RectF, usize)], l: &RichLine) -> Option<usize> {
     }
 }
 
-/// The class of most characters of the lines.
-fn majority_class(lines: &[(RichLine, Option<usize>)]) -> Option<usize> {
-    let mut votes: HashMap<usize, usize> = HashMap::new();
+/// The class and region of most characters of the lines.
+fn majority_class(lines: &[(RichLine, Option<(usize, usize)>)]) -> Option<(usize, usize)> {
+    let mut votes: HashMap<(usize, usize), usize> = HashMap::new();
     for (l, c) in lines {
         if let Some(c) = c {
             *votes.entry(*c).or_default() += l.chars.len();
         }
     }
     votes.into_iter().max_by_key(|&(k, n)| (n, std::cmp::Reverse(k))).map(|(k, _)| k)
+}
+
+/// Blocks of one layout region (the extractor splits some paragraphs, captions
+/// and reference entries into a block per line) become one unit, if they share a column.
+fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
+    let mut out: Vec<Unit> = Vec::with_capacity(units.len());
+    for u in units {
+        if let Some(g) = u.group
+            && let Some(o) = out.iter_mut().find(|o| o.group == Some(g) && o.kind == UnitKind::Text && o.bbox.x0 < u.bbox.x1 && u.bbox.x0 < o.bbox.x1)
+        {
+            o.bbox = o.bbox.union(&u.bbox);
+            o.lines.extend(u.lines);
+            o.lines.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0).then(a.bbox.x0.total_cmp(&b.bbox.x0)));
+            continue;
+        }
+        out.push(u);
+    }
+    out
 }
 
 /// Lines of one block that play different parts (heading, caption, figure text,
@@ -567,12 +587,12 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     for b in &p.rich.blocks {
         match b {
             RichBlock::Text { lines, .. } => {
-                let kept: Vec<(RichLine, Option<usize>)> = lines
+                let kept: Vec<(RichLine, Option<(usize, usize)>)> = lines
                     .iter()
                     .map(|l| (l, line_class(&p.layout, l)))
                     .filter(|(l, class)| {
                         // Running heads and page numbers found by the layout model.
-                        if opts.strip_headers && matches!(class, Some(PAGE_HEADER | PAGE_FOOTER)) && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
+                        if opts.strip_headers && matches!(class, Some((PAGE_HEADER | PAGE_FOOTER, _))) && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
                             return false;
                         }
                         if opts.strip_headers && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
@@ -600,10 +620,10 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                     .map(|(l, c)| (l.clone(), c))
                     .collect();
                 // Split where the layout role changes; lines without a class go with the previous ones.
-                let mut runs: Vec<Vec<(RichLine, Option<usize>)>> = Vec::new();
+                let mut runs: Vec<Vec<(RichLine, Option<(usize, usize)>)>> = Vec::new();
                 let mut cur_role: Option<u8> = None;
                 for (l, c) in kept {
-                    let r = c.map(role);
+                    let r = c.map(|(c, _)| role(c));
                     match (runs.last_mut(), r) {
                         (Some(run), Some(r)) if cur_role.is_none_or(|cr| cr == r) => {
                             cur_role = Some(r);
@@ -621,8 +641,8 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                     // paragraphs that stop paragraph joining.
                     if run.iter().any(|(l, _)| l.chars.iter().any(|c| !c.c.is_whitespace())) {
                         let bbox = run.iter().skip(1).fold(run[0].0.bbox, |a, (l, _)| a.union(&l.bbox));
-                        let class = majority_class(&run);
-                        units.push(Unit { kind: UnitKind::Text, bbox, lines: run.into_iter().map(|(l, _)| l).collect(), class });
+                        let cg = majority_class(&run);
+                        units.push(Unit { kind: UnitKind::Text, bbox, lines: run.into_iter().map(|(l, _)| l).collect(), class: cg.map(|c| c.0), group: cg.map(|c| c.1) });
                     }
                 }
             }
@@ -630,14 +650,24 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                 // A page-sized image under a text layer is the scan of an OCRed page.
                 let background = bbox.width() * bbox.height() > page_area * 0.7 && text_chars > 100;
                 if !background && bbox.width() * bbox.height() > page_area * 0.005 {
-                    units.push(Unit { kind: UnitKind::Figure, bbox: *bbox, lines: Vec::new(), class: None });
+                    units.push(Unit { kind: UnitKind::Figure, bbox: *bbox, lines: Vec::new(), class: None, group: None });
                 }
             }
             _ => {}
         }
     }
+    // Line numbers go first: a region can hold them (the layout lines of some
+    // manuscripts start with the number), and merged into text they would stay.
+    let numbers = line_number_column(&units, body);
+    let manuscript = !numbers.is_empty();
+    let mut k = 0;
+    units.retain(|_| {
+        k += 1;
+        !numbers.contains(&(k - 1))
+    });
+    let mut units = merge_regions(units);
     for r in vector_figures(&p.rich.blocks, page_area) {
-        units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None });
+        units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None });
     }
     // Merge overlapping figures; absorb labels inside figures.
     let mut figs: Vec<RectF> = Vec::new();
@@ -782,14 +812,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             _ => k += 1,
         }
     }
-    out.extend(figs.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None }));
-    let numbers = line_number_column(&out, body);
-    let manuscript = !numbers.is_empty();
-    let mut i = 0;
-    out.retain(|_| {
-        i += 1;
-        !numbers.contains(&(i - 1))
-    });
+    out.extend(figs.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None, group: None }));
     (out, manuscript)
 }
 
@@ -874,7 +897,12 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
                 && let Some(s) = spans.last_mut()
                 && !s.text.ends_with(' ')
             {
-                s.text.push(' ');
+                // Not inside a superscript ("Vaswani∗"): those are trimmed below.
+                if s.style.sup || s.style.sub {
+                    spans.push(Span { text: " ".into(), style: Style::default(), link: None });
+                } else {
+                    s.text.push(' ');
+                }
             }
         }
         for c in &l.chars {
@@ -1049,7 +1077,7 @@ fn run_layout(model: &strata_ocr::layout::LayoutModel, pages: &mut [PageData], s
     let workers = if serial { 1 } else { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8) };
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let results: Vec<parking_lot::Mutex<Vec<(RectF, usize)>>> = pages.iter().map(|_| parking_lot::Mutex::new(Vec::new())).collect();
+    let results: Vec<parking_lot::Mutex<Vec<(RectF, usize, usize)>>> = pages.iter().map(|_| parking_lot::Mutex::new(Vec::new())).collect();
     let pages_ref = &*pages;
     std::thread::scope(|s| {
         for _ in 0..workers {
@@ -1070,10 +1098,11 @@ fn run_layout(model: &strata_ocr::layout::LayoutModel, pages: &mut [PageData], s
                                     .layout
                                     .groups
                                     .iter()
-                                    .flat_map(|g| g.nodes.iter().map(move |&k| (k, g.class)))
-                                    .map(|(k, c)| {
+                                    .enumerate()
+                                    .flat_map(|(gi, g)| g.nodes.iter().map(move |&k| (k, g.class, gi)))
+                                    .map(|(k, c, gi)| {
                                         let b = a.nodes[k].bbox;
-                                        (RectF { x0: b[0], y0: b[1], x1: b[2], y1: b[3] }, c)
+                                        (RectF { x0: b[0], y0: b[1], x1: b[2], y1: b[3] }, c, gi)
                                     })
                                     .collect()
                             }
@@ -1291,6 +1320,21 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     i += 1;
                     continue;
                 }
+                None if u.class == Some(CAPTION) => {
+                    // The rest of a caption ("(b) PPL image of ...") belongs to the float before it.
+                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical);
+                    match doc.nodes.last_mut() {
+                        Some(Node::Figure { caption, .. } | Node::Table { caption, .. }) => {
+                            if !caption.is_empty() {
+                                caption.push(Span { text: " ".into(), style: Style::default(), link: None });
+                            }
+                            caption.extend(spans);
+                        }
+                        _ => doc.nodes.push(Node::Paragraph { spans }),
+                    }
+                    i += 1;
+                    continue;
+                }
                 None => {}
             }
             let math = math_fraction(u, &p.rich.fonts);
@@ -1465,7 +1509,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
             } else if is_list_marker(&text) {
                 doc.nodes.push(Node::ListItem { spans });
-            } else if u.class == Some(FOOTNOTE) || (!vertical && size <= body * 0.92 && u.bbox.y0 > p.rich.height * 0.6 && u.lines.len() <= 8) {
+            } else if u.class == Some(FOOTNOTE) || (u.class.is_none() && !vertical && size <= body * 0.92 && u.bbox.y0 > p.rich.height * 0.6 && u.lines.len() <= 8) {
                 doc.nodes.push(Node::Footnote { spans });
             } else {
                 // Continuation across a column or page break; figures, tables,
@@ -1490,7 +1534,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             // a paragraph: figure labels near a column top are short.
                             let cut = last_para.as_ref().is_some_and(|l| Some(l.node) == prev && l.cut_at_edge);
                             let first_indented = u.lines.first().is_some_and(|l| l.bbox.x0 - u.bbox.x0 > body * 0.6);
-                            let bodyish = (size - body).abs() <= body * 0.1 && (u.lines.len() >= 2 || text.chars().count() >= 40);
+                            // Running text by size, or by the layout model (references are set smaller).
+                            let bodyish = ((size - body).abs() <= body * 0.1 && (u.lines.len() >= 2 || text.chars().count() >= 40))
+                                || matches!(u.class, Some(strata_ocr::layout::TEXT | strata_ocr::layout::LIST_ITEM));
                             // The next lines of the same column, split off by the extractor
                             // (it breaks blocks at a change of font, such as an italic
                             // species name at the start of a line).
