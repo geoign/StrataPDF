@@ -3,6 +3,8 @@
 //! fills it starting from the reading position.
 
 pub mod gemini;
+#[cfg(feature = "llama")]
+pub mod llama;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -74,6 +76,30 @@ fn is_mostly_symbols(s: &str) -> bool {
     wordy * 3 < total
 }
 
+/// A reference-list entry that escaped the "References" heading (reflow may not
+/// find it): "Author X (2010) Title. Journal 12(3):45–67". Both a year in
+/// parentheses near the start and a volume:pages range are required, which
+/// running text with citations rarely has.
+fn looks_like_reference(s: &str) -> bool {
+    let c: Vec<char> = s.chars().collect();
+    let digits = |i: usize, n: usize| i + n <= c.len() && c[i..i + n].iter().all(|d| d.is_ascii_digit());
+    let year_near_start = (0..c.len().min(90)).any(|i| c[i] == '(' && digits(i + 1, 4) && matches!(c.get(i + 5), Some(')') | Some('a'..='z')));
+    let pages = (0..c.len()).any(|i| {
+        c[i] == ':' && {
+            let mut j = i + 1;
+            while j < c.len() && c[j] == ' ' {
+                j += 1;
+            }
+            let start = j;
+            while j < c.len() && c[j].is_ascii_digit() {
+                j += 1;
+            }
+            j > start && matches!(c.get(j), Some('–' | '-' | '—')) && c.get(j + 1).is_some_and(|d| d.is_ascii_digit())
+        }
+    });
+    year_near_start && pages
+}
+
 /// Already Japanese: kana make up a noticeable share of the letters.
 fn is_japanese(s: &str) -> bool {
     let (mut kana, mut letters) = (0usize, 0usize);
@@ -112,7 +138,7 @@ pub fn plan(doc: &ReflowDoc) -> Plan {
             Node::Figure { caption, .. } | Node::Table { caption, .. } => plain(caption),
             _ => continue,
         };
-        if text.chars().filter(|c| c.is_alphabetic()).count() < 2 || is_japanese(&text) || is_mostly_symbols(&text) {
+        if text.chars().filter(|c| c.is_alphabetic()).count() < 2 || is_japanese(&text) || is_mostly_symbols(&text) || looks_like_reference(&text) {
             continue;
         }
         segments.push(Segment { node: i, hash: text_hash(&text), text });
@@ -450,6 +476,12 @@ mod tests {
         let nodes: Vec<usize> = p.segments.iter().map(|s| s.node).collect();
         assert_eq!(nodes, vec![0, 1, 5, 6]);
         assert_eq!(p.segments[1].text, "Some text here.");
+    }
+
+    #[test]
+    fn reference_entries() {
+        assert!(looks_like_reference("Giannetti B (1996) Volcanology of trachytic and associated basaltic pyroclastic deposits at Roccamonfina volcano, Italy. J Volcanol Geotherm Res 71(2–4):229–248"));
+        assert!(!looks_like_reference("Tephra from the 2010 eruption (Biass et al. 2011) was sampled at 40 sites; see Table 2 for details: 12–15 cm thick."));
     }
 
     #[test]

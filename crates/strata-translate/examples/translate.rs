@@ -1,5 +1,6 @@
 //! translate <file> <engine> <out.html>
-//! engine: `gemini:<model>` (key from GEMINI_API_KEY or the file named by GEMINI_KEY_FILE).
+//! engine: `gemini:<model>` (key from GEMINI_API_KEY or the file named by GEMINI_KEY_FILE),
+//! or `llama:<model id>` (GGUF in STRATA_MODELS; GPU unless LLAMA_CPU is set).
 //! Writes a side-by-side HTML with the translations filled in, and prints timing.
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -17,6 +18,16 @@ fn engine(spec: &str) -> Arc<dyn Translator> {
                 .or_else(|| std::env::var("GEMINI_KEY_FILE").ok().and_then(|f| std::fs::read_to_string(f).ok()))
                 .expect("GEMINI_API_KEY or GEMINI_KEY_FILE");
             Arc::new(strata_translate::gemini::Gemini::new(key.trim().to_string(), model))
+        }
+        #[cfg(feature = "llama")]
+        "llama" => {
+            let spec = strata_translate::llama::MODELS.iter().find(|m| m.id == model).copied().expect("model id");
+            let dir = std::env::var("STRATA_MODELS").map(std::path::PathBuf::from).ok().or_else(strata_translate::llama::models_dir).unwrap();
+            let gpu = if std::env::var("LLAMA_CPU").is_ok() { 0 } else { 999 };
+            let t = std::time::Instant::now();
+            let l = strata_translate::llama::Llama::load(spec, &dir.join(spec.file), gpu).unwrap();
+            eprintln!("loaded {} in {:.1}s (gpu={})", spec.label, t.elapsed().as_secs_f32(), l.uses_gpu());
+            Arc::new(l)
         }
         _ => panic!("unknown engine {kind}"),
     }
@@ -55,7 +66,13 @@ fn main() {
             Event::Done => break,
         }
     }
-    eprintln!("{} translated in {:.1}s by {}", tr.len(), t.elapsed().as_secs_f32(), eng.label());
+    let secs = t.elapsed().as_secs_f32();
+    eprintln!("{} translated in {secs:.1}s by {}", tr.len(), eng.label());
+    // Side file for comparisons: source and translation per node.
+    let map: std::collections::HashMap<usize, &String> = tr.iter().map(|(n, t)| (*n, t)).collect();
+    let segs: Vec<serde_json::Value> = plan.segments.iter().map(|s| serde_json::json!({"node": s.node, "src": s.text, "tr": map.get(&s.node)})).collect();
+    let json = serde_json::json!({"engine": eng.id(), "label": eng.label(), "seconds": secs, "segments": segs});
+    std::fs::write(format!("{}.json", a[3].trim_end_matches(".html")), serde_json::to_string_pretty(&json).unwrap()).unwrap();
     let nodes = plan.nodes();
     let src = |im: &ReflowImage| format!("data:image/png;base64,{}", b64(&im.png));
     let mut html = output::to_html(&d, &output::HtmlOptions { theme: output::Theme::Auto, page_markers: false, image_src: &src, extra_css: "", bilingual: Some(&nodes) });

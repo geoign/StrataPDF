@@ -38,13 +38,12 @@ impl DocView {
         if ui.selectable_label(self.tr.on, "翻訳").on_hover_text("原文と訳文を左右に並べる（英語・中国語 → 日本語）").clicked() {
             self.tr.on = !self.tr.on;
         }
-        if !self.tr.on {
-            return;
-        }
+        // Always shown, so that the engine can be chosen before anything is sent.
         let tm = &mut *svc.translate;
-        egui::ComboBox::from_id_salt(("tr-model", self.id)).selected_text(tm.model_label()).show_ui(ui, |ui| {
-            for (id, label) in strata_translate::gemini::MODELS {
-                ui.selectable_value(&mut tm.settings.model, id.to_string(), label);
+        egui::ComboBox::from_id_salt(("tr-model", self.id)).selected_text(tm.model_label()).width(200.0).show_ui(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            for (id, label, note) in crate::translate_ui::TranslateManager::choices() {
+                ui.selectable_value(&mut tm.settings.model, id.to_string(), format!("{label}　{note}"));
             }
             ui.separator();
             if ui.button("API キーを変更…").clicked() {
@@ -77,9 +76,19 @@ impl DocView {
         let stale = self.tr.session.as_ref().is_none_or(|s| !Arc::ptr_eq(&s.doc, &doc) || s.model != model);
         if stale {
             let path = self.doc.info().path.clone();
-            match svc.translate.engine(&path) {
-                EngineState::Waiting => return,
+            match svc.translate.engine(ctx, &path) {
+                EngineState::Waiting => {
+                    if let Some(s) = svc.translate.status() {
+                        self.status = s;
+                    }
+                    return;
+                }
                 EngineState::Declined => {
+                    self.tr.on = false;
+                    return;
+                }
+                EngineState::Failed(e) => {
+                    self.status = e;
                     self.tr.on = false;
                     return;
                 }
@@ -94,6 +103,9 @@ impl DocView {
                     let c = ctx.clone();
                     let job = strata_translate::start(plan.clone(), store, engine, from, Arc::new(move || c.request_repaint()));
                     self.tr.progress = (0, plan.segments.len());
+                    if self.status.starts_with("翻訳モデル") {
+                        self.status.clear();
+                    }
                     self.tr.session = Some(Session { doc, model: model.clone(), plan, job: Some(job) });
                 }
             }

@@ -14,3 +14,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6"
 ureq = "3"
+# Local models (GGUF). The GPU backend is a module loaded at run time.
+llama-cpp-2 = { version = "=0.1.157", optional = true, default-features = false, features = ["dynamic-backends", "vulkan"] }
+
+[features]
+llama = ["dep:llama-cpp-2"]

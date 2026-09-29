@@ -98,6 +98,8 @@ pub struct StrataApp {
     confirm_quit: bool,
     allow_quit: bool,
     quit_after_save: bool,
+    /// A menu or combo box was open at the end of the last frame.
+    popup_open: bool,
 }
 
 impl StrataApp {
@@ -143,6 +145,7 @@ impl StrataApp {
             confirm_quit: false,
             allow_quit: false,
             quit_after_save: false,
+            popup_open: false,
             web: wry::WebContext::new(directories::ProjectDirs::from("", "", "StrataPDF").map(|d| d.data_local_dir().join("WebView2"))),
         };
         for f in files {
@@ -767,7 +770,7 @@ impl eframe::App for StrataApp {
                 ThemeChoice::Light => strata_core::reflow::output::Theme::Light,
                 ThemeChoice::Dark => strata_core::reflow::output::Theme::Dark,
             };
-            let overlay = ctx.any_popup_open() || self.ocr.dialog_open() || self.translate.dialog_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
+            let overlay = self.popup_open || self.ocr.dialog_open() || self.translate.dialog_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
             let mut viewer = Viewer {
                 pool: &self.pool,
                 tiles: &mut self.tiles,
@@ -829,6 +832,14 @@ impl eframe::App for StrataApp {
         self.translate.ui(&ctx);
         self.update_title(&ctx);
         self.tiles.end_frame();
+        // egui lists open popups while a frame is built, so `any_popup_open` is only
+        // meaningful at its end. Webviews (native windows drawn over egui) hide in the
+        // next frame, which must come even without further input.
+        let popup = ctx.any_popup_open();
+        if popup != self.popup_open {
+            self.popup_open = popup;
+            ctx.request_repaint();
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

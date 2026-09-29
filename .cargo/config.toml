@@ -4,3 +4,8 @@ target-dir = "C:/tmp/cargo-target/StrataPDF"
 
 [env]
 LIBCLANG_PATH = "C:/Program Files/LLVM/bin"
+# llama.cpp (local translation models): the shader generator of the Vulkan
+# backend only installs correctly with the Release configuration.
+LLAMA_LIB_PROFILE = "Release"
+VULKAN_SDK = "C:/VulkanSDK/1.4.357.0"
+CMAKE = "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe"
