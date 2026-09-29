@@ -226,7 +226,8 @@ fn cache_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "StrataPDF").map(|d| d.data_local_dir().join("ocr"))
 }
 
-fn cache_key(path: &Path) -> Option<String> {
+/// Per-file cache key: path, size and modification time.
+pub fn cache_key(path: &Path) -> Option<String> {
     use std::hash::{Hash, Hasher};
     // The same file opened by a relative path must hit the same entry.
     // (`canonicalize` returns a verbatim `\\?\` path on Windows; drop the prefix.)

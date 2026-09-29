@@ -22,6 +22,7 @@ use crate::reflow_view::{ReflowPane, WebMsg};
 
 mod annot_ui;
 mod table_ui;
+mod tr_ui;
 use crate::tiles::TileCache;
 
 static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
@@ -79,6 +80,7 @@ pub struct Services<'a> {
     pub latex: bool,
     /// Font size of the text view (shared by all tabs, saved in the settings).
     pub text_scale: &'a mut f32,
+    pub translate: &'a mut crate::translate_ui::TranslateManager,
 }
 
 struct OcrJob {
@@ -206,6 +208,7 @@ pub struct DocView {
     save_job: Option<Receiver<Result<(usize, std::path::PathBuf), String>>>,
     annot: annot_ui::AnnotState,
     table: table_ui::TableState,
+    tr: tr_ui::TrState,
 }
 
 impl DocView {
@@ -261,6 +264,7 @@ impl DocView {
             save_job: None,
             annot: annot_ui::AnnotState::default(),
             table: table_ui::TableState::default(),
+            tr: tr_ui::TrState::default(),
         }
     }
 
@@ -823,12 +827,13 @@ impl DocView {
                 self.rebuild_reflow(Some(f));
             }
         }
-        self.reflow_toolbar(ui, svc.text_scale);
+        self.reflow_toolbar(ui, svc);
         if self.mode != ViewMode::Reflow {
             // Switched to the PDF view from the toolbar: drawing the text view in
             // the rest of this frame would show the webview again.
             return;
         }
+        self.update_translation(&ui.ctx().clone(), svc);
         self.status_bar(ui);
         let ctx = ui.ctx().clone();
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
@@ -1030,11 +1035,14 @@ impl DocView {
         }
     }
 
-    fn reflow_toolbar(&mut self, ui: &mut Ui, text_scale: &mut f32) {
+    fn reflow_toolbar(&mut self, ui: &mut Ui, svc: &mut Services) {
         egui::Panel::top(Id::new(("rtoolbar", self.id))).show(ui, |ui| {
             ui.horizontal(|ui| {
                 self.mode_switch(ui);
                 ui.separator();
+                self.translation_toolbar(ui, svc);
+                ui.separator();
+                let text_scale = &mut *svc.text_scale;
                 if ui.button("A－").on_hover_text("文字を小さく (Ctrl+- / Ctrl+ホイール)").clicked() {
                     step_text_scale(text_scale, -1);
                 }

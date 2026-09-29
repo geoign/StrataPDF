@@ -17,6 +17,9 @@ pub struct HtmlOptions<'a> {
     pub image_src: &'a dyn Fn(&ReflowImage) -> String,
     /// Extra CSS appended after the built-in style sheet.
     pub extra_css: &'a str,
+    /// Side-by-side translation layout: these nodes get a row with an empty
+    /// translation cell (`#tr-<node index>`) filled in later by script.
+    pub bilingual: Option<&'a std::collections::HashSet<usize>>,
 }
 
 fn esc_html(s: &str) -> String {
@@ -176,9 +179,9 @@ pub fn to_markdown(doc: &ReflowDoc, image_path: &dyn Fn(&ReflowImage) -> String)
 }
 
 const CSS: &str = r#"
-:root { --bg:#fbfaf7; --fg:#1d1d1f; --muted:#6b6b70; --rule:#dddad2; --link:#1f5fbf; --card:#ffffff; --pm:#b5b1a6; }
-@media (prefers-color-scheme: dark) { :root:not(.light) { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; } }
-:root.dark { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; }
+:root { --bg:#fbfaf7; --fg:#1d1d1f; --muted:#6b6b70; --rule:#dddad2; --link:#1f5fbf; --card:#ffffff; --pm:#b5b1a6; --hover:rgba(0,0,0,.035); }
+@media (prefers-color-scheme: dark) { :root:not(.light) { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; --hover:rgba(255,255,255,.04); } }
+:root.dark { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; --hover:rgba(255,255,255,.04); }
 html { background: var(--bg); color: var(--fg); }
 body { margin: 0; font-family: "Charis SIL", "Cambria", "Georgia", "Yu Mincho", "YuMincho", "Noto Serif JP", serif; font-size: 17px; line-height: 1.7; }
 main { max-width: 46em; margin: 0 auto; padding: 2.5em 1.5em 6em; position: relative; }
@@ -213,6 +216,18 @@ html:lang(ja) p { text-indent: 1em; }
 html:lang(ja) p.fn { text-indent: 0; }
 body.vertical .pm { position: static; display: inline-block; writing-mode: horizontal-tb; margin: 0 .3em; }
 body.vertical figure img { max-height: 80vh; }
+/* Side-by-side translation. */
+main.bi-main { max-width: 96em; }
+.bi { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 2.4em; align-items: start; border-radius: 4px; }
+.bi > .full { grid-column: 1 / -1; }
+.bi:hover { background: var(--hover); }
+.bi .tr { font-family: "Yu Mincho", "YuMincho", "Noto Serif JP", serif; line-height: 1.85; }
+/* Justifying Japanese with long Latin words stretches the gaps between characters. */
+.bi .tr p { text-indent: 1em; text-align: left; } .bi .tr p.fn, .bi .tr p.capt, .bi .tr p.li { text-indent: 0; }
+.bi .tr.pending::before { content: "…"; color: var(--muted); }
+.bi .tr.failed::before { content: "（訳せませんでした）"; color: var(--muted); font-size: .85em; }
+.bi .src p.li { padding-left: 1.2em; text-indent: -1.2em; }
+.bi p.capt { color: var(--muted); font-size: .9em; }
 "#;
 
 const SCRIPT: &str = r#"
@@ -257,15 +272,29 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
         Theme::Dark => "dark",
     };
     let mut h = String::new();
+    // The translation column is horizontal, so vertical originals are shown horizontally too.
+    let vertical = doc.vertical && o.bilingual.is_none();
     h.push_str(&format!(
-        "<!doctype html>\n<html lang=\"{lang}\" class=\"{root_class}\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<meta name=\"generator\" content=\"StrataPDF\">\n<title>{}</title>\n<style>{CSS}{}</style>\n</head>\n<body class=\"{}\">\n<main>\n",
+        "<!doctype html>\n<html lang=\"{lang}\" class=\"{root_class}\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<meta name=\"generator\" content=\"StrataPDF\">\n<title>{}</title>\n<style>{CSS}{}</style>\n</head>\n<body class=\"{}\">\n<main{}>\n",
         esc_html(&doc.title),
         o.extra_css,
-        if doc.vertical { "vertical" } else { "" }
+        if vertical { "vertical" } else { "" },
+        if o.bilingual.is_some() { " class=\"bi-main\"" } else { "" }
     ));
     let mut in_list = false;
     for (ni, n) in doc.nodes.iter().enumerate() {
         let a = doc.anchors.get(ni).map(|(p, y)| format!(" data-p=\"{}\" data-y=\"{:.0}\"", p + 1, y)).unwrap_or_default();
+        if let Some(set) = o.bilingual
+            && set.contains(&ni)
+            && let Some(row) = bilingual_row(doc, ni, n, &a, o)
+        {
+            if in_list {
+                h.push_str("</ul>\n");
+                in_list = false;
+            }
+            h.push_str(&row);
+            continue;
+        }
         let is_item = matches!(n, Node::ListItem { .. });
         if in_list && !is_item {
             h.push_str("</ul>\n");
@@ -335,6 +364,23 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
     h.push_str(SCRIPT);
     h.push_str("</script>\n</body>\n</html>\n");
     h
+}
+
+/// A side-by-side row: the original on the left, an empty translation cell on the right.
+fn bilingual_row(doc: &ReflowDoc, ni: usize, n: &Node, a: &str, o: &HtmlOptions) -> Option<String> {
+    let (full, src, tag) = match n {
+        Node::Heading { level, spans } => (String::new(), format!("<h{level}>{}</h{level}>", spans_html(spans).trim()), format!("h{level}")),
+        Node::Paragraph { spans } => (String::new(), format!("<p>{}</p>", spans_html(spans).trim()), "p".into()),
+        Node::ListItem { spans } => (String::new(), format!("<p class=\"li\">• {}</p>", spans_html(&strip_marker(spans)).trim()), "p.li".into()),
+        Node::Footnote { spans } => (String::new(), format!("<p class=\"fn\">{}</p>", spans_html(spans).trim()), "p.fn".into()),
+        Node::Figure { image, caption } | Node::Table { image, caption, .. } if !caption.is_empty() => {
+            let img = &doc.images[*image];
+            let full = format!("<figure class=\"full\"><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\"></figure>", esc_html(&(o.image_src)(img)), img.width / 2);
+            (full, format!("<p class=\"capt\">{}</p>", spans_html(caption).trim()), "p.capt".into())
+        }
+        _ => return None,
+    };
+    Some(format!("<div class=\"bi\"{a}>{full}<div class=\"src\">{src}</div><div class=\"tr pending\" id=\"tr-{ni}\" data-tag=\"{tag}\"></div></div>\n"))
 }
 
 /// LaTeX to MathML Core (rendered natively by Chromium/WebView2).

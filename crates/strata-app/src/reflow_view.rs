@@ -2,7 +2,7 @@
 //! laid over the tab's content area.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +44,16 @@ pub struct ReflowPane {
     pub at_page: u32,
     pub at_y: f32,
     pending_goto: Option<(u32, f32)>,
+    /// Side-by-side translation page: the nodes with a translation cell.
+    bilingual: Option<Arc<HashSet<usize>>>,
+    translations: HashMap<usize, String>,
+    failed: HashSet<usize>,
+    /// Translations not yet sent to the page.
+    unsent: Vec<usize>,
+    /// The current page has loaded (it reports `ready:`).
+    page_ready: bool,
+    /// Load this page into the webview.
+    navigate: bool,
 }
 
 const JS_BRIDGE: &str = r#"
@@ -100,6 +110,22 @@ const JS_BRIDGE: &str = r#"
   };
   let t = null;
   window.addEventListener('scroll', () => { if (!t) t = setTimeout(() => { t = null; report(); }, 150); }, {passive: true});
+  // Fill translation cells: [[node, text, failed], ...].
+  window.strataSetTr = list => {
+    for (const [id, text, failed] of list) {
+      const el = document.getElementById('tr-' + id);
+      if (!el) continue;
+      el.classList.remove('pending');
+      if (failed) { el.classList.add('failed'); continue; }
+      el.classList.remove('failed');
+      const [name, cls] = (el.dataset.tag || 'p').split('.');
+      const e = document.createElement(name);
+      if (cls) e.className = cls;
+      e.textContent = text;
+      el.replaceChildren(e);
+    }
+  };
+  send('ready:' + location.pathname);
 })();
 "#;
 
@@ -126,6 +152,12 @@ impl ReflowPane {
             at_page: 1,
             at_y: 0.0,
             pending_goto: None,
+            bilingual: None,
+            translations: HashMap::new(),
+            failed: HashSet::new(),
+            unsent: Vec::new(),
+            page_ready: false,
+            navigate: false,
         }
     }
 
@@ -164,9 +196,68 @@ impl ReflowPane {
             store.insert(format!("/img/{}", im.id), ("image/png", Arc::new(im.png.clone())));
         }
         let src = |im: &ReflowImage| format!("img/{}", im.id);
-        let html = output::to_html(d, &HtmlOptions { theme: Theme::Auto, page_markers: true, image_src: &src, extra_css: "" });
+        let html = output::to_html(d, &HtmlOptions { theme: Theme::Auto, page_markers: true, image_src: &src, extra_css: "", bilingual: None });
         let html = html.replace("</body>", &format!("<script>{JS_BRIDGE}</script></body>"));
         store.insert("/index.html".into(), ("text/html; charset=utf-8", Arc::new(html.into_bytes())));
+    }
+
+    fn page_url(&self) -> &'static str {
+        if self.bilingual.is_some() { "http://strata.doc/bi.html" } else { "http://strata.doc/index.html" }
+    }
+
+    /// Show the side-by-side translation page with cells for `nodes`, or the plain page.
+    pub fn set_bilingual(&mut self, nodes: Option<HashSet<usize>>) {
+        if nodes.as_ref() == self.bilingual.as_deref() {
+            return;
+        }
+        self.translations.clear();
+        self.failed.clear();
+        self.unsent.clear();
+        if let (Some(n), Some(d)) = (&nodes, &self.doc) {
+            let src = |im: &ReflowImage| format!("img/{}", im.id);
+            let html = output::to_html(d, &HtmlOptions { theme: Theme::Auto, page_markers: true, image_src: &src, extra_css: "", bilingual: Some(n) });
+            let html = html.replace("</body>", &format!("<script>{JS_BRIDGE}</script></body>"));
+            self.store.write().insert("/bi.html".into(), ("text/html; charset=utf-8", Arc::new(html.into_bytes())));
+        }
+        self.bilingual = nodes.map(Arc::new);
+        self.navigate = true;
+        self.page_ready = false;
+    }
+
+    pub fn is_bilingual(&self) -> bool {
+        self.bilingual.is_some()
+    }
+
+    pub fn add_translations(&mut self, v: Vec<(usize, String)>) {
+        for (id, t) in v {
+            self.failed.remove(&id);
+            self.translations.insert(id, t);
+            self.unsent.push(id);
+        }
+    }
+
+    pub fn mark_failed(&mut self, ids: Vec<usize>) {
+        for id in ids {
+            self.failed.insert(id);
+            self.unsent.push(id);
+        }
+    }
+
+    /// Send pending translations to the loaded page.
+    fn flush_translations(&mut self) {
+        let Some(w) = &self.webview else { return };
+        if !self.page_ready || self.bilingual.is_none() || self.unsent.is_empty() {
+            return;
+        }
+        let list: Vec<serde_json::Value> = self
+            .unsent
+            .drain(..)
+            .map(|id| match self.translations.get(&id) {
+                Some(t) => serde_json::json!([id, t, false]),
+                None => serde_json::json!([id, "", true]),
+            })
+            .collect();
+        let _ = w.evaluate_script(&format!("window.strataSetTr && window.strataSetTr({})", serde_json::Value::Array(list)));
     }
 
     /// Scroll the reflowed view to a 1-based page and page-space y once it is ready.
@@ -190,6 +281,15 @@ impl ReflowPane {
                 out.push(WebMsg::Key(k.to_string()));
             } else if let Some(d) = m.strip_prefix("font:").and_then(|d| d.parse().ok()) {
                 out.push(WebMsg::Font(d));
+            } else if let Some(path) = m.strip_prefix("ready:") {
+                // A page finished loading: restore theme, font, position and translations.
+                if self.page_url().ends_with(path) {
+                    self.page_ready = true;
+                    self.theme = None;
+                    self.font = None;
+                    self.pending_goto = Some((self.at_page, self.at_y));
+                    self.unsent = self.translations.keys().chain(self.failed.iter()).copied().collect();
+                }
             }
         }
         out
@@ -219,7 +319,7 @@ impl ReflowPane {
             })
             .with_navigation_handler(|url| url.starts_with("http://strata.") || url.starts_with("about:"))
             .with_devtools(cfg!(debug_assertions))
-            .with_url("http://strata.doc/index.html")
+            .with_url(self.page_url())
             .build_as_child(window)
             .map_err(|e| e.to_string())
     }
@@ -256,6 +356,8 @@ impl ReflowPane {
             let (Some(window), Some(ctx)) = (window, ctx) else { return };
             match self.build_webview(ui.ctx(), window, ctx, rect) {
                 Ok(w) => {
+                    // It opens on the current page already.
+                    self.navigate = false;
                     if focused {
                         let _ = w.focus();
                     }
@@ -269,6 +371,12 @@ impl ReflowPane {
                 }
             }
         }
+        if std::mem::take(&mut self.navigate)
+            && let Some(w) = &self.webview
+        {
+            let _ = w.load_url(self.page_url());
+        }
+        self.flush_translations();
         let Some(w) = &self.webview else { return };
         if self.bounds != Some(rect) {
             let _ = w.set_bounds(to_wry(rect));
@@ -333,7 +441,7 @@ impl ReflowPane {
     pub fn export_html(&self, path: &Path, theme: Theme) -> std::io::Result<()> {
         let Some(d) = &self.doc else { return Ok(()) };
         let src = |im: &ReflowImage| format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&im.png));
-        let html = output::to_html(d, &HtmlOptions { theme, page_markers: false, image_src: &src, extra_css: "" });
+        let html = output::to_html(d, &HtmlOptions { theme, page_markers: false, image_src: &src, extra_css: "", bilingual: None });
         std::fs::write(path, html)
     }
 }

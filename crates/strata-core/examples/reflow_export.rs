@@ -26,7 +26,7 @@ fn main() {
                 let md = output::to_markdown(&d, &|im| format!("images/{}", im.id));
                 std::fs::write(out.join("out.md"), md).unwrap();
                 let src = |im: &strata_core::reflow::ReflowImage| format!("images/{}", im.id);
-                let html = output::to_html(&d, &output::HtmlOptions { theme: output::Theme::Auto, page_markers: true, image_src: &src, extra_css: "" });
+                let html = output::to_html(&d, &output::HtmlOptions { theme: output::Theme::Auto, page_markers: true, image_src: &src, extra_css: "", bilingual: None });
                 std::fs::write(out.join("out.html"), html).unwrap();
                 return;
             }

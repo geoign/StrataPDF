@@ -39,11 +39,12 @@ pub struct Settings {
     pub formula_latex: bool,
     /// Font size of the text view relative to the default.
     pub text_scale: f32,
+    pub translate: crate::translate_ui::TranslateSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true, text_scale: 1.0 }
+        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true, text_scale: 1.0, translate: Default::default() }
     }
 }
 
@@ -90,6 +91,7 @@ pub struct StrataApp {
     waker: Waker,
     web: wry::WebContext,
     ocr: crate::ocr_ui::OcrManager,
+    translate: crate::translate_ui::TranslateManager,
     /// Tab awaiting a decision about unsaved changes.
     confirm_close: Option<ViewId>,
     /// Window close requested while documents have unsaved changes.
@@ -109,6 +111,7 @@ impl StrataApp {
         let waker: Waker = Arc::new(move || wctx.request_repaint());
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).clamp(2, 16);
         let settings_device = settings.ocr_device;
+        let settings_translate = settings.translate.clone();
         let (open_tx, open_rx) = unbounded();
         let (msg_tx, msg_rx) = unbounded();
         let (ipc_tx, ipc_rx) = unbounded();
@@ -135,6 +138,7 @@ impl StrataApp {
             title: String::new(),
             waker,
             ocr: crate::ocr_ui::OcrManager::new(settings_device),
+            translate: crate::translate_ui::TranslateManager::new(settings_translate),
             confirm_close: None,
             confirm_quit: false,
             allow_quit: false,
@@ -641,6 +645,7 @@ struct Viewer<'a> {
     ocr: &'a mut crate::ocr_ui::OcrManager,
     latex: bool,
     text_scale: &'a mut f32,
+    translate: &'a mut crate::translate_ui::TranslateManager,
 }
 
 impl TabViewer for Viewer<'_> {
@@ -667,6 +672,7 @@ impl TabViewer for Viewer<'_> {
             ocr: &mut *self.ocr,
             latex: self.latex,
             text_scale: &mut *self.text_scale,
+            translate: &mut *self.translate,
         };
         tab.ui(ui, &mut svc);
     }
@@ -761,7 +767,7 @@ impl eframe::App for StrataApp {
                 ThemeChoice::Light => strata_core::reflow::output::Theme::Light,
                 ThemeChoice::Dark => strata_core::reflow::output::Theme::Dark,
             };
-            let overlay = ctx.any_popup_open() || self.ocr.dialog_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
+            let overlay = ctx.any_popup_open() || self.ocr.dialog_open() || self.translate.dialog_open() || self.password.is_some() || self.props.is_some() || self.show_about || !self.errors.is_empty();
             let mut viewer = Viewer {
                 pool: &self.pool,
                 tiles: &mut self.tiles,
@@ -775,6 +781,7 @@ impl eframe::App for StrataApp {
                 ocr: &mut self.ocr,
                 latex: self.settings.formula_latex,
                 text_scale: &mut self.settings.text_scale,
+                translate: &mut self.translate,
             };
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                 DockArea::new(&mut self.dock)
@@ -819,11 +826,13 @@ impl eframe::App for StrataApp {
         if let Some(e) = self.ocr.ui(&ctx) {
             self.errors.push(e);
         }
+        self.translate.ui(&ctx);
         self.update_title(&ctx);
         self.tiles.end_frame();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.translate = self.translate.settings.clone();
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
     }
 }

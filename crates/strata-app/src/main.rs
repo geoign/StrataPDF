@@ -7,6 +7,7 @@ mod ocr_ui;
 mod print;
 mod reflow_view;
 mod tiles;
+mod translate_ui;
 mod view;
 
 use std::path::PathBuf;
