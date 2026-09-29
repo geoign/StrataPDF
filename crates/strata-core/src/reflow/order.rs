@@ -65,19 +65,26 @@ fn merge_column_bands(rects: &[RectF], bands: Vec<Vec<usize>>, min_gap: f32) -> 
     out
 }
 
-pub fn reading_order(rects: &[RectF], vertical_text: bool) -> Vec<usize> {
+/// Reading order of the boxes. `imprecise`: the boxes come from OCR (a text
+/// layer over a scan), whose lines run into the gutter (trailing spaces, stray
+/// marks): columns may then touch or overlap by a few points.
+pub fn reading_order(rects: &[RectF], vertical_text: bool, imprecise: bool) -> Vec<usize> {
     let idx: Vec<usize> = (0..rects.len()).collect();
     let mut out = Vec::with_capacity(rects.len());
-    cut(rects, &idx, vertical_text, &mut out, 0);
+    cut(rects, &idx, vertical_text, imprecise, &mut out, 0);
     out
 }
 
-fn cut(rects: &[RectF], idx: &[usize], vertical_text: bool, out: &mut Vec<usize>, depth: u32) {
+fn cut(rects: &[RectF], idx: &[usize], vertical_text: bool, imprecise: bool, out: &mut Vec<usize>, depth: u32) {
     if idx.len() <= 1 || depth > 64 {
         out.extend_from_slice(idx);
         return;
     }
-    let (first_is_columns, gap_cols, gap_rows) = if vertical_text { (false, MIN_GAP, MIN_GAP * 2.0) } else { (true, MIN_GAP * 2.0, MIN_GAP) };
+    let (first_is_columns, gap_cols, gap_rows) = match (vertical_text, imprecise) {
+        (true, _) => (false, MIN_GAP, MIN_GAP * 2.0),
+        (false, false) => (true, MIN_GAP * 2.0, MIN_GAP),
+        (false, true) => (true, -MIN_GAP, MIN_GAP),
+    };
     let cols = || {
         let mut g = split(rects, idx, false, gap_cols);
         if vertical_text {
@@ -93,7 +100,7 @@ fn cut(rects: &[RectF], idx: &[usize], vertical_text: bool, out: &mut Vec<usize>
     let groups = if a.len() > 1 { a } else { b };
     if groups.len() > 1 {
         for g in groups {
-            cut(rects, &g, vertical_text, out, depth + 1);
+            cut(rects, &g, vertical_text, imprecise, out, depth + 1);
         }
         return;
     }
@@ -119,7 +126,7 @@ mod tests {
     fn two_columns_under_a_title() {
         // title, then left column (2 paras) and right column (2 paras) with aligned gaps
         let rects = [r(50.0, 10.0, 550.0, 40.0), r(300.0, 60.0, 550.0, 200.0), r(50.0, 60.0, 280.0, 200.0), r(50.0, 210.0, 280.0, 400.0), r(300.0, 210.0, 550.0, 400.0)];
-        assert_eq!(reading_order(&rects, false), vec![0, 2, 3, 1, 4]);
+        assert_eq!(reading_order(&rects, false, false), vec![0, 2, 3, 1, 4]);
     }
 
     #[test]
@@ -137,13 +144,13 @@ mod tests {
             r(306.1, 582.4, 525.4, 591.2), // 7 right: heading
             r(306.1, 607.1, 544.4, 715.7), // 8 right
         ];
-        assert_eq!(reading_order(&rects, false), vec![0, 1, 2, 5, 6, 3, 4, 7, 8]);
+        assert_eq!(reading_order(&rects, false, false), vec![0, 1, 2, 5, 6, 3, 4, 7, 8]);
     }
 
     #[test]
     fn vertical_text_runs_right_to_left_by_tier() {
         // upper tier: two blocks (right one first), lower tier: one block
         let rects = [r(10.0, 10.0, 100.0, 200.0), r(120.0, 10.0, 200.0, 200.0), r(10.0, 230.0, 200.0, 400.0)];
-        assert_eq!(reading_order(&rects, true), vec![1, 0, 2]);
+        assert_eq!(reading_order(&rects, true, false), vec![1, 0, 2]);
     }
 }

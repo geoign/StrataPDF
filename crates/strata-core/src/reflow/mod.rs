@@ -200,8 +200,13 @@ fn is_cjk(c: char) -> bool {
 
 fn is_math_font(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    const KEYS: [&str; 18] = ["math", "cmmi", "cmsy", "cmex", "msbm", "msam", "symbol", "stix", "mt extra", "mtextra", "euclid", "mathematicalpi", "txsy", "txmi", "rtxmi", "mtsy", "mtmi", "cambria math"];
-    KEYS.iter().any(|k| n.contains(k))
+    // STIX is a text family too (STIX-Regular, STIXTwoText set whole papers);
+    // its math fonts are "STIXMath", "STIXTwoMath", "STIXSize…", "STIXIntegrals…"
+    // and "STIXGeneral" (symbols), matched by "math" or listed here.
+    const KEYS: [&str; 21] = [
+        "math", "cmmi", "cmsy", "cmex", "msbm", "msam", "symbol", "stixgeneral", "stixsize", "stixintegrals", "stixvariants", "stixnonunicode", "mt extra", "mtextra", "euclid", "mathematicalpi", "txsy", "txmi", "rtxmi", "mtsy", "mtmi",
+    ];
+    KEYS.iter().any(|k| n.contains(k)) || n.contains("cambria math")
 }
 
 /// Bold or italic from the font, including naming conventions MuPDF does not
@@ -245,11 +250,9 @@ fn normalize_vertical(p: &mut RichPage) {
     }
 }
 
-/// Precompose spacing accents that PDFs place before the base letter
-/// ("Universit´e" -> "Université").
-fn fix_accents(s: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    let combining = |c: char| match c {
+/// The combining mark for a spacing accent.
+fn combining(c: char) -> Option<char> {
+    match c {
         '\u{00B4}' => Some('\u{0301}'),
         '\u{0060}' => Some('\u{0300}'),
         '\u{00A8}' => Some('\u{0308}'),
@@ -259,7 +262,53 @@ fn fix_accents(s: &str) -> String {
         '\u{00B8}' => Some('\u{0327}'),
         '\u{02DA}' => Some('\u{030A}'),
         _ => None,
-    };
+    }
+}
+
+/// Accents drawn as glyphs of their own (a spacing "¨", or a combining mark
+/// in the wrong place) moved onto the letter they are drawn over: the
+/// neighbouring letter, before or after, that they overlap most. PDFs put
+/// them before the letter ("Universit´e") or after it ("Hu¨bscher" draws the
+/// "¨" back over the "u").
+fn attach_accents(chars: &[crate::rich::RichChar]) -> Vec<crate::rich::RichChar> {
+    let accent = |c: char| combining(c).is_some() || ('\u{0300}'..='\u{036F}').contains(&c);
+    if !chars.iter().any(|c| accent(c.c)) {
+        return chars.to_vec();
+    }
+    let letter = |k: usize| chars.get(k).is_some_and(|c| c.c.is_alphabetic() && !accent(c.c));
+    // Base letter of each accent.
+    let mut base: Vec<Option<usize>> = vec![None; chars.len()];
+    for (i, c) in chars.iter().enumerate() {
+        if !accent(c.c) {
+            continue;
+        }
+        let overlap = |k: usize| {
+            let b = &chars[k].bbox;
+            b.x1.min(c.bbox.x1) - b.x0.max(c.bbox.x0)
+        };
+        let cands: Vec<usize> = [i.checked_sub(1), Some(i + 1)].into_iter().flatten().filter(|&k| letter(k)).collect();
+        base[i] = cands.into_iter().max_by(|&a, &b| overlap(a).total_cmp(&overlap(b)));
+    }
+    let mut out = Vec::with_capacity(chars.len());
+    for (k, c) in chars.iter().enumerate() {
+        if base[k].is_some() {
+            continue;
+        }
+        out.push(*c);
+        for (i, b) in base.iter().enumerate() {
+            if *b == Some(k) {
+                let m = combining(chars[i].c).unwrap_or(chars[i].c);
+                out.push(crate::rich::RichChar { c: m, ..*c });
+            }
+        }
+    }
+    out
+}
+
+/// Precompose spacing accents that PDFs place before the base letter
+/// ("Universit´e" -> "Université").
+fn fix_accents(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
     if !s.chars().any(|c| combining(c).is_some()) {
         return s.to_string();
     }
@@ -733,17 +782,33 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                     })
                     .map(|(l, c)| (l.clone(), c))
                     .collect();
-                // Split where the layout role changes; lines without a class go with the previous ones.
+                // Split where the layout role or region changes (the extractor's blocks
+                // can run from one paragraph or reference entry into the next); lines
+                // without a class go with the previous ones. Blocks of one region are
+                // joined again by `merge_regions`.
+                let split_groups = std::env::var("STRATA_NO_GROUP_SPLIT").is_err();
                 let mut runs: Vec<Vec<(RichLine, Option<(usize, usize)>)>> = Vec::new();
                 let mut cur_role: Option<u8> = None;
+                let mut cur_group: Option<usize> = None;
+                let mut prev_size: Option<f32> = None;
                 for (l, c) in kept {
                     let r = c.map(|(c, _)| role(c));
+                    let g = c.map(|(_, g)| g);
+                    let same_group = !split_groups || g.is_none() || cur_group.is_none_or(|cg| Some(cg) == g);
+                    if g.is_some() {
+                        cur_group = g;
+                    }
+                    // A change of type size (a title over its authors, a heading over
+                    // its paragraph) ends a run; OCR sizes are estimates.
+                    let ls = line_size(&l);
+                    let same_size = p.scan || prev_size.is_none_or(|ps| (ls - ps).abs() <= ps.max(ls) * 0.25);
+                    prev_size = Some(ls);
                     match (runs.last_mut(), r) {
-                        (Some(run), Some(r)) if cur_role.is_none_or(|cr| cr == r) => {
+                        (Some(run), Some(r)) if cur_role.is_none_or(|cr| cr == r) && same_group && same_size => {
                             cur_role = Some(r);
                             run.push((l, c));
                         }
-                        (Some(run), None) => run.push((l, c)),
+                        (Some(run), None) if same_size => run.push((l, c)),
                         _ => {
                             cur_role = r;
                             runs.push(vec![(l, c)]);
@@ -779,7 +844,10 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         k += 1;
         !numbers.contains(&(k - 1))
     });
-    let mut units = regroup_references(merge_regions(units));
+    let mut units = merge_regions(units);
+    if std::env::var("STRATA_NO_REGROUP").is_err() {
+        units = regroup_references(units);
+    }
     for r in vector_figures(&p.rich.blocks, page_area) {
         units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None });
     }
@@ -792,6 +860,17 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         }
     }
     let mut texts: Vec<Option<Unit>> = units.into_iter().filter(|u| u.kind == UnitKind::Text).map(Some).collect();
+    // A "figure" holding paragraphs of running text is a page decoration (a
+    // frame, a coloured box, a background drawing), not a figure.
+    figs.retain(|f| {
+        let prose: usize = texts
+            .iter()
+            .flatten()
+            .filter(|u| overlap_frac(&u.bbox, f) > 0.8 && u.lines.len() >= 3 && (u.size() - body).abs() < body * 0.1)
+            .map(|u| u.chars())
+            .sum();
+        prose < 400
+    });
     // Labels around a figure (axis ticks, legends, panel letters, a chart title)
     // lie just outside the drawing: take short blocks within a few lines of it
     // into the figure, growing it so that chained labels follow, and so that
@@ -990,6 +1069,147 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
     (saw_digit && rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())).then_some(depth)
 }
 
+/// Section numbering at the start of a heading, with its depth: "2.1 Methods",
+/// "IV. Discussion", "1) Setting", "５．結論", "I. はじめに".
+fn heading_number(t: &str) -> Option<u8> {
+    if let Some(d) = numbered_heading_depth(t) {
+        return Some(d);
+    }
+    let t = t.trim_start();
+    let head: String = t.chars().take_while(|c| !c.is_whitespace()).collect();
+    let rest = t[head.len()..].trim_start();
+    let title_follows = |s: &str| s.chars().next().is_some_and(|c| c.is_alphabetic());
+    // Roman numerals: "IV." (not "I" as a word).
+    if let Some(r) = head.strip_suffix('.')
+        && !r.is_empty()
+        && r.chars().all(|c| matches!(c, 'I' | 'V' | 'X'))
+        && title_follows(rest)
+    {
+        return Some(1);
+    }
+    // "1)" or full-width "１．" / "1．" followed by a title, with or without a space.
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit() || ('０'..='９').contains(c)).collect();
+    if !digits.is_empty() && digits.chars().count() <= 2 {
+        let after = &t[digits.len()..];
+        if let Some(r) = after.strip_prefix('．')
+            && title_follows(r.trim_start())
+        {
+            return Some(1);
+        }
+        if let Some(r) = after.strip_prefix(')').or_else(|| after.strip_prefix('）'))
+            && title_follows(r.trim_start())
+        {
+            return Some(2);
+        }
+    }
+    None
+}
+
+/// Front-matter headings that are headings even before the body starts.
+fn is_front_heading(t: &str) -> bool {
+    let l = t.trim().trim_end_matches([':', '.']).to_lowercase();
+    ["abstract", "summary", "key points", "keywords", "key words", "highlights", "plain language summary", "introduction", "要旨", "概要", "要約", "はじめに", "序論", "緒言"].contains(&l.as_str())
+}
+
+/// An author line: personal names ("A. B. Surname", "Firstname Surname",
+/// "SURNAME") separated by commas, "and", "&", "·" or affiliation marks. Each
+/// name is a short group of name-like words; a Title Case title has long groups
+/// and function words. Only meaningful in the front matter.
+fn is_byline(t: &str) -> bool {
+    if t.chars().count() > 600 || is_front_heading(t) {
+        return false;
+    }
+    // A short CJK name ("勝間田明男").
+    let compact: String = t.chars().filter(|c| !c.is_whitespace() && !matches!(c, '*' | '＊')).collect();
+    if (2..=6).contains(&compact.chars().count()) && compact.chars().all(is_cjk) {
+        return true;
+    }
+    let cleaned: String = t
+        .chars()
+        .map(|c| if matches!(c, ',' | ';' | '·' | '•' | '&' | '*' | '＊' | '∗' | '⁎' | '†' | '‡' | '§' | '¶' | '#' | '(' | ')') || c.is_ascii_digit() { '|' } else { c })
+        .collect();
+    let cleaned = cleaned.replace(" and ", "|").replace(" und ", "|").replace(" et ", "|");
+    let groups: Vec<Vec<&str>> = cleaned
+        .split('|')
+        .map(|g| g.split_whitespace().filter(|w| !matches!(*w, "and" | "und" | "et") && w.chars().any(char::is_alphabetic)).collect::<Vec<_>>())
+        .filter(|g| !g.is_empty())
+        .collect();
+    if groups.is_empty() {
+        return false;
+    }
+    const PARTICLES: [&str; 18] = ["de", "da", "di", "del", "della", "van", "von", "der", "den", "la", "le", "du", "dos", "das", "y", "e", "bin", "ter"];
+    let name_like = |w: &str| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric() && c != '.');
+        let letters: Vec<char> = w.chars().filter(|c| c.is_alphabetic()).collect();
+        if letters.is_empty() || letters.len() > 16 {
+            return false;
+        }
+        // Initials: "A.", "A.B.", "J.-C."
+        let initials = w.contains('.') && letters.len() <= 3 && letters.iter().all(|c| c.is_uppercase());
+        // "Smith", "SMITH", "McCloskey", "LaFemina", "D’Antonio".
+        let capitalised = letters[0].is_uppercase() && (letters[1..].iter().any(|c| c.is_lowercase()) || letters.iter().all(|c| c.is_uppercase()));
+        // A lone lowercase letter is an affiliation mark ("Smith a").
+        initials || capitalised || PARTICLES.contains(&w) || (letters.len() == 1 && letters[0].is_lowercase())
+    };
+    // Each group a name of one to six words ("Jr." alone is a group too).
+    let good = groups.iter().filter(|g| g.len() <= 6 && g.iter().all(|w| name_like(w))).count();
+    let words: usize = groups.iter().map(|g| g.len()).sum();
+    // A single name has two to four words.
+    if groups.len() == 1 {
+        return good == 1 && (2..=4).contains(&words);
+    }
+    good * 10 >= groups.len() * 9
+}
+
+/// A heading set in capitals ("VOLCANIC FLOW TYPES AND DISTRIBUTION"), as older
+/// papers do: short, nearly all letters uppercase, no closing punctuation.
+fn caps_heading(t: &str) -> bool {
+    let t = t.trim();
+    let letters: Vec<char> = t.chars().filter(|c| c.is_alphabetic()).collect();
+    letters.len() >= 6
+        && t.chars().count() <= 100
+        && letters.iter().filter(|c| c.is_uppercase()).count() * 10 >= letters.len() * 9
+        && !t.ends_with([',', ';', '.'])
+        && t.chars().filter(char::is_ascii_digit).count() <= 4
+}
+
+/// An author line with the marks of one: commas or "and" between names,
+/// initials, affiliation numbers or asterisks.
+fn is_strong_byline(t: &str) -> bool {
+    let initials = t.split_whitespace().any(|w| {
+        let l: Vec<char> = w.chars().filter(|c| c.is_alphabetic()).collect();
+        w.contains('.') && !l.is_empty() && l.len() <= 3 && l.iter().all(|c| c.is_uppercase())
+    });
+    let separators = t.chars().filter(|c| matches!(c, ',' | '·' | ';')).count();
+    is_byline(t) && (initials || separators >= 2 || t.contains(['*', '＊', '∗', '†', '‡']) || t.chars().any(|c| c.is_ascii_digit()))
+}
+
+/// Publisher boilerplate that is not part of the text: copyright and licence
+/// lines, banners, download stamps. Shown as notes and kept out of paragraphs.
+fn is_boilerplate(t: &str) -> bool {
+    let l = t.trim().to_lowercase();
+    if l.chars().count() > 500 {
+        return false;
+    }
+    const STARTS: [&str; 14] = [
+        "copyright",
+        "©",
+        "paper number",
+        "printed in",
+        "contents lists available at",
+        "journal homepage",
+        "this article is protected by copyright",
+        "this article has been accepted for publication",
+        "downloaded from",
+        "this is an open access article",
+        "open access this article",
+        "published by elsevier",
+        "all rights reserved",
+        "crown copyright",
+    ];
+    STARTS.iter().any(|s| l.starts_with(s)) || l.contains("all rights reserved") || (l.contains("creative commons") && l.contains("licen") && l.chars().count() < 400)
+}
+
 fn is_list_marker(t: &str) -> bool {
     let t = t.trim_start();
     t.starts_with(['•', '·', '▪', '●', '◦', '‣', '–', '・']) || {
@@ -1054,7 +1274,7 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
                 }
             }
         }
-        for c in &l.chars {
+        for c in &attach_accents(&l.chars) {
             let f = fonts.get(c.font as usize);
             let small = c.size < med * 0.8 && !vertical;
             let cy = (c.bbox.y0 + c.bbox.y1) * 0.5;
@@ -1093,7 +1313,8 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
         }
     }
     for s in &mut spans {
-        s.text = fix_accents(&s.text);
+        use unicode_normalization::UnicodeNormalization;
+        s.text = fix_accents(&s.text).nfc().collect();
     }
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
     for s in spans {
@@ -1386,6 +1607,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // The last heading from the layout model: node, page, box and size, for
     // headings that the extractor split into one block per line.
     let mut last_heading: Option<(usize, u32, RectF, f32)> = None;
+    // The body starts at the abstract, the introduction or the first numbered
+    // section (or a long paragraph); before it, on the first page, lie the title,
+    // authors and affiliations.
+    let mut body_started = false;
     for (pi, p) in pages.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
@@ -1394,7 +1619,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         // Double-spaced manuscripts leave a blank line's height between lines.
         let line_gap = if manuscript { body * 1.8 } else { body * 0.6 };
         let rects: Vec<RectF> = units.iter().map(|u| u.bbox).collect();
-        let order = order::reading_order(&rects, vertical);
+        let order = order::reading_order(&rects, vertical, p.scan);
         let mut ordered: Vec<Unit> = Vec::with_capacity(units.len());
         let mut slots: Vec<Option<Unit>> = units.drain(..).map(Some).collect();
         for i in order {
@@ -1404,6 +1629,70 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         }
         if !vertical {
             ordered = merge_display_math(ordered, &p.rich.fonts, body);
+        }
+        // A numbered heading that opens a block ("I. はじめに", then the paragraph):
+        // a short first line with section numbering becomes a heading of its own.
+        let mut forced_heading: Vec<bool> = Vec::with_capacity(ordered.len());
+        if !vertical {
+            let mut out: Vec<Unit> = Vec::with_capacity(ordered.len());
+            for mut u in ordered.drain(..) {
+                while u.kind == UnitKind::Text && u.lines.len() >= 2 {
+                    let first = &u.lines[0];
+                    let ft = first.text();
+                    let ft = ft.trim();
+                    let short = first.bbox.x1 < u.bbox.x1 - body * 3.0;
+                    if !(short && ft.chars().count() <= 60 && heading_number(ft).is_some() && !ft.ends_with(['。', ',', '、', ';', '.'])) {
+                        break;
+                    }
+                    let rest = u.lines.split_off(1);
+                    let head = Unit { kind: UnitKind::Text, bbox: u.lines[0].bbox, lines: u.lines, class: u.class, group: u.group };
+                    out.push(head);
+                    forced_heading.push(true);
+                    let bbox = rest.iter().skip(1).fold(rest[0].bbox, |a, l| a.union(&l.bbox));
+                    u = Unit { kind: UnitKind::Text, bbox, lines: rest, class: u.class, group: u.group };
+                }
+                out.push(u);
+                forced_heading.push(false);
+            }
+            ordered = out;
+        } else {
+            forced_heading.resize(ordered.len(), false);
+        }
+        // The title of the first page: the most title-like unit in its upper half.
+        // What lies above it is the journal's masthead (banners, logos' text).
+        let page_title: Option<usize> = (pi == 0 && !vertical)
+            .then(|| {
+                // The title is followed by its authors; a journal masthead is not.
+                let authors_below = |k: usize| ordered[k + 1..].iter().filter(|o| o.kind == UnitKind::Text).take(2).any(|o| is_byline(&o.text()));
+                let score = |(k, u): (usize, &Unit)| {
+                    let bonus = if u.class == Some(TITLE) { 1.3 } else { 1.0 } * if authors_below(k) { 1.5 } else { 1.0 };
+                    u.size() * (u.text().chars().count().min(150) as f32).sqrt() * bonus
+                };
+                ordered
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, u)| {
+                        let t = u.text();
+                        let n = t.chars().count();
+                        let cjk = t.chars().filter(|&c| is_cjk(c)).count();
+                        u.kind == UnitKind::Text
+                            && ((10..=300).contains(&n) || (cjk >= 4 && n <= 300))
+                            && u.lines.len() <= 6
+                            && u.bbox.y0 < p.rich.height * 0.5
+                            && (u.class == Some(TITLE) || u.size() >= body * 1.25)
+                            && (cjk >= 4 || t.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2).count() >= 2)
+                            && caption_kind(&t).is_none()
+                            && !is_strong_byline(&t)
+                            && !is_boilerplate(&t)
+                    })
+                    .max_by(|a, b| score(*a).total_cmp(&score(*b)))
+                    .map(|(i, _)| i)
+            })
+            .flatten();
+        let title_top = page_title.map(|t| ordered[t].bbox.y0);
+        let title_size_pt = page_title.map_or(0.0, |t| ordered[t].size());
+        if std::env::var("STRATA_DEBUG_UNITS").ok().and_then(|v| v.parse::<u32>().ok()) == Some(p.page + 1) {
+            eprintln!("page title: {:?}", page_title.map(|t| ordered[t].text()));
         }
         // `STRATA_DEBUG_UNITS=<page>` (1-based): the ordered units of that page on stderr.
         if std::env::var("STRATA_DEBUG_UNITS").ok().and_then(|v| v.parse::<u32>().ok()) == Some(p.page + 1) {
@@ -1471,6 +1760,19 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             let text = u.text();
             let size = u.size();
+            let in_front = pi == 0 && !body_started;
+            // The masthead above the title of the first page, and publisher
+            // boilerplate: notes, outside the running text.
+            // (Text above the title set larger than it is part of the title, unless
+            // it is a short banner: a title split in pieces, or a wrong pick.)
+            let masthead = title_top.is_some_and(|top| {
+                Some(i) != page_title && u.bbox.y1 <= top + 2.0 && (size < title_size_pt * 0.95 || (text.split_whitespace().count() <= 5 && !text.chars().any(is_cjk)))
+            });
+            if masthead || is_boilerplate(&text) {
+                doc.nodes.push(Node::Footnote { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, &lex) });
+                i += 1;
+                continue;
+            }
             // Running text that happens to start with "Table 2 summarizes..." is no
             // caption: with the layout model, a table caption must lead into a table.
             let running_text = matches!(u.class, Some(strata_ocr::layout::TEXT | strata_ocr::layout::LIST_ITEM));
@@ -1675,6 +1977,32 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             } else {
                 None
             };
+            // Headings in capitals (older papers), numbered first lines split off above,
+            // and the title found for the page.
+            let caps = !vertical
+                && u.lines.len() <= 2
+                && size >= body * 0.7
+                && caps_heading(&text)
+                && !matches!(u.class, Some(strata_ocr::layout::TABLE | PICTURE | CAPTION | FOOTNOTE | PAGE_HEADER | PAGE_FOOTER));
+            let mut level = level;
+            if Some(i) == page_title {
+                level = Some(1);
+                doc.title = text.trim().to_string();
+                title_size = f32::MAX;
+            } else if forced_heading[i] {
+                level = Some(heading_number(&text).map_or(3, |d| (d + 1).min(6)));
+            } else if level.is_none() && caps {
+                level = Some(heading_number(&text).map_or(2, |d| (d + 1).min(6)));
+            }
+            // Author lines in the front matter are no headings.
+            if in_front && level.is_some() && Some(i) != page_title && !is_front_heading(&text) && is_byline(&text) {
+                doc.nodes.push(Node::Paragraph { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, &lex) });
+                i += 1;
+                continue;
+            }
+            if level.is_some() && (is_front_heading(&text) || heading_number(&text).is_some()) {
+                body_started = true;
+            }
             let mut spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
             // Run-in heading: "4.1.1. Porous flow bands  Body text..." in one block.
             if level.is_none() {
@@ -1714,7 +2042,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     ps.push(Span { text: format!("{num} "), style: Style::default(), link: None });
                     ps.extend(spans);
                 } else if let Some((ix, pg, bbox, hsize)) = last_heading
-                    && u.class.is_some()
+                    && (u.class.is_some() || caps || level == 1)
                     && ix + 1 == doc.nodes.len()
                     && pg == p.page
                     && (size - hsize).abs() <= hsize * 0.05
@@ -1734,7 +2062,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         s
                     });
                     doc.nodes.push(Node::Heading { level: level as u8, spans: spans.collect() });
-                    if u.class.is_some() {
+                    if u.class.is_some() || caps || Some(i) == page_title {
                         last_heading = Some((doc.nodes.len() - 1, p.page, u.bbox, size));
                     }
                 }
@@ -1842,6 +2170,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     last_para = Some(LastPara { node: idx, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size });
                     para_size.insert(idx, (size, p.page));
                 } else {
+                    body_started |= text.chars().count() >= 400;
                     doc.nodes.push(Node::Paragraph { spans });
                     last_para = Some(LastPara { node: doc.nodes.len() - 1, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size });
                     para_size.insert(doc.nodes.len() - 1, (size, p.page));
@@ -1891,6 +2220,21 @@ mod tests {
         assert!(!author_start("Bru˜na, J.L."[..0].trim()));
         assert!(!author_start("Geophysical investigation of rifting and volcanism"));
         assert!(!author_start("In contrast, the northern part"));
+    }
+
+    #[test]
+    fn bylines() {
+        assert!(is_byline("Andrew F. Bell1*, Stephen Hernandez2, John McCloskey1, Mario Ruiz2, Peter C. LaFemina3"));
+        assert!(is_byline("R. J. Brown · L. Civetta · I. Arienzo · M. D’Antonio"));
+        assert!(is_byline("PETER CATTERMOLE"));
+        assert!(is_byline("Eysteinn Tryggvason"));
+        assert!(is_byline("Bowen Zhu 1,2,3and Zhigang Zeng 1,2,4,*"));
+        assert!(is_byline("勝間田明男"));
+        assert!(!is_byline("Monitoring and Modeling the Rapid Evolution of Earth’s Newest Volcanic Island: Hunga Tonga Hunga Ha’apai (Tonga) Using High Spatial Resolution Satellite Observations"));
+        assert!(!is_strong_byline("Hydrothermal Calderas and Their Deposits"));
+        assert!(is_strong_byline("J. B. Garvin, D. A. Slayback, V. Ferrini"));
+        assert!(!is_byline("Key Points"));
+        assert!(!is_byline("Geological Setting of the Izu Arc"));
     }
 
     #[test]

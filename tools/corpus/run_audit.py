@@ -63,6 +63,12 @@ def bib_agreement(rec, dump_text):
                 inter = len(set(tt) & set(ts))
                 best = max(best, inter / max(len(set(tt)), len(set(ts))))
         res["title_heading"] = round(best, 3)
+        # The title the engine chose for the document.
+        chosen = set(toks(rec.get("_reflow_title") or ""))
+        if chosen:
+            res["title_match"] = round(len(set(tt) & chosen) / max(len(set(tt)), len(chosen)), 3)
+        else:
+            res["title_match"] = 0.0
     abstract = bib.get("abstract")
     if abstract:
         a = abstract.rstrip("…").rstrip(".").rstrip()
@@ -123,7 +129,7 @@ def run_one(exe, rec, out_dir, timeout):
     r["bib_year"] = bib.get("year")
     r["bib_key"] = bib.get("key")
     if "error" not in r and dump.exists():
-        r.update(bib_agreement(rec, dump.read_text(encoding="utf-8")))
+        r.update(bib_agreement(dict(rec, _reflow_title=r.get("title")), dump.read_text(encoding="utf-8")))
     return r
 
 
@@ -197,7 +203,7 @@ def measures(r):
         "ref_frag%": 100 * r["ref_frag"] / max(1, r["ref_paras"]) if r.get("ref_paras") else None,
         "sec/page": r["ms"] / 1000 / max(1, r["pages"]),
     }
-    for k in ("title_heading", "abs_found", "abs_order", "abs_nodes", "abs_extra"):
+    for k in ("title_heading", "title_match", "abs_found", "abs_order", "abs_nodes", "abs_extra"):
         if k in r:
             m[k] = r[k]
     return m
@@ -219,6 +225,7 @@ FLAGS = {
     "ref_multi%": lambda v: v is not None and v > 10,
     "ref_frag%": lambda v: v is not None and v > 10,
     "title_heading": lambda v: v < 0.6,
+    "title_match": lambda v: v < 0.6,
     "abs_found": lambda v: v < 0.8,
     "abs_order": lambda v: v < 0.9,
     "abs_extra": lambda v: v > 0.3,
