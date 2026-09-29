@@ -579,6 +579,7 @@ impl StrataApp {
             egui::Window::new("StrataPDF について").open(&mut self.show_about).default_width(420.0).show(ctx, |ui| {
                 ui.label(format!("StrataPDF {}", env!("CARGO_PKG_VERSION")));
                 ui.label("ライセンス: AGPL-3.0-or-later（描画エンジン MuPDF を含む）");
+                ui.label("レイアウト解析: PyMuPDF Layout（Artifex、AGPL-3.0）");
                 ui.hyperlink_to("ソースコード（GitHub）", "https://github.com/geoign/StrataPDF");
                 ui.separator();
                 egui::Grid::new("keys").num_columns(2).show(ui, |ui| {

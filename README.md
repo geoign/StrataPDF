@@ -8,6 +8,7 @@ Windows 向けの PDF ビューア。Rust 製で、描画と解析のエンジ�
 - **表示**：タブと分割表示、連続スクロール、単ページ・見開き（右綴じ対応）、縮小時の複数見開き、サムネイル、目次、全文検索、リンク
 - **開ける文書**：PDF（壊れた xref やページツリーの修復、全種類の暗号）、EPUB、XPS、CBZ
 - **テキスト表示（リフロー）**：段組み・図・ページ境界をまたいで段落をつなぎ直し、ヘッダ・フッタを除いた本文を表示する。
+  見出し・キャプション・図中の文字・柱の判別には、PyMuPDF Layout のレイアウト解析モデル（CPU で動く小さなグラフニューラルネットワーク）を使う。
   縦書き、ダークモード、文字サイズの変更、Markdown / HTML への書き出しに対応
 - **OCR**：国立国会図書館の NDLOCR-Lite を Rust に移植したもの（日本語・縦書き対応）。
   結果は選択・検索・テキスト表示に反映され、検索可能 PDF として書き出せる。表示数式は LaTeX に変換する（Pix2Text MFR）
@@ -105,5 +106,7 @@ StrataPDF は [GNU Affero General Public License v3.0](LICENSE) 以降（AGPL-3.
 - OCR の実装は [NDLOCR-Lite](https://github.com/ndl-lab/ndlocr-lite)（国立国会図書館、CC BY 4.0）の推論処理を Rust に移植したもの。
   モデルも同じ配布元から取得する
 - 数式認識のモデルは [Pix2Text MFR 1.5](https://huggingface.co/breezedeus/pix2text-mfr-1.5)（MIT）
+- レイアウト解析は [PyMuPDF Layout](https://github.com/ArtifexSoftware/pymupdf_layout)（Artifex、AGPL-3.0）の
+  特徴量計算（C）とモデル（ONNX）をそのまま組み込み、Python の処理部分を Rust に移植したもの（`vendor/pymupdf_layout`）
 - 配布版の zip には、依存する Rust クレートのライセンス表記（`THIRD-PARTY-NOTICES.html`）と、
   ONNX Runtime の DirectML 実行に使う `DirectML.dll`（Microsoft、再配布可能なランタイム）を同梱する

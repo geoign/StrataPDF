@@ -10,6 +10,7 @@
 //! they only need another `OcrEngine` implementation.
 
 pub mod formula;
+pub mod layout;
 pub mod models;
 pub mod ndl;
 mod order;

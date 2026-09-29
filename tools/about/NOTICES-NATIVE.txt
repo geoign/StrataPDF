@@ -24,6 +24,15 @@ MuPDF includes the following libraries, statically linked into StrataPDF.exe:
   with font exception).
 
 
+PyMuPDF Layout
+--------------
+Copyright (C) Artifex Software, Inc. Licensed under the GNU Affero General
+Public License v3.0. https://github.com/ArtifexSoftware/pymupdf_layout
+
+The region features (features.c) are compiled into StrataPDF.exe, and the
+layout models (layout_rf2.4.1+imf1.onnx, feature_imf1.onnx) are embedded in it.
+
+
 ONNX Runtime
 ------------
 MIT License

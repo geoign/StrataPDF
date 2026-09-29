@@ -8,14 +8,18 @@
 //!    figures, order units by XY-cut, classify each unit;
 //! 3. merge paragraphs split by column or page breaks.
 //!
-//! A layout model can later supply [`RegionHint`]s that override the heuristics.
+//! For horizontal text, the layout model of PyMuPDF Layout ([`crate::layout`])
+//! labels each line (heading, caption, figure text, running head, footnote...);
+//! its labels decide headings, running heads and figure labels, and split
+//! blocks that mix them. The heuristics remain for what it does not cover and
+//! for pages without its labels.
 
 mod order;
 pub mod output;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_channel::{Receiver, unbounded};
 
@@ -23,6 +27,7 @@ use crate::doc::{Document, Engine, open_engine};
 use crate::geom::RectF;
 use crate::render::render_region_png;
 use crate::rich::{RichBlock, RichLine, RichPage, reflow_flags};
+use strata_ocr::layout::{CAPTION, FOOTNOTE, PAGE_FOOTER, PAGE_HEADER, PICTURE, SECTION_HEADER, TITLE};
 use crate::text::FontInfo;
 
 #[derive(Clone)]
@@ -36,11 +41,13 @@ pub struct ReflowOptions {
     pub drop_ruby: bool,
     /// Converts display formulas to LaTeX when set.
     pub formula: Option<std::sync::Arc<dyn strata_ocr::formula::FormulaEngine>>,
+    /// Label lines with the layout model (horizontal text only).
+    pub layout: bool,
 }
 
 impl Default for ReflowOptions {
     fn default() -> Self {
-        ReflowOptions { strip_headers: true, image_scale: 2.0, formula_scale: 3.0, drop_ruby: true, formula: None }
+        ReflowOptions { strip_headers: true, image_scale: 2.0, formula_scale: 3.0, drop_ruby: true, formula: None, layout: true }
     }
 }
 
@@ -144,6 +151,7 @@ impl Document {
         let password = self.password();
         let waker = self.waker();
         let ocr = self.ocr_store().clone();
+        let serial = crate::doc::needs_serial_rendering(&path);
         std::thread::Builder::new()
             .name("strata-reflow".into())
             .spawn(move || {
@@ -153,7 +161,7 @@ impl Document {
                             let _ = tx.send(ReflowEvent::Progress { done, total });
                             waker();
                         };
-                        match build(&eng, &opts, &progress, &cancel, &ocr) {
+                        match build(&eng, &opts, &progress, &cancel, &ocr, serial) {
                             Ok(Some(doc)) => ReflowEvent::Done(Arc::new(doc)),
                             Ok(None) => return,
                             Err(e) => ReflowEvent::Error(e),
@@ -175,6 +183,11 @@ struct PageData {
     page: u32,
     rich: RichPage,
     links: Vec<(RectF, String)>,
+    dl: Option<mupdf::DisplayList>,
+    /// The text came from OCR.
+    ocr: bool,
+    /// Lines found by the layout model and their classes (empty without it).
+    layout: Vec<(RectF, usize)>,
 }
 
 fn is_cjk(c: char) -> bool {
@@ -336,7 +349,7 @@ fn repeated_margin_lines(pages: &[PageData]) -> HashMap<String, usize> {
         for b in &p.rich.blocks {
             if let RichBlock::Text { lines, .. } = b {
                 for l in lines {
-                    if l.bbox.y1 < h * 0.09 || l.bbox.y0 > h * 0.91 {
+                    if l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85 {
                         let k = digits_key(&l.text());
                         if !k.is_empty() && seen.insert(k.clone()) {
                             *counts.entry(k).or_default() += 1;
@@ -359,6 +372,8 @@ struct Unit {
     kind: UnitKind,
     bbox: RectF,
     lines: Vec<RichLine>,
+    /// Layout class of most of its text.
+    class: Option<usize>,
 }
 
 impl Unit {
@@ -415,6 +430,47 @@ fn overlap_frac(inner: &RectF, outer: &RectF) -> f32 {
     (x1 - x0) * (y1 - y0) / a
 }
 
+/// Layout class of a line: that of the layout line holding most of its characters.
+fn line_class(layout: &[(RectF, usize)], l: &RichLine) -> Option<usize> {
+    let cand: Vec<&(RectF, usize)> = layout.iter().filter(|(r, _)| overlap_frac(&l.bbox, r) > 0.0).collect();
+    match cand.len() {
+        0 => None,
+        1 => Some(cand[0].1),
+        _ => {
+            let mut votes: HashMap<usize, usize> = HashMap::new();
+            for c in &l.chars {
+                let (x, y) = ((c.bbox.x0 + c.bbox.x1) / 2.0, (c.bbox.y0 + c.bbox.y1) / 2.0);
+                if let Some((_, k)) = cand.iter().find(|(r, _)| r.x0 <= x && x <= r.x1 && r.y0 <= y && y <= r.y1) {
+                    *votes.entry(*k).or_default() += 1;
+                }
+            }
+            votes.into_iter().max_by_key(|&(k, n)| (n, std::cmp::Reverse(k))).map(|(k, _)| k)
+        }
+    }
+}
+
+/// The class of most characters of the lines.
+fn majority_class(lines: &[(RichLine, Option<usize>)]) -> Option<usize> {
+    let mut votes: HashMap<usize, usize> = HashMap::new();
+    for (l, c) in lines {
+        if let Some(c) = c {
+            *votes.entry(*c).or_default() += l.chars.len();
+        }
+    }
+    votes.into_iter().max_by_key(|&(k, n)| (n, std::cmp::Reverse(k))).map(|(k, _)| k)
+}
+
+/// Lines of one block that play different parts (heading, caption, figure text,
+/// running text) become separate units.
+fn role(c: usize) -> u8 {
+    match c {
+        TITLE | SECTION_HEADER => 1,
+        CAPTION => 2,
+        PICTURE => 3,
+        _ => 0,
+    }
+}
+
 /// Merge vector blocks into clusters; clusters that look like drawings (not just
 /// table rules or underlines) become figure candidates.
 fn vector_figures(blocks: &[RichBlock], page_area: f32) -> Vec<RectF> {
@@ -469,14 +525,26 @@ fn line_number_column(units: &[Unit], body: f32) -> Vec<usize> {
         .collect();
     // Group by right edge (numbers are right-aligned).
     let mut groups: Vec<(f32, Vec<usize>)> = Vec::new();
-    for i in numbers {
+    for &i in &numbers {
         let x = units[i].bbox.x1;
         match groups.iter_mut().find(|g| (g.0 - x).abs() < 3.0) {
             Some(g) => g.1.push(i),
             None => groups.push((x, vec![i])),
         }
     }
-    groups.into_iter().filter(|g| g.1.len() >= 8).flat_map(|g| g.1).collect()
+    // In the margin, left or right of all other text (a column of a table is not).
+    let others: Vec<RectF> = units.iter().enumerate().filter(|(i, u)| u.kind == UnitKind::Text && !numbers.contains(i)).map(|(_, u)| u.bbox).collect();
+    // Nearly all other text (running heads aside) lies on one side of the column.
+    let one_side = |x0: f32, x1: f32| {
+        let left = others.iter().filter(|b| b.x0 < x1 - 1.0).count();
+        let right = others.iter().filter(|b| b.x1 > x0 + 1.0).count();
+        left * 10 <= others.len() || right * 10 <= others.len()
+    };
+    groups
+        .into_iter()
+        .filter(|g| g.1.len() >= 8 && one_side(g.1.iter().map(|&i| units[i].bbox.x0).fold(f32::INFINITY, f32::min), g.0))
+        .flat_map(|g| g.1)
+        .collect()
 }
 
 /// Text and figure units of a page, and whether the page is a line-numbered
@@ -499,17 +567,23 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     for b in &p.rich.blocks {
         match b {
             RichBlock::Text { lines, .. } => {
-                let kept: Vec<RichLine> = lines
+                let kept: Vec<(RichLine, Option<usize>)> = lines
                     .iter()
-                    .filter(|l| {
-                        if opts.strip_headers && (l.bbox.y1 < h * 0.09 || l.bbox.y0 > h * 0.91) {
+                    .map(|l| (l, line_class(&p.layout, l)))
+                    .filter(|(l, class)| {
+                        // Running heads and page numbers found by the layout model.
+                        if opts.strip_headers && matches!(class, Some(PAGE_HEADER | PAGE_FOOTER)) && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
+                            return false;
+                        }
+                        if opts.strip_headers && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
                             let t = l.text();
                             let k = digits_key(&t);
                             if repeated.get(&k).copied().unwrap_or(0) >= threshold && n_pages > 1 {
                                 return false;
                             }
                             // Lone page numbers in the margins.
-                            if t.trim().chars().all(|c| c.is_ascii_digit() || c == '-' || c == '—' || c.is_whitespace()) {
+                            let margin = l.bbox.y1 < h * 0.09 || l.bbox.y0 > h * 0.91;
+                            if margin && t.trim().chars().all(|c| c.is_ascii_digit() || c == '-' || c == '—' || c.is_whitespace()) {
                                 return false;
                             }
                         }
@@ -523,27 +597,47 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                         let _ = vertical;
                         true
                     })
-                    .cloned()
+                    .map(|(l, c)| (l.clone(), c))
                     .collect();
-                // Whitespace-only blocks (spacing in manuscripts) would become empty
-                // paragraphs that stop paragraph joining.
-                if kept.iter().any(|l| l.chars.iter().any(|c| !c.c.is_whitespace())) {
-                    let bbox = kept.iter().skip(1).fold(kept[0].bbox, |a, l| a.union(&l.bbox));
-                    units.push(Unit { kind: UnitKind::Text, bbox, lines: kept });
+                // Split where the layout role changes; lines without a class go with the previous ones.
+                let mut runs: Vec<Vec<(RichLine, Option<usize>)>> = Vec::new();
+                let mut cur_role: Option<u8> = None;
+                for (l, c) in kept {
+                    let r = c.map(role);
+                    match (runs.last_mut(), r) {
+                        (Some(run), Some(r)) if cur_role.is_none_or(|cr| cr == r) => {
+                            cur_role = Some(r);
+                            run.push((l, c));
+                        }
+                        (Some(run), None) => run.push((l, c)),
+                        _ => {
+                            cur_role = r;
+                            runs.push(vec![(l, c)]);
+                        }
+                    }
+                }
+                for run in runs {
+                    // Whitespace-only blocks (spacing in manuscripts) would become empty
+                    // paragraphs that stop paragraph joining.
+                    if run.iter().any(|(l, _)| l.chars.iter().any(|c| !c.c.is_whitespace())) {
+                        let bbox = run.iter().skip(1).fold(run[0].0.bbox, |a, (l, _)| a.union(&l.bbox));
+                        let class = majority_class(&run);
+                        units.push(Unit { kind: UnitKind::Text, bbox, lines: run.into_iter().map(|(l, _)| l).collect(), class });
+                    }
                 }
             }
             RichBlock::Image { bbox } => {
                 // A page-sized image under a text layer is the scan of an OCRed page.
                 let background = bbox.width() * bbox.height() > page_area * 0.7 && text_chars > 100;
                 if !background && bbox.width() * bbox.height() > page_area * 0.005 {
-                    units.push(Unit { kind: UnitKind::Figure, bbox: *bbox, lines: Vec::new() });
+                    units.push(Unit { kind: UnitKind::Figure, bbox: *bbox, lines: Vec::new(), class: None });
                 }
             }
             _ => {}
         }
     }
     for r in vector_figures(&p.rich.blocks, page_area) {
-        units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new() });
+        units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None });
     }
     // Merge overlapping figures; absorb labels inside figures.
     let mut figs: Vec<RectF> = Vec::new();
@@ -559,6 +653,10 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     // into the figure, growing it so that chained labels follow, and so that
     // the figure image shows them. Captions and headings stay text.
     let label_like = |u: &Unit| {
+        // The layout model knows figure text from running text.
+        if let Some(c) = u.class {
+            return c == PICTURE;
+        }
         let t = u.text();
         let n = t.chars().count();
         // A heading next to a figure ("Attention Visualizations" above a chart) is
@@ -594,6 +692,46 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             break;
         }
     }
+    // Figure text (per the layout model) away from every figure found above
+    // belongs to a drawing the clustering missed: the text and the vector
+    // graphics around it make a figure.
+    let grow = |r: &RectF| RectF { x0: r.x0 - margin, y0: r.y0 - margin, x1: r.x1 + margin, y1: r.y1 + margin };
+    let mut clusters: Vec<(RectF, Vec<usize>)> = Vec::new();
+    for (i, slot) in texts.iter().enumerate() {
+        if let Some(u) = slot
+            && u.class == Some(PICTURE)
+        {
+            match clusters.iter_mut().find(|c| overlap_frac(&u.bbox, &grow(&c.0)) > 0.0) {
+                Some(c) => {
+                    c.0 = c.0.union(&u.bbox);
+                    c.1.push(i);
+                }
+                None => clusters.push((u.bbox, vec![i])),
+            }
+        }
+    }
+    for (mut region, members) in clusters {
+        let mut graphics = 0;
+        for _ in 0..3 {
+            let near = grow(&region);
+            for b in &p.rich.blocks {
+                if let RichBlock::Vector { bbox } | RichBlock::Image { bbox } = b
+                    && overlap_frac(bbox, &near) > 0.5
+                    && overlap_frac(bbox, &region) < 1.0
+                    && bbox.width() * bbox.height() < page_area * 0.5
+                {
+                    region = region.union(bbox);
+                    graphics += 1;
+                }
+            }
+        }
+        if graphics >= 3 {
+            for i in members {
+                texts[i] = None;
+            }
+            figs.push(region);
+        }
+    }
     let mut out: Vec<Unit> = Vec::new();
     for u in texts.into_iter().flatten() {
         let inside = figs.iter().any(|f| overlap_frac(&u.bbox, f) > 0.8);
@@ -603,7 +741,48 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         }
         out.push(u);
     }
-    out.extend(figs.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new() }));
+    // Section numbers set apart from their titles ("1.4" | "Characteristics of…")
+    // would be read as a column of their own: join each to the title on its line.
+    let mut k = 0;
+    while k < out.len() {
+        let t = out[k].text();
+        let t = t.trim();
+        let number = out[k].lines.len() == 1 && !t.is_empty() && t.len() <= 12 && t.chars().all(|c| c.is_ascii_digit() || c == '.') && t.contains(|c: char| c.is_ascii_digit());
+        let nb = out[k].bbox;
+        let title = number
+            .then(|| {
+                out.iter().position(|o| {
+                    // Only a heading's number: table cells are numbers next to text too.
+                    let heading = match (o.class, out[k].class) {
+                        (Some(c), _) => matches!(c, TITLE | SECTION_HEADER),
+                        (None, None) => o.lines.len() <= 2 && t.contains('.'),
+                        (None, Some(_)) => false,
+                    };
+                    let first = o.lines.first().map(|l| l.bbox);
+                    heading && first.is_some_and(|f| {
+                        let overlap = f.y1.min(nb.y1) - f.y0.max(nb.y0);
+                        overlap > nb.height().min(f.height()) * 0.5 && f.x0 >= nb.x1 - 1.0 && f.x0 - nb.x1 < body * 4.0
+                    })
+                })
+            })
+            .flatten();
+        match title {
+            Some(j) if j != k => {
+                let num = out.remove(k);
+                let j = if j > k { j - 1 } else { j };
+                let o = &mut out[j];
+                o.bbox = o.bbox.union(&num.bbox);
+                let mut lines = num.lines;
+                lines.append(&mut o.lines);
+                o.lines = lines;
+                if o.class.is_none() {
+                    o.class = num.class;
+                }
+            }
+            _ => k += 1,
+        }
+    }
+    out.extend(figs.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None }));
     let numbers = line_number_column(&out, body);
     let manuscript = !numbers.is_empty();
     let mut i = 0;
@@ -864,6 +1043,53 @@ fn merge_display_math(units: Vec<Unit>, fonts: &[FontInfo], body: f32) -> Vec<Un
     out
 }
 
+/// Label the lines of every page with the layout model, on several threads
+/// (one for documents whose display lists must not run concurrently).
+fn run_layout(model: &strata_ocr::layout::LayoutModel, pages: &mut [PageData], serial: bool, cancel: &AtomicBool, progress: &(dyn Fn(usize) + Sync)) {
+    let workers = if serial { 1 } else { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8) };
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let results: Vec<parking_lot::Mutex<Vec<(RectF, usize)>>> = pages.iter().map(|_| parking_lot::Mutex::new(Vec::new())).collect();
+    let pages_ref = &*pages;
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= pages_ref.len() || cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let p = &pages_ref[i];
+                    if !p.ocr
+                        && let Some(dl) = &p.dl
+                    {
+                        match crate::layout::analyze_display_list(model, dl, p.rich.width, p.rich.height) {
+                            Ok(a) => {
+                                // Each line takes the class of its region (the majority of its lines).
+                                *results[i].lock() = a
+                                    .layout
+                                    .groups
+                                    .iter()
+                                    .flat_map(|g| g.nodes.iter().map(move |&k| (k, g.class)))
+                                    .map(|(k, c)| {
+                                        let b = a.nodes[k].bbox;
+                                        (RectF { x0: b[0], y0: b[1], x1: b[2], y1: b[3] }, c)
+                                    })
+                                    .collect()
+                            }
+                            Err(e) => log::warn!("layout analysis of page {}: {e}", p.page + 1),
+                        }
+                    }
+                    progress(done.fetch_add(1, Ordering::Relaxed) + 1);
+                }
+            });
+        }
+    });
+    for (p, r) in pages.iter_mut().zip(results) {
+        p.layout = r.into_inner();
+    }
+}
+
 /// Top and bottom of the body text columns on a vertical page.
 fn vertical_text_area(units: &[Unit], body: f32) -> (f32, f32) {
     let cols = units.iter().filter(|u| u.kind == UnitKind::Text && u.lines.iter().all(|l| l.vertical) && (u.size() - body).abs() <= body * 0.15);
@@ -875,9 +1101,9 @@ fn vertical_text_area(units: &[Unit], body: f32) -> (f32, f32) {
     if top > bottom { (0.0, 0.0) } else { (top, bottom) }
 }
 
-fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), cancel: &AtomicBool, ocr: &crate::ocr::OcrStore) -> Result<Option<ReflowDoc>, String> {
+fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + Sync), cancel: &AtomicBool, ocr: &crate::ocr::OcrStore, serial: bool) -> Result<Option<ReflowDoc>, String> {
     let n = eng.page_count().map_err(|e| e.to_string())?.max(0) as usize;
-    let total = n * 2;
+    let total = n * 3;
     // Pass 1: extraction.
     let mut pages = Vec::with_capacity(n);
     for p in 0..n {
@@ -890,10 +1116,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
         let Ok(tp) = tp else { continue };
         let mut rich = RichPage::from_text_page(&tp, b.width(), b.height());
         // OCR text replaces an unusable text layer.
+        let mut from_ocr = false;
         if let Some(o) = ocr.get(p as u32)
             && (o.forced || needs_ocr(&rich).is_some())
         {
             rich = o.to_rich(b.width(), b.height());
+            from_ocr = true;
         }
         normalize_vertical(&mut rich);
         let links = page
@@ -910,7 +1138,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                 .collect()
             })
             .unwrap_or_default();
-        pages.push(PageData { page: p as u32, rich, links });
+        let ocr = from_ocr || needs_ocr(&rich).is_some();
+        pages.push(PageData { page: p as u32, rich, links, dl: page.to_display_list(true).ok(), ocr, layout: Vec::new() });
         if p % 4 == 0 {
             progress(p + 1, total);
         }
@@ -928,6 +1157,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
         }
     }
     let vertical = vchars > hchars;
+    if opts.layout
+        && !vertical
+        && let Some(model) = crate::layout::shared_model()
+    {
+        run_layout(&model, &mut pages, serial, cancel, &|done| progress(n + done, total));
+    }
 
     // Pass 2: per page layout and classification.
     let mut doc = ReflowDoc { vertical, ..Default::default() };
@@ -935,6 +1170,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
     // Vertical text: did the last paragraph column run to the bottom of the text area?
     let mut last_col_full = false;
     let mut last_para: Option<LastPara> = None;
+    // The last heading from the layout model: node, page, box and size, for
+    // headings that the extractor split into one block per line.
+    let mut last_heading: Option<(usize, u32, RectF, f32)> = None;
     for (pi, p) in pages.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
@@ -957,9 +1195,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
         doc.fill_anchors((p.page, 0.0));
         doc.nodes.push(Node::PageStart { page: p.page });
         doc.fill_anchors((p.page, 0.0));
-        let dl = eng.load_page(p.page as i32).and_then(|pg| pg.to_display_list(true)).ok();
         let crop = |bbox: RectF, scale: f32, doc: &mut ReflowDoc| -> Option<usize> {
-            let dl = dl.as_ref()?;
+            let dl = p.dl.as_ref()?;
             let pad = RectF { x0: bbox.x0 - 2.0, y0: bbox.y0 - 2.0, x1: bbox.x1 + 2.0, y1: bbox.y1 + 2.0 };
             let (w, h, png) = render_region_png(dl, pad, scale).ok()?;
             let id = format!("p{}_{}.png", p.page + 1, doc.images.len() + 1);
@@ -975,7 +1212,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                 doc.nodes.push(Node::PageImage { image: img, reason });
             }
             doc.fill_anchors((p.page, 0.0));
-            progress(n + pi + 1, total);
+            progress(2 * n + pi + 1, total);
             continue;
         }
 
@@ -1008,7 +1245,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
             }
             let text = u.text();
             let size = u.size();
-            match caption_kind(&text) {
+            // Running text that happens to start with "Table 2 summarizes..." is no
+            // caption: with the layout model, a table caption must lead into a table.
+            let running_text = matches!(u.class, Some(strata_ocr::layout::TEXT | strata_ocr::layout::LIST_ITEM));
+            let leads_to_table = ordered[i + 1..].iter().take(3).any(|n| n.kind == UnitKind::Figure || n.class == Some(strata_ocr::layout::TABLE));
+            match caption_kind(&text).filter(|&table| !(running_text && table && !leads_to_table)) {
                 Some(true) => {
                     // Table: caption, then small-font units until body text resumes.
                     let caption = spans_of(u, &p.rich.fonts, &p.links, vertical);
@@ -1112,7 +1353,40 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                 })
                 .count();
             let short = short && sups <= 2;
-            let level = if short && size >= body * 1.4 {
+            // A heading has a word of two letters, or is a bare section number ("3.2")
+            // whose title follows.
+            let wordy = text.split_whitespace().any(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2);
+            let number_only = !text.trim().is_empty() && text.trim().chars().all(|c| c.is_ascii_digit() || c == '.');
+            let level = if let Some(c) = u.class {
+                // The layout model decides what is a heading; size and numbering give the level.
+                let number = number_only
+                    && ordered.get(i + 1).is_some_and(|n| {
+                        matches!(n.class, Some(TITLE | SECTION_HEADER))
+                            && n.text().split_whitespace().any(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
+                            && (n.bbox.y0 - u.bbox.y0).abs() < size * 2.0
+                    });
+                // Large type the model took for running text is still a title.
+                let large = c == strata_ocr::layout::TEXT && size >= body * 1.4 && u.lines.len() <= 5 && text.chars().count() < 300;
+                if (matches!(c, TITLE | SECTION_HEADER) || large) && (wordy || number) {
+                    let level = if c == TITLE || size >= body * 1.4 {
+                        let score = size * (text.chars().count().min(150) as f32).sqrt();
+                        if pi == 0 && score > title_size {
+                            title_size = score;
+                            doc.title = text.trim().to_string();
+                        }
+                        1
+                    } else if size >= body * 1.15 {
+                        2
+                    } else {
+                        numbered.map_or(3, |d| (d + 1).min(6))
+                    };
+                    Some(level)
+                } else {
+                    None
+                }
+            } else if !(wordy || number_only) {
+                None
+            } else if short && size >= body * 1.4 {
                 // Prefer the long title over a large journal banner.
                 let score = size * (text.chars().count().min(150) as f32).sqrt();
                 if pi == 0 && score > title_size {
@@ -1168,12 +1442,30 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
                     ps.clear();
                     ps.push(Span { text: format!("{num} "), style: Style::default(), link: None });
                     ps.extend(spans);
+                } else if let Some((ix, pg, bbox, hsize)) = last_heading
+                    && u.class.is_some()
+                    && ix + 1 == doc.nodes.len()
+                    && pg == p.page
+                    && (size - hsize).abs() <= hsize * 0.05
+                    && numbered.is_none()
+                    && ((u.bbox.y0 >= bbox.y1 - 2.0 && u.bbox.y0 - bbox.y1 < size * 0.8 && u.bbox.x0 < bbox.x1 && u.bbox.x1 > bbox.x0)
+                        || ((u.bbox.y0 - bbox.y0).abs() < 2.0 && u.bbox.x0 >= bbox.x1 - 1.0 && u.bbox.x0 - bbox.x1 < size * 1.5))
+                {
+                    // The next line, or the rest of the line, of the same heading.
+                    if let Node::Heading { spans: ps, .. } = &mut doc.nodes[ix] {
+                        ps.push(Span { text: " ".into(), style: Style::default(), link: None });
+                        ps.extend(spans);
+                    }
+                    last_heading = Some((ix, p.page, bbox.union(&u.bbox), hsize));
                 } else {
                     doc.nodes.push(Node::Heading { level: level as u8, spans });
+                    if u.class.is_some() {
+                        last_heading = Some((doc.nodes.len() - 1, p.page, u.bbox, size));
+                    }
                 }
             } else if is_list_marker(&text) {
                 doc.nodes.push(Node::ListItem { spans });
-            } else if !vertical && size <= body * 0.92 && u.bbox.y0 > p.rich.height * 0.6 && u.lines.len() <= 8 {
+            } else if u.class == Some(FOOTNOTE) || (!vertical && size <= body * 0.92 && u.bbox.y0 > p.rich.height * 0.6 && u.lines.len() <= 8) {
                 doc.nodes.push(Node::Footnote { spans });
             } else {
                 // Continuation across a column or page break; figures, tables,
@@ -1250,7 +1542,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &dyn Fn(usize, usize), ca
             i += 1;
         }
         doc.fill_anchors(last_anchor);
-        progress(n + pi + 1, total);
+        progress(2 * n + pi + 1, total);
     }
     let last = doc.anchors.last().copied().unwrap_or((0, 0.0));
     doc.fill_anchors(last);

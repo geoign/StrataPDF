@@ -5,7 +5,7 @@ fn main() {
         res.set_icon("assets/strata.ico");
         res.set("ProductName", "StrataPDF");
         res.set("FileDescription", "StrataPDF");
-        res.set("LegalCopyright", "Private use only (AGPL-3.0 components)");
+        res.set("LegalCopyright", "AGPL-3.0-or-later");
         if let Err(e) = res.compile() {
             println!("cargo:warning=icon resource not embedded: {e}");
         }

@@ -171,7 +171,7 @@ struct Shared {
 /// shared symbols without locking. Such files are rendered one tile at a time.
 /// Image dictionaries are never inside compressed object streams, so the filter
 /// name is visible in the raw file.
-fn needs_serial_rendering(path: &Path) -> bool {
+pub(crate) fn needs_serial_rendering(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else { return false };
     // SAFETY: read-only view of a file we do not modify.
     let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return false };
