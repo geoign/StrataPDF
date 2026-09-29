@@ -2,7 +2,10 @@
 //! engines behind one trait, a per-document cache and a background job that
 //! fills it starting from the reading position.
 
+pub mod anthropic;
 pub mod gemini;
+pub mod openai;
+pub mod providers;
 #[cfg(feature = "llama")]
 pub mod llama;
 
@@ -171,6 +174,8 @@ pub enum Error {
     Auth(String),
     /// The answer was cut off: send fewer paragraphs at once.
     TooLong,
+    /// No credit left, or billing not set up.
+    Billing(String),
     Other(String),
     Cancelled,
 }
@@ -180,6 +185,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::RateLimited { message, .. } => write!(f, "利用上限: {message}"),
             Error::Auth(m) => write!(f, "API キーを確認してください: {m}"),
+            Error::Billing(m) => write!(f, "残高または支払い設定を確認してください: {m}"),
             Error::TooLong => write!(f, "出力が長すぎて途中で切れました"),
             Error::Other(m) => write!(f, "{m}"),
             Error::Cancelled => write!(f, "中止しました"),
@@ -206,7 +212,57 @@ Translate every item completely and faithfully into natural, fluent academic Jap
 Keep citation markers such as [12] or (Smith et al., 2020), numbers, units, chemical formulas, gene and species names, variable names and mathematical expressions unchanged. \
 Use the standard Japanese term of the field for technical terms; keep proper nouns and acronyms in their original spelling unless a common Japanese form exists. \
 Translate headings as short headings and captions as captions (keep labels such as \"Figure 3\" as \"図3\"). \
+Never guess kanji for personal names: keep names of people as written in the source. \
+Text was extracted from a PDF, so an item may start or end in the middle of a sentence: translate exactly what is given, without completing it or adding anything (such as citation numbers). \
 Return every id exactly once.";
+
+/// Bumped when the prompt changes, so that cached translations are redone.
+pub const PROMPT_VERSION: u32 = 2;
+
+/// The user message for LLM engines: title, context and the items as JSON.
+pub fn user_prompt(batch: &Batch) -> String {
+    let items: Vec<serde_json::Value> = batch.items.iter().map(|(id, t)| serde_json::json!({"id": id, "text": t})).collect();
+    format!(
+        "Document title: {}\n\nBeginning of the document (context for terminology only; do not translate it):\n{}\n\nTranslate these items into Japanese. Answer with JSON of the form {{\"items\": [{{\"id\": <id>, \"ja\": \"<translation>\"}}]}}:\n{}",
+        batch.title,
+        batch.context,
+        serde_json::json!({ "items": items })
+    )
+}
+
+/// JSON schema of the answer: `{"items": [{"id": 3, "ja": "…"}]}`.
+pub fn answer_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "ja": {"type": "string"}},
+            "required": ["id", "ja"],
+            "additionalProperties": false
+        }}},
+        "required": ["items"],
+        "additionalProperties": false
+    })
+}
+
+/// Read the answer, tolerating a Markdown code fence around the JSON (engines
+/// without schema enforcement).
+pub fn parse_answer(text: &str) -> Result<Vec<(usize, String)>, Error> {
+    let t = text.trim();
+    let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).map(|s| s.trim_end().trim_end_matches("```")).unwrap_or(t);
+    let start = t.find('{').ok_or_else(|| Error::Other("応答に JSON がありません".into()))?;
+    let end = t.rfind('}').ok_or_else(|| Error::Other("応答の JSON が途中で切れています".into()))?;
+    let v: serde_json::Value = serde_json::from_str(&t[start..=end]).map_err(|e| Error::Other(format!("JSON を解釈できません: {e}")))?;
+    Ok(v["items"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|i| Some((i["id"].as_u64()? as usize, i["ja"].as_str()?.to_string()))).collect())
+        .unwrap_or_default())
+}
+
+/// Seconds from a `Retry-After` header (delay-seconds form only).
+pub(crate) fn retry_after(resp: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
+    resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<f64>().ok()).map(Duration::from_secs_f64)
+}
 
 // ---------------------------------------------------------------- cache
 

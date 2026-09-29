@@ -162,6 +162,29 @@ struct Shared {
     waker: Waker,
     ocr: Arc<crate::ocr::OcrStore>,
     edit: Arc<EditState>,
+    /// Present when display lists must not run on two threads at once.
+    serial: Option<Arc<parking_lot::Mutex<()>>>,
+}
+
+/// JBIG2 images whose shared symbol dictionary (JBIG2Globals) is used by two
+/// decoders at once corrupt the heap: jbig2dec updates reference counts of the
+/// shared symbols without locking. Such files are rendered one tile at a time.
+/// Image dictionaries are never inside compressed object streams, so the filter
+/// name is visible in the raw file.
+fn needs_serial_rendering(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    // SAFETY: read-only view of a file we do not modify.
+    let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return false };
+    const NEEDLE: &[u8] = b"JBIG2Decode";
+    let mut i = 0;
+    while let Some(off) = map[i..].iter().position(|&b| b == b'J') {
+        let at = i + off;
+        if map[at..].starts_with(NEEDLE) {
+            return true;
+        }
+        i = at + 1;
+    }
+    false
 }
 
 /// Edit bookkeeping shared between the document thread and the UI.
@@ -179,9 +202,16 @@ pub(crate) struct EditState {
 pub struct DocClient {
     pub id: DocId,
     tx: Sender<Cmd>,
+    serial: Option<Arc<parking_lot::Mutex<()>>>,
 }
 
 impl DocClient {
+    /// Hold while running this document's display lists on another thread.
+    /// `None` unless the document needs it (see [`needs_serial_rendering`]).
+    pub fn serialize(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.serial.as_ref().map(|m| m.lock())
+    }
+
     /// Blocking fetch of a page's display list.
     pub fn display_list(&self, page: u32) -> Result<Arc<DisplayList>, String> {
         let (tx, rx) = bounded(1);
@@ -379,6 +409,8 @@ impl Document {
         let thread_ocr = ocr_store.clone();
         let edit = Arc::new(EditState::default());
         let thread_edit = edit.clone();
+        let serial = needs_serial_rendering(path).then(|| Arc::new(parking_lot::Mutex::new(())));
+        let thread_serial = serial.clone();
         let path_buf = path.to_path_buf();
         let pw = password.clone();
         let wk = waker.clone();
@@ -398,12 +430,13 @@ impl Document {
                 if init_tx.send(Ok((info, first))).is_err() {
                     return;
                 }
-                doc_thread(eng, rx, wk, thread_ocr, thread_edit);
+                doc_thread(eng, rx, wk, thread_ocr, thread_edit, thread_serial);
             })
             .map_err(|e| OpenError::Failed(e.to_string()))?;
 
         let (info, first) = init_rx.recv().map_err(|_| OpenError::Failed("document thread died".into()))??;
         let shared = Arc::new(Shared {
+            serial,
             path: path.to_path_buf(),
             password,
             sizes: RwLock::new(vec![first; info.page_count]),
@@ -467,7 +500,7 @@ impl Document {
         self.shared.waker.clone()
     }
     pub fn client(&self) -> DocClient {
-        DocClient { id: self.id, tx: self.tx.clone() }
+        DocClient { id: self.id, tx: self.tx.clone(), serial: self.shared.serial.clone() }
     }
 
     /// Bumped whenever page sizes change; re-layout when it differs from the last seen value.
@@ -620,7 +653,7 @@ fn poor_text(t: &PageText) -> bool {
     n < 20 || bad * 10 > n * 3
 }
 
-fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::ocr::OcrStore>, edit: Arc<EditState>) {
+fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::ocr::OcrStore>, edit: Arc<EditState>, serial: Option<Arc<parking_lot::Mutex<()>>>) {
     let mut history = crate::annot::History::default();
     let cap = |n| NonZeroUsize::new(n).unwrap();
     let mut dl_cache: LruCache<u32, Arc<DisplayList>> = LruCache::new(cap(64));
@@ -798,6 +831,8 @@ fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::
                 send(r, v, wake, &waker);
             }
             Cmd::SaveImage { page, index, as_jpeg, path, reply } => {
+                // Decodes the image, like a render worker.
+                let _serial = serial.as_ref().map(|m| m.lock());
                 let v = image_page(&eng, &mut dl_cache, page).map_err(|e| e.to_string()).and_then(|tp| crate::images::save(&tp, index, as_jpeg, &path));
                 send(reply, v, true, &waker);
             }

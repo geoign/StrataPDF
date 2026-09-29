@@ -1035,6 +1035,21 @@ impl DocView {
         }
     }
 
+    /// Ask for a file name and save the text view as Markdown (images beside it).
+    fn export_markdown(&mut self) {
+        let Some(pane) = &self.reflow else { return };
+        if !pane.is_ready() {
+            return;
+        }
+        let stem = self.doc.info().path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if let Some(path) = rfd::FileDialog::new().add_filter("Markdown", &["md"]).set_file_name(format!("{stem}.md")).save_file() {
+            self.status = match pane.export_markdown(&path) {
+                Ok(()) => format!("保存しました: {}", path.display()),
+                Err(e) => format!("保存に失敗しました: {e}"),
+            };
+        }
+    }
+
     fn reflow_toolbar(&mut self, ui: &mut Ui, svc: &mut Services) {
         egui::Panel::top(Id::new(("rtoolbar", self.id))).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1055,13 +1070,8 @@ impl DocView {
                 ui.separator();
                 let ready = self.reflow.as_ref().is_some_and(|r| r.is_ready());
                 let stem = self.doc.info().path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                if ui.add_enabled(ready, egui::Button::new("Markdown で保存…")).clicked()
-                    && let Some(path) = rfd::FileDialog::new().add_filter("Markdown", &["md"]).set_file_name(format!("{stem}.md")).save_file()
-                {
-                    self.status = match self.reflow.as_ref().unwrap().export_markdown(&path) {
-                        Ok(()) => format!("保存しました: {}", path.display()),
-                        Err(e) => format!("保存に失敗しました: {e}"),
-                    };
+                if ui.add_enabled(ready, egui::Button::new("Markdown で保存…")).clicked() {
+                    self.export_markdown();
                 }
                 if ui.add_enabled(ready, egui::Button::new("HTML で保存…")).on_hover_text("画像を埋め込んだ 1 ファイルの HTML").clicked()
                     && let Some(path) = rfd::FileDialog::new().add_filter("HTML", &["html"]).set_file_name(format!("{stem}.html")).save_file()

@@ -62,6 +62,8 @@ pub fn print_dialog(doc: &Arc<Document>, current_page: u32, msg: Sender<String>)
         .name("strata-print".into())
         .spawn(move || {
             let hdc = hdc;
+            // Page rendering must not overlap the render pool for some files.
+            let _serial = client.serialize();
             let r = print_pages(hdc.0, &name, &pages, |p| client.display_list(p), &msg);
             unsafe {
                 let _ = DeleteDC(hdc.0);

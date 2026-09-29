@@ -17,5 +17,8 @@ ureq = "3"
 # Local models (GGUF). The GPU backend is a module loaded at run time.
 llama-cpp-2 = { version = "=0.1.157", optional = true, default-features = false, features = ["dynamic-backends", "vulkan"] }
 
+[dev-dependencies]
+env_logger = "0.11"
+
 [features]
 llama = ["dep:llama-cpp-2"]

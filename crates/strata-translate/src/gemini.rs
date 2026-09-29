@@ -5,13 +5,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::{Batch, Error, SYSTEM_PROMPT, Translator};
-
-/// Models offered in the UI: (id, label). All are on the free tier.
-pub const MODELS: [(&str, &str); 2] = [("gemini-3.8-flash", "Gemini 3.8 Flash"), ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite")];
-
-/// Bumped when the prompt changes, so that cached translations are redone.
-const PROMPT_VERSION: u32 = 1;
+use crate::{Batch, Error, PROMPT_VERSION, SYSTEM_PROMPT, Translator};
 
 pub struct Gemini {
     key: String,
@@ -52,7 +46,7 @@ fn api_error(status: u16, body: &str) -> Error {
             Error::RateLimited { retry_after, daily, message }
         }
         401 | 403 => Error::Auth(message),
-        400 if err["status"].as_str() == Some("INVALID_ARGUMENT") && message.contains("API key") => Error::Auth(message),
+        400 if message.contains("API key") => Error::Auth(message),
         _ => Error::Other(format!("HTTP {status}: {message}")),
     }
 }
@@ -63,7 +57,7 @@ impl Translator for Gemini {
     }
 
     fn label(&self) -> String {
-        MODELS.iter().find(|m| m.0 == self.model).map(|m| m.1.to_string()).unwrap_or_else(|| self.model.clone())
+        format!("Gemini API（{}）", self.model)
     }
 
     fn chunk_chars(&self) -> (usize, usize) {
@@ -72,24 +66,12 @@ impl Translator for Gemini {
     }
 
     fn translate(&self, batch: &Batch, _cancel: &AtomicBool) -> Result<Vec<(usize, String)>, Error> {
-        let items: Vec<Value> = batch.items.iter().map(|(id, t)| json!({"id": id, "text": t})).collect();
-        let user = format!(
-            "Document title: {}\n\nBeginning of the document (context for terminology only; do not translate it):\n{}\n\nTranslate these items into Japanese:\n{}",
-            batch.title,
-            batch.context,
-            serde_json::to_string(&json!({ "items": items })).unwrap_or_default()
-        );
-        let schema = json!({
-            "type": "object",
-            "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer"}, "ja": {"type": "string"}}, "required": ["id", "ja"]}}},
-            "required": ["items"]
-        });
         let body = json!({
             "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "contents": [{"role": "user", "parts": [{"text": crate::user_prompt(batch)}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseJsonSchema": schema,
+                "responseJsonSchema": crate::answer_schema(),
                 "maxOutputTokens": 60000,
                 "thinkingConfig": {"thinkingLevel": self.thinking_level()}
             }
@@ -120,11 +102,7 @@ impl Translator for Gemini {
             let why = cand["finishReason"].as_str().or(v["promptFeedback"]["blockReason"].as_str()).unwrap_or("空の応答");
             return Err(Error::Other(format!("訳文が返りませんでした（{why}）")));
         }
-        let parsed: Value = serde_json::from_str(&out).map_err(|e| Error::Other(format!("JSON を解釈できません: {e}")))?;
-        Ok(parsed["items"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|i| Some((i["id"].as_u64()? as usize, i["ja"].as_str()?.to_string()))).collect())
-            .unwrap_or_default())
+        crate::parse_answer(&out)
     }
 }
 

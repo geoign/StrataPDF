@@ -1,6 +1,5 @@
 //! translate <file> <engine> <out.html>
-//! engine: `gemini:<model>` (key from GEMINI_API_KEY or the file named by GEMINI_KEY_FILE),
-//! or `llama:<model id>` (GGUF in STRATA_MODELS; GPU unless LLAMA_CPU is set).
+//! engine: `<provider>:<model>` (see `engine`), or `llama:<model id>` with the `llama` feature.
 //! Writes a side-by-side HTML with the translations filled in, and prints timing.
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -11,29 +10,25 @@ use strata_translate::{Event, Store, Translator};
 
 fn engine(spec: &str) -> Arc<dyn Translator> {
     let (kind, model) = spec.split_once(':').unwrap_or((spec, ""));
-    match kind {
-        "gemini" => {
-            let key = std::env::var("GEMINI_API_KEY")
-                .ok()
-                .or_else(|| std::env::var("GEMINI_KEY_FILE").ok().and_then(|f| std::fs::read_to_string(f).ok()))
-                .expect("GEMINI_API_KEY or GEMINI_KEY_FILE");
-            Arc::new(strata_translate::gemini::Gemini::new(key.trim().to_string(), model))
-        }
-        #[cfg(feature = "llama")]
-        "llama" => {
-            let spec = strata_translate::llama::MODELS.iter().find(|m| m.id == model).copied().expect("model id");
-            let dir = std::env::var("STRATA_MODELS").map(std::path::PathBuf::from).ok().or_else(strata_translate::llama::models_dir).unwrap();
-            let gpu = if std::env::var("LLAMA_CPU").is_ok() { 0 } else { 999 };
-            let t = std::time::Instant::now();
-            let l = strata_translate::llama::Llama::load(spec, &dir.join(spec.file), gpu).unwrap();
-            eprintln!("loaded {} in {:.1}s (gpu={})", spec.label, t.elapsed().as_secs_f32(), l.uses_gpu());
-            Arc::new(l)
-        }
-        _ => panic!("unknown engine {kind}"),
+    #[cfg(feature = "llama")]
+    if kind == "llama" {
+        let spec = strata_translate::llama::MODELS.iter().find(|m| m.id == model).copied().expect("model id");
+        let dir = std::env::var("STRATA_MODELS").map(std::path::PathBuf::from).ok().or_else(strata_translate::llama::models_dir).unwrap();
+        let gpu = if std::env::var("LLAMA_CPU").is_ok() { 0 } else { 999 };
+        let l = strata_translate::llama::Llama::load(spec, &dir.join(spec.file), gpu).unwrap();
+        return Arc::new(l);
     }
+    // gemini / openai / anthropic / openrouter / custom: key from <PROVIDER>_API_KEY or the file in
+    // <PROVIDER>_KEY_FILE; custom endpoint base URL from STRATA_BASE.
+    let p = strata_translate::providers::provider(kind);
+    let file_var = p.env.replace("_API_KEY", "_KEY_FILE");
+    let key = std::env::var(p.env).ok().or_else(|| std::env::var(&file_var).ok().and_then(|f| std::fs::read_to_string(f).ok())).map(|k| k.trim().to_string());
+    let base = std::env::var("STRATA_BASE").unwrap_or_default();
+    strata_translate::providers::build(kind, key, model, &base)
 }
 
 fn main() {
+    env_logger::init();
     strata_core::fonts::install();
     let a: Vec<String> = std::env::args().collect();
     let doc = Document::open(a[1].as_ref(), None, Arc::new(|| {})).unwrap();

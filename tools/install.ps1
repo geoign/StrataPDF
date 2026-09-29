@@ -28,14 +28,6 @@ Copy-Item "$target\strata-app.exe" "$Dest\StrataPDF.exe" -Force
 $dml = Get-Item "$target\DirectML.dll"
 if ($dml.LinkType) { $dml = Get-Item ($dml.Target | Select-Object -First 1) }
 Copy-Item $dml.FullName "$Dest\DirectML.dll" -Force
-# llama.cpp（ローカル翻訳モデル）の共有ライブラリと GPU バックエンド。
-foreach ($n in 'llama.dll', 'llama-common.dll', 'ggml.dll', 'ggml-base.dll') {
-    if (Test-Path "$target\$n") { Copy-Item "$target\$n" "$Dest\$n" -Force }
-}
-if (Test-Path "$target\ggml-backends") {
-    New-Item -ItemType Directory -Force "$Dest\ggml-backends" | Out-Null
-    Copy-Item "$target\ggml-backends\*.dll" "$Dest\ggml-backends\" -Force
-}
 @"
 StrataPDF（私的利用に限る）
 

@@ -186,7 +186,10 @@ fn worker(inner: Arc<Inner>) {
                 inner.cv.wait(&mut st);
             }
         };
-        let result = client.display_list(key.page).and_then(|dl| render_tile(&dl, key));
+        let result = client.display_list(key.page).and_then(|dl| {
+            let _serial = client.serialize();
+            render_tile(&dl, key)
+        });
         let tile = match result {
             Ok((width, height, rgba)) => RenderedTile { key, width, height, rgba, error: None },
             Err(e) => RenderedTile { key, width: 0, height: 0, rgba: Vec::new(), error: Some(e) },
