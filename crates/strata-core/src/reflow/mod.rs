@@ -3271,7 +3271,13 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             let columns = bottom > top && u.lines.iter().all(|l| l.vertical);
                             // An indented column still carries on a sentence the column
                             // before left open ("…売尽し、"): a quotation set in from the top.
-                            columns && (same_column || (last_col_full && (!indented || !ends_sentence(&spans_text(prev_spans)))))
+                            // (Without a full stop: open by a comma or bracket, or running text on
+                            // either side; two short pieces are entries of a list of books, which
+                            // end in names.)
+                            let prev_text = spans_text(prev_spans);
+                            let open = prev_text.trim_end().ends_with(['、', '，', ',', '（', '(', '「', '『'])
+                                || (!ends_sentence(&prev_text) && (prev_text.chars().count() > 20 || text.chars().count() > 20));
+                            columns && (same_column || (last_col_full && (!indented || open)))
                         } else {
                             let prev_text = spans_text(prev_spans);
                             // A sentence cut at the edge of a column and resumed at the top
