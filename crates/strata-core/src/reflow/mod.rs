@@ -627,6 +627,100 @@ fn sort_rows(lines: &mut [RichLine]) {
     }
 }
 
+/// A drop cap (a large initial letter set beside the first lines of a
+/// paragraph, "T" + "he carbon content…") goes back to the start of the
+/// paragraph's first line.
+fn attach_drop_caps(units: Vec<Unit>, body: f32) -> Vec<Unit> {
+    let mut slots: Vec<Option<Unit>> = units.into_iter().map(Some).collect();
+    for i in 0..slots.len() {
+        let Some(cap) = slots[i].as_ref() else { continue };
+        let t = cap.text();
+        let t = t.trim();
+        if cap.kind != UnitKind::Text || t.chars().count() != 1 || !t.chars().all(char::is_uppercase) || cap.size() < body * 1.6 {
+            continue;
+        }
+        let cb = cap.bbox;
+        // The paragraph whose first line starts just right of the cap, at its top.
+        let target = (0..slots.len()).find(|&k| {
+            k != i && slots[k].as_ref().is_some_and(|u| {
+                u.kind == UnitKind::Text
+                    && u.lines.first().is_some_and(|l| {
+                        l.bbox.x0 >= cb.x1 - 1.0 && l.bbox.x0 - cb.x1 < body * 2.0 && (l.bbox.y0 - cb.y0).abs() < cb.height() * 0.6 && l.text().trim_start().starts_with(char::is_lowercase)
+                    })
+            })
+        });
+        if let Some(k) = target {
+            let cap = slots[i].take().unwrap();
+            let u = slots[k].as_mut().unwrap();
+            let line = &mut u.lines[0];
+            let mut first: Vec<crate::rich::RichChar> = cap.lines.into_iter().flat_map(|l| l.chars).filter(|c| !c.c.is_whitespace()).collect();
+            // At the paragraph's type size (the cap's size would read as a heading).
+            let size = line.chars.first().map_or(body, |c| c.size);
+            for c in &mut first {
+                c.size = size;
+                c.bbox = RectF { x0: line.bbox.x0 - size * 0.6, x1: line.bbox.x0, y0: line.bbox.y0, y1: line.bbox.y1 };
+            }
+            first.append(&mut line.chars);
+            line.chars = first;
+            line.bbox.x0 -= size * 0.6;
+            u.bbox = u.bbox.union(&cb);
+        }
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// Paragraphs run together in one unit (the extractor and the layout model
+/// can put several in one block): a new one starts where a line stops well
+/// short of the right edge and the next line is indented from the unit's
+/// usual left edge. A hanging indent (reference lists: the first line out to
+/// the left) is not such an indent.
+fn split_paragraphs(units: Vec<Unit>, body: f32) -> Vec<Unit> {
+    let mut out: Vec<Unit> = Vec::with_capacity(units.len());
+    for u in units {
+        if u.kind != UnitKind::Text || u.lines.len() < 4 || matches!(u.class, Some(strata_ocr::layout::TABLE | PICTURE | CAPTION)) {
+            out.push(u);
+            continue;
+        }
+        // The usual left edge: the most common start of the unit's lines.
+        let mut starts: Vec<f32> = u.lines.iter().map(|l| l.bbox.x0).collect();
+        starts.sort_by(f32::total_cmp);
+        let edge = starts
+            .iter()
+            .copied()
+            .max_by_key(|&x| starts.iter().filter(|&&y| (y - x).abs() < body * 0.3).count())
+            .unwrap_or(u.bbox.x0);
+        let right = u.lines.iter().map(|l| l.bbox.x1).fold(f32::NEG_INFINITY, f32::max);
+        let mut cuts: Vec<usize> = Vec::new();
+        for k in 1..u.lines.len() {
+            let (prev, l) = (&u.lines[k - 1], &u.lines[k]);
+            let short = prev.bbox.x1 < right - body * 1.5 && ends_sentence(&prev.text());
+            let indented = l.bbox.x0 - edge > body * 0.6 && l.bbox.x0 - edge < body * 4.0;
+            let below = l.bbox.y0 >= prev.bbox.y0 + prev.bbox.height() * 0.5;
+            if short && indented && below {
+                cuts.push(k);
+            }
+        }
+        if cuts.is_empty() {
+            out.push(u);
+            continue;
+        }
+        let Unit { lines, class, group, .. } = u;
+        let mut rest = lines;
+        for &k in cuts.iter().rev() {
+            let tail = rest.split_off(k);
+            let bbox = tail.iter().skip(1).fold(tail[0].bbox, |a, l| a.union(&l.bbox));
+            out.push(Unit { kind: UnitKind::Text, bbox, lines: tail, class, group, refs: refs::Ref::No });
+        }
+        let bbox = rest.iter().skip(1).fold(rest[0].bbox, |a, l| a.union(&l.bbox));
+        out.push(Unit { kind: UnitKind::Text, bbox, lines: rest, class, group, refs: refs::Ref::No });
+        // (Pushed last part first: put the pieces of this unit back in reading order.)
+        let n = cuts.len() + 1;
+        let len = out.len();
+        out[len - n..].reverse();
+    }
+    out
+}
+
 /// One-line units that sit side by side on one baseline, in the same type,
 /// closer than a gutter: the pieces of one line that something between them
 /// (an ORCID or e-mail icon, a drawn mark) cut apart. Joined left to right,
@@ -1031,6 +1125,8 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             u.lines = join_rows(std::mem::take(&mut u.lines));
         }
         units = stitch_rows(units);
+        units = attach_drop_caps(units, body);
+        units = split_paragraphs(units, body);
     }
     for r in vector_figures(&p.rich.blocks, page_area) {
         units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No });
@@ -1724,6 +1820,20 @@ fn ends_sentence(t: &str) -> bool {
 #[cfg(test)]
 fn continues(prev: &str, next: &str) -> bool {
     continues_strongly(prev, next) || continues_weakly(prev, next)
+}
+
+/// Text that cannot end a paragraph: it stops on a comma, semicolon or hyphen,
+/// inside brackets, or on a word that needs a following one (English).
+fn open_end(t: &str) -> bool {
+    let t = t.trim_end();
+    if t.ends_with([',', ';', '(', '[', '–', '—']) || t.chars().filter(|&c| c == '(').count() > t.chars().filter(|&c| c == ')').count() {
+        return true;
+    }
+    const WORDS: [&str; 26] = [
+        "and", "or", "of", "the", "a", "an", "to", "in", "with", "for", "by", "from", "that", "which", "on", "at", "than", "as", "is", "are", "was", "were", "be", "its", "their", "nor",
+    ];
+    let last = t.rsplit(char::is_whitespace).next().unwrap_or("");
+    WORDS.contains(&last) && t.split_whitespace().count() >= 4
 }
 
 /// `next` carries on the sentence `prev` left open: it starts in lowercase or
@@ -2793,7 +2903,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             // layout agrees: the next lines of the column, or a column top
                             // after a column cut at its edge.
                             let weak = continues_weakly(&prev_text, &text) && (adjacent || (cut && at_top));
-                            same_size && (continues_strongly(&prev_text, &text) || weak || (!ends_sentence(&prev_text) && !first_indented && bodyish && ((cut && at_top) || adjacent)))
+                            // A paragraph cannot end with "and", "of", a comma or an open
+                            // bracket: the text at the top of the next column or page (or right
+                            // below) carries on whatever its first letter.
+                            let open = open_end(&prev_text) && (at_top || adjacent) && bodyish;
+                            same_size && (continues_strongly(&prev_text, &text) || weak || open || (!ends_sentence(&prev_text) && !first_indented && bodyish && ((cut && at_top) || adjacent)))
                         }
                     }
                     _ => false,
