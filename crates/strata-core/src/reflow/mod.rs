@@ -559,6 +559,8 @@ fn body_size(pages: &[PageData]) -> f32 {
 /// Header/footer line keys that repeat across pages.
 fn repeated_margin_lines(pages: &[PageData]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
+    // The margin lines of scanned pages, for the similar ones below.
+    let mut scanned: Vec<Vec<(String, std::collections::HashSet<(char, char)>)>> = Vec::new();
     for p in pages {
         let h = p.rich.height;
         let mut seen = std::collections::HashSet::new();
@@ -574,8 +576,34 @@ fn repeated_margin_lines(pages: &[PageData]) -> HashMap<String, usize> {
                 }
             }
         }
+        if p.scan {
+            scanned.push(seen.into_iter().filter(|k| k.chars().count() >= 6).map(|k| (k.clone(), bigrams(&k))).collect());
+        }
+    }
+    // OCR spells a running head a little differently from page to page ("5-ll地球の
+    // 誕生と…" beside "#-##地球の誕生と…"): a key also counts the scanned pages with a
+    // line sharing most of its character pairs.
+    if scanned.len() >= 4 && scanned.iter().map(Vec::len).sum::<usize>() <= 4000 {
+        // (Of about the same length too: a line where the extractor ran body text into the
+        // running head shares the head's pairs but is no running head.)
+        let similar = |a: &std::collections::HashSet<(char, char)>, b: &std::collections::HashSet<(char, char)>| {
+            let (short, long) = (a.len().min(b.len()), a.len().max(b.len()));
+            short * 100 >= long * 85 && a.intersection(b).count() * 10 >= long * 8
+        };
+        for page in &scanned {
+            for (k, g) in page {
+                let n = scanned.iter().filter(|other| other.iter().any(|(o, og)| o == k || similar(g, og))).count();
+                let c = counts.entry(k.clone()).or_default();
+                *c = (*c).max(n);
+            }
+        }
     }
     counts
+}
+
+fn bigrams(s: &str) -> std::collections::HashSet<(char, char)> {
+    let c: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+    c.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
