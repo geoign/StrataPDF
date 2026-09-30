@@ -33,6 +33,13 @@ The region features (features.c) are compiled into StrataPDF.exe, and the
 layout models (layout_rf2.4.1+imf1.onnx, feature_imf1.onnx) are embedded in it.
 
 
+English word list
+-----------------
+The lower-case words of Webster's Second International Dictionary (1934), the
+Unix "web2" list, which is in the public domain, are embedded in StrataPDF.exe
+to judge the text layers that other OCR programs left on scanned pages.
+
+
 ONNX Runtime
 ------------
 MIT License
