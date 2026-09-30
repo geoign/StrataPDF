@@ -2301,7 +2301,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     let mut doc = ReflowDoc { vertical, ..Default::default() };
     // Another program's OCR text on scanned pages: a poor one is worth reading again.
     let foreign: Vec<String> = pages.iter().filter(|p| p.scan && !p.ocr).map(|p| page_text(&p.rich)).collect();
-    doc.ocr_layer = (!foreign.is_empty()).then(|| crate::ocrq::LayerQuality::assess(&foreign));
+    doc.ocr_layer = crate::ocrq::LayerQuality::assess_document(&foreign, pages.len());
     let mut title_size = 0.0f32;
     // Vertical text: did the last paragraph column run to the bottom of the text area?
     let mut last_col_full = false;

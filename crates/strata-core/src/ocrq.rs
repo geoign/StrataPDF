@@ -291,6 +291,13 @@ pub struct LayerQuality {
 }
 
 impl LayerQuality {
+    /// Assess a document from the text of its scanned pages with a foreign text layer,
+    /// if they are at least half of its `total` pages: in a born-digital paper they are
+    /// figures filling a page, whose labels read like garbage.
+    pub fn assess_document<S: AsRef<str>>(scanned: &[S], total: usize) -> Option<Self> {
+        (!scanned.is_empty() && scanned.len() * 2 >= total).then(|| Self::assess(scanned))
+    }
+
     /// Assess the text of each scanned page (lines separated by newlines).
     pub fn assess<S: AsRef<str>>(pages: &[S]) -> Self {
         let texts: Vec<String> = pages.iter().map(|p| dehyphenate(p.as_ref())).collect();

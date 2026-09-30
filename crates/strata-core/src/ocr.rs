@@ -540,7 +540,7 @@ impl Document {
                 texts.push(crate::reflow::page_text(&rich));
             }
         }
-        (!texts.is_empty()).then(|| crate::ocrq::LayerQuality::assess(&texts))
+        crate::ocrq::LayerQuality::assess_document(&texts, self.page_count())
     }
 
     /// Save a copy with an invisible text layer on every OCR'd page whose own
