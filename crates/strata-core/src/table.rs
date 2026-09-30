@@ -318,7 +318,7 @@ fn extract(eng: &Engine, page: u32, region: RectF, ocr: Option<&dyn crate::ocr::
     let pg = eng.load_page(page as i32).map_err(|e| e.to_string())?;
     let b = pg.bounds().map_err(|e| e.to_string())?;
     let tp = pg.to_text_page(reflow_flags() | mupdf::TextPageFlags::COLLECT_VECTORS).map_err(|e| e.to_string())?;
-    let rich = RichPage::from_text_page(&tp, b.width(), b.height());
+    let rich = RichPage::from_page(&pg, &tp, b.width(), b.height());
     let lines = rulings(&rich, region);
     let forced = store.get(page).is_some_and(|o| o.forced);
     let segs = segments_from_rich(&rich, region);

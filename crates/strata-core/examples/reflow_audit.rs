@@ -153,7 +153,7 @@ fn raw_text(path: &str) -> Result<Raw, String> {
         };
         let b = page.bounds().map_err(|e| e.to_string())?;
         match page.to_text_page(reflow_flags()) {
-            Ok(tp) => pages.push(RichPage::from_text_page(&tp, b.width(), b.height())),
+            Ok(tp) => pages.push(RichPage::from_page(&page, &tp, b.width(), b.height())),
             Err(_) => pages.push(RichPage::default()),
         }
     }
