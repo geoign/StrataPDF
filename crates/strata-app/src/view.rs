@@ -1106,6 +1106,16 @@ impl DocView {
                         if idle && ui.button("内蔵 OCR で読み直す").on_hover_text("スキャンページを内蔵 OCR で読み取り、既存の OCR 文字の代わりに使う").clicked() {
                             self.request_ocr(strata_core::ocr::OcrScope::Scans);
                         }
+                    } else if d.ocr_layer.is_some_and(|q| q.japanese()) {
+                        // A Japanese scan whose text layer passes: ours still reads most better.
+                        if idle
+                            && ui
+                                .button("内蔵 OCR で読み直す")
+                                .on_hover_text("スキャンに付いている OCR 文字を表示しています。日本語のスキャンは、内蔵 OCR で読み直すと誤字や段落の区切りがよくなることが多い")
+                                .clicked()
+                        {
+                            self.request_ocr(strata_core::ocr::OcrScope::Scans);
+                        }
                     } else if ocr > 0 && idle && ui.button("OCR を実行").clicked() {
                         self.request_ocr(strata_core::ocr::OcrScope::Needed);
                     }

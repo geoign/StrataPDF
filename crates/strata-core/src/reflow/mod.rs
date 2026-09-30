@@ -1172,6 +1172,23 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             (l.bbox, t.trim().chars().count(), repeated.get(&digits_key(&t)).copied().unwrap_or(0) >= threshold)
         })
         .collect();
+    // Vertical pages: the top and bottom of the columns of running text. A short
+    // horizontal line beyond them, in a margin band, is a running head or a page
+    // number, even where OCR spells it differently from page to page.
+    let (col_top, col_bottom) = {
+        let cols = p.rich.blocks.iter().flat_map(|b| match b {
+            RichBlock::Text { lines, .. } => lines.iter().filter(|l| l.vertical && l.chars.len() >= 5).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        });
+        cols.fold((f32::INFINITY, f32::NEG_INFINITY), |(t, b), l| (t.min(l.bbox.y0), b.max(l.bbox.y1)))
+    };
+    let vertical_margin = |l: &RichLine| {
+        vertical
+            && !l.vertical
+            && col_top < col_bottom
+            && l.chars.len() <= 40
+            && ((l.bbox.y1 <= col_top + 1.0 && l.bbox.y1 < h * 0.15) || (l.bbox.y0 >= col_bottom - 1.0 && l.bbox.y0 > h * 0.85))
+    };
     // A running head stands alone in its band (a page number or another running
     // head beside it at most); a repeated fragment inside running text does not.
     let alone_in_band = |b: &RectF| {
@@ -1189,6 +1206,9 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                     .filter(|(l, class)| {
                         // Running heads and page numbers found by the layout model.
                         if opts.strip_headers && matches!(class, Some((PAGE_HEADER | PAGE_FOOTER, _))) && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
+                            return false;
+                        }
+                        if opts.strip_headers && vertical_margin(l) {
                             return false;
                         }
                         if opts.strip_headers && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
@@ -1910,7 +1930,9 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
         let cleaned = if scan { chars::drop_cjk_spaces(cleaned) } else { cleaned };
         for c in &attach_accents(&cleaned) {
             let f = fonts.get(c.font as usize);
-            let small = c.size < med * 0.8 && !vertical;
+            // (On a scan the boxes of punctuation and brackets are small and low or high
+            // whatever the type: only Latin and Greek letters and digits are raised or lowered.)
+            let small = c.size < med * 0.8 && !vertical && (!scan || (c.c.is_alphanumeric() && !is_cjk(c.c)));
             let cy = (c.bbox.y0 + c.bbox.y1) * 0.5;
             let style = Style {
                 bold: c.bold || f.is_some_and(font_bold),

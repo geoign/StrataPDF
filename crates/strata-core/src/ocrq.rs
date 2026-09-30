@@ -338,6 +338,13 @@ impl LayerQuality {
         (self.ja_chars >= 1000).then(|| self.ja_bad as f32 / self.ja_chars as f32)
     }
 
+    /// Mostly Japanese text. The built-in OCR (NDLOCR-Lite) reads Japanese scans better
+    /// than most text layers they come with, also where this measure cannot tell: its
+    /// misreadings are other correct characters (大/人, 日/口, 二/ニ) and wrong digits.
+    pub fn japanese(&self) -> bool {
+        self.ja_chars >= 1000 && self.ja_chars > self.en_words
+    }
+
     /// Poor enough that OCR of the page images would read better. Judged in the paper's
     /// main language: the English of a Japanese paper (abstract, captions, romanised
     /// names) is too little and too mixed to tell.

@@ -285,6 +285,19 @@ fn cut(rects: &[RectF], lines: &[Lines], body: f32, idx: &[usize], part: bool, v
         out.extend_from_slice(idx);
         return;
     }
+    // Vertical text: tiers split by gaps across the whole page, then columns right
+    // to left. (Cutting into column groups first puts a short column beside a
+    // figure at the top of the page before the columns set under the figure to
+    // its right.)
+    if vertical_text {
+        let tiers = split(rects, idx, true, MIN_GAP * 2.0);
+        for tier in tiers {
+            let mut v = tier;
+            v.sort_by(|&a, &b| rects[b].x1.total_cmp(&rects[a].x1).then(rects[a].y0.total_cmp(&rects[b].y0)));
+            out.extend(v);
+        }
+        return;
+    }
     let (first_is_columns, gap_cols, gap_rows) = match (vertical_text, imprecise) {
         (true, _) => (false, MIN_GAP, MIN_GAP * 2.0),
         (false, false) => (true, MIN_GAP * 2.0, MIN_GAP),
@@ -442,5 +455,12 @@ mod tests {
         // upper tier: two blocks (right one first), lower tier: one block
         let rects = [r(10.0, 10.0, 100.0, 200.0), r(120.0, 10.0, 200.0, 200.0), r(10.0, 230.0, 200.0, 400.0)];
         assert_eq!(order(&rects, true, false), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn vertical_columns_under_a_figure_come_before_the_column_beside_it() {
+        // figure top right, columns under it, a short column left of the figure, a full column further left
+        let rects = [r(115.0, 31.0, 258.0, 194.0), r(99.0, 68.0, 111.0, 196.0), r(247.0, 233.0, 259.0, 363.0), r(113.0, 233.0, 126.0, 447.0), r(24.0, 66.0, 66.0, 447.0)];
+        assert_eq!(order(&rects, true, false), vec![2, 0, 3, 1, 4]);
     }
 }
