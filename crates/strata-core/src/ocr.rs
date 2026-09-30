@@ -319,11 +319,33 @@ pub(crate) fn text_layer_unusable(eng: &Engine, page: u32) -> bool {
     crate::reflow::needs_ocr(&RichPage::from_page(&pg, &tp, b.width(), b.height())).is_some()
 }
 
+/// Whether OCR of `scope` covers a page, and if so whether its text is to replace the
+/// page's own text layer.
+fn ocr_wanted(eng: &Engine, page: u32, scope: OcrScope) -> Option<bool> {
+    let forced = scope == OcrScope::All;
+    let Ok(pg) = eng.load_page(page as i32) else { return None };
+    let Ok(b) = pg.bounds() else { return None };
+    let Ok(tp) = pg.to_text_page(reflow_flags()) else { return Some(forced) };
+    let rich = RichPage::from_page(&pg, &tp, b.width(), b.height());
+    if crate::reflow::needs_ocr(&rich).is_some() {
+        return Some(forced);
+    }
+    let scan = crate::reflow::scanned_with_text(&rich);
+    match scope {
+        OcrScope::All => Some(true),
+        // A scan whose text layer is mostly garbage (text view shows the page image).
+        OcrScope::Needed => (scan && crate::reflow::ocr_layer_quality(&rich) < 0.4).then_some(true),
+        OcrScope::Scans => scan.then_some(true),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OcrScope {
     /// Pages without a usable text layer.
     Needed,
-    /// Every page, replacing nothing but adding OCR text alongside.
+    /// Scanned pages, also those with another program's OCR text, which ours replaces.
+    Scans,
+    /// Every page; the OCR text replaces the page's own.
     All,
 }
 
@@ -355,22 +377,22 @@ impl Document {
                         return;
                     }
                 };
-                let pages: Vec<u32> = (0..n as u32)
+                let pages: Vec<(u32, bool)> = (0..n as u32)
                     .filter(|&p| store.get(p).is_none())
-                    .filter(|&p| scope == OcrScope::All || text_layer_unusable(&eng, p))
+                    .filter_map(|p| ocr_wanted(&eng, p, scope).map(|forced| (p, forced)))
                     .collect();
                 let total = pages.len();
                 let _ = tx.send(OcrEvent::Progress { done: 0, total });
                 waker();
-                for (i, p) in pages.iter().enumerate() {
+                for (i, &(p, forced)) in pages.iter().enumerate() {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
-                    match ocr_page(&eng, *p, engine.as_ref(), OCR_DPI) {
+                    match ocr_page(&eng, p, engine.as_ref(), OCR_DPI) {
                         Ok(mut r) => {
-                            r.forced = scope == OcrScope::All;
+                            r.forced = forced;
                             store.insert(r);
-                            let _ = tx.send(OcrEvent::Page(*p));
+                            let _ = tx.send(OcrEvent::Page(p));
                         }
                         Err(e) => {
                             let _ = tx.send(OcrEvent::Error(format!("{} ページ: {e}", p + 1)));
@@ -501,6 +523,26 @@ fn add_text_layer(pdf: &mut mupdf::pdf::PdfDocument, page: u32, o: &PageOcr, fon
 }
 
 impl Document {
+    /// Recognition quality of the text that another program's OCR left on the scanned
+    /// pages (`None` without such pages); pages read by our OCR are left out. Blocking:
+    /// call from a background thread.
+    pub fn foreign_ocr_quality(&self) -> Option<crate::ocrq::LayerQuality> {
+        let (eng, _) = open_engine(&self.info().path, self.password().as_deref()).ok()?;
+        let store = self.ocr_store().clone();
+        let mut texts = Vec::new();
+        for p in 0..self.page_count() as u32 {
+            let Ok(pg) = eng.load_page(p as i32) else { continue };
+            let Ok(b) = pg.bounds() else { continue };
+            let Ok(tp) = pg.to_text_page(reflow_flags() & !mupdf::TextPageFlags::TABLE_HUNT) else { continue };
+            let rich = RichPage::from_page(&pg, &tp, b.width(), b.height());
+            let ours = store.get(p).is_some_and(|o| o.forced) || crate::reflow::needs_ocr(&rich).is_some();
+            if !ours && crate::reflow::scanned_with_text(&rich) {
+                texts.push(crate::reflow::page_text(&rich));
+            }
+        }
+        (!texts.is_empty()).then(|| crate::ocrq::LayerQuality::assess(&texts))
+    }
+
     /// Save a copy with an invisible text layer on every OCR'd page whose own
     /// text layer is unusable, so the file becomes searchable elsewhere.
     /// Encryption is removed. Blocking: call from a background thread.

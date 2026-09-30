@@ -1007,7 +1007,11 @@ impl DocView {
                 self.request_ocr(OcrScope::Needed);
                 ui.close();
             }
-            if ui.button("全ページを OCR").on_hover_text("既存の文字があるページも読み取る（既存の文字は置き換えない）").clicked() {
+            if ui.button("スキャンページを OCR し直す").on_hover_text("他のソフトの OCR 文字が付いたスキャンページも読み取り、その文字を置き換える").clicked() {
+                self.request_ocr(OcrScope::Scans);
+                ui.close();
+            }
+            if ui.button("全ページを OCR").on_hover_text("文字のあるページも読み取り、既存の文字を OCR の結果で置き換える").clicked() {
                 self.request_ocr(OcrScope::All);
                 ui.close();
             }
@@ -1087,7 +1091,22 @@ impl DocView {
                     let ocr = d.nodes.iter().filter(|n| matches!(n, strata_core::reflow::Node::PageImage { .. })).count();
                     let extra = if ocr > 0 { format!("・要OCR {ocr} ページ") } else { String::new() };
                     ui.weak(format!("{} 要素・画像 {figs}{extra}", d.nodes.len()));
-                    if ocr > 0 && self.ocr_job.is_none() && self.ocr_request.is_none() && ui.button("OCR を実行").clicked() {
+                    let idle = self.ocr_job.is_none() && self.ocr_request.is_none();
+                    // Another program's OCR text that reads badly: offer ours instead.
+                    let poor_layer = d.ocr_layer.filter(|q| q.poor());
+                    if let Some(q) = poor_layer {
+                        let rate = |r: Option<f32>| r.map(|r| format!("{:.0}%", r * 100.0));
+                        let detail = [rate(q.en_rate()).map(|r| format!("英単語の誤認識らしいもの {r}")), rate(q.ja_rate()).map(|r| format!("日本語の誤認識らしい文字 {r}"))]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        ui.colored_label(Color32::from_rgb(230, 160, 40), "⚠ 既存の OCR 文字の精度が低いようです")
+                            .on_hover_text(format!("スキャン {} ページに付いている OCR 文字の推定: {detail}", q.pages));
+                        if idle && ui.button("内蔵 OCR で読み直す").on_hover_text("スキャンページを内蔵 OCR で読み取り、既存の OCR 文字の代わりに使う").clicked() {
+                            self.request_ocr(strata_core::ocr::OcrScope::Scans);
+                        }
+                    } else if ocr > 0 && idle && ui.button("OCR を実行").clicked() {
                         self.request_ocr(strata_core::ocr::OcrScope::Needed);
                     }
                 }

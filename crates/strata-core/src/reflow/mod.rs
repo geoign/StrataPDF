@@ -108,6 +108,9 @@ pub struct ReflowDoc {
     /// Source position of each node: (0-based page, top y in page space).
     /// Used to keep the reading position when switching views.
     pub anchors: Vec<(u32, f32)>,
+    /// Quality of the text layer another program's OCR left on scanned pages (`None`
+    /// without such pages).
+    pub ocr_layer: Option<crate::ocrq::LayerQuality>,
 }
 
 impl ReflowDoc {
@@ -380,11 +383,32 @@ pub fn needs_ocr(p: &RichPage) -> Option<String> {
     }
 }
 
+/// A scanned page with a text layer over the image (another program's OCR).
+pub(crate) fn scanned_with_text(p: &RichPage) -> bool {
+    let area = p.width * p.height;
+    p.blocks.iter().any(|b| matches!(b, RichBlock::Image { bbox } if bbox.width() * bbox.height() > area * 0.7))
+        && p.blocks.iter().map(|b| if let RichBlock::Text { lines, .. } = b { lines.iter().map(|l| l.chars.len()).sum() } else { 0 }).sum::<usize>() > 100
+}
+
+/// A page's text, a line per line.
+pub(crate) fn page_text(p: &RichPage) -> String {
+    let mut s = String::new();
+    for b in &p.blocks {
+        if let RichBlock::Text { lines, .. } = b {
+            for l in lines {
+                s.extend(l.chars.iter().map(|c| c.c));
+                s.push('\n');
+            }
+        }
+    }
+    s
+}
+
 /// Share of the characters of a page's text layer that sit on plausible lines:
 /// running text (function words, or mostly words of three letters and more)
 /// or Japanese with kana and punctuation. OCR of figures and bad recognitions
 /// give runs of symbols, stray letters and unrelated kanji.
-fn ocr_layer_quality(p: &RichPage) -> f32 {
+pub(crate) fn ocr_layer_quality(p: &RichPage) -> f32 {
     let (mut good, mut total) = (0usize, 0usize);
     for b in &p.blocks {
         let RichBlock::Text { lines, .. } = b else { continue };
@@ -2221,10 +2245,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             })
             .unwrap_or_default();
         let ocr = from_ocr || needs_ocr(&rich).is_some();
-        let area = b.width() * b.height();
-        let over_scan = rich.blocks.iter().any(|b| matches!(b, RichBlock::Image { bbox } if bbox.width() * bbox.height() > area * 0.7))
-            && rich.blocks.iter().map(|b| if let RichBlock::Text { lines, .. } = b { lines.iter().map(|l| l.chars.len()).sum() } else { 0 }).sum::<usize>() > 100;
-        let scan = ocr || over_scan;
+        let scan = ocr || scanned_with_text(&rich);
         // Display lists are made when needed and dropped soon: kept for every page,
         // the images they hold fill MuPDF's store, and every later allocation then
         // scans it (a 27-page paper with large figures took minutes).
@@ -2278,6 +2299,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
 
     // Pass 2: per page layout and classification.
     let mut doc = ReflowDoc { vertical, ..Default::default() };
+    // Another program's OCR text on scanned pages: a poor one is worth reading again.
+    let foreign: Vec<String> = pages.iter().filter(|p| p.scan && !p.ocr).map(|p| page_text(&p.rich)).collect();
+    doc.ocr_layer = (!foreign.is_empty()).then(|| crate::ocrq::LayerQuality::assess(&foreign));
     let mut title_size = 0.0f32;
     // Vertical text: did the last paragraph column run to the bottom of the text area?
     let mut last_col_full = false;

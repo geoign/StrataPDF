@@ -493,6 +493,7 @@ fn main() {
             "body_size": raw.body,
             "nodes": kinds,
             "page_images": page_images,
+            "ocr_layer": d.ocr_layer.map(|q| json!({"pages": q.pages, "en_rate": q.en_rate(), "ja_rate": q.ja_rate(), "poor": q.poor()})),
             "headings": headings,
             "raw_tokens": raw_tokens,
             "out_tokens": out_tokens,

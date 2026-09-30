@@ -106,6 +106,8 @@ StrataPDF は [GNU Affero General Public License v3.0](LICENSE) 以降（AGPL-3.
 - OCR の実装は [NDLOCR-Lite](https://github.com/ndl-lab/ndlocr-lite)（国立国会図書館、CC BY 4.0）の推論処理を Rust に移植したもの。
   モデルも同じ配布元から取得する
 - 数式認識のモデルは [Pix2Text MFR 1.5](https://huggingface.co/breezedeus/pix2text-mfr-1.5)（MIT）
+- 既存 OCR の品質判定に使う英単語表（`crates/strata-core/data/words-en.txt`）は、
+  Webster's Second International Dictionary（1934）の語彙表（Unix の `web2`、パブリックドメイン）の小文字語
 - レイアウト解析は [PyMuPDF Layout](https://github.com/ArtifexSoftware/pymupdf_layout)（Artifex、AGPL-3.0）の
   特徴量計算（C）とモデル（ONNX）をそのまま組み込み、Python の処理部分を Rust に移植したもの（`vendor/pymupdf_layout`）
 - 配布版の zip には、依存する Rust クレートのライセンス表記（`THIRD-PARTY-NOTICES.html`）と、

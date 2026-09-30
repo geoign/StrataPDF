@@ -9,6 +9,7 @@ pub mod recode;
 pub mod images;
 pub mod layout;
 pub mod ocr;
+pub mod ocrq;
 pub mod reflow;
 pub mod render;
 pub mod rich;
