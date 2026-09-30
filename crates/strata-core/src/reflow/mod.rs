@@ -1889,6 +1889,28 @@ fn is_boilerplate(t: &str) -> bool {
     STARTS.iter().any(|s| l.starts_with(s)) || l.contains("all rights reserved") || (l.contains("creative commons") && l.contains("licen") && l.chars().count() < 400)
 }
 
+/// The number that a numbered item of a list opens with ("3. Internal velocity in the
+/// beds", "4) …"): digits, a stop or a bracket, and words.
+fn item_number(t: &str) -> Option<u32> {
+    let t = t.trim_start();
+    // (Numbered references, "1. R. S. J. Sparks, J. Volcanol. …", are entries of a list of
+    // their own kind.)
+    if !t.starts_with(|c: char| c.is_ascii_digit()) || t.chars().filter(|c| c.is_alphabetic()).count() < 3 || refs::lead(t) != refs::Lead::No {
+        return None;
+    }
+    refs::marker(t)
+}
+
+/// A unit that is an item of a numbered list: the text unit before it in the reading order
+/// carries the number that comes before its own, or the one after it the number after.
+fn numbered_item(units: &[Unit], i: usize) -> bool {
+    let Some(n) = item_number(&units[i].text()) else { return false };
+    let number_of = |k: usize| (units[k].kind == UnitKind::Text).then(|| item_number(&units[k].text())).flatten();
+    let before = (0..i).rev().find(|&k| units[k].kind == UnitKind::Text).and_then(number_of);
+    let after = (i + 1..units.len()).find(|&k| units[k].kind == UnitKind::Text).and_then(number_of);
+    (n >= 2 && before == Some(n - 1)) || after == Some(n + 1)
+}
+
 fn is_list_marker(t: &str) -> bool {
     let t = t.trim_start();
     t.starts_with(['•', '·', '▪', '●', '◦', '‣', '–', '・']) || {
@@ -3249,6 +3271,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 // "(22)", "(dz)", is no list marker.)
                 doc.nodes.push(Node::ListItem { spans });
             } else {
+                // A numbered item of a list is a paragraph that starts a list item (and is
+                // carried on by the unit after it, as any paragraph is).
+                let numbered = !vertical && numbered_item(&ordered, i);
                 // Continuation across a column or page break; figures, tables,
                 // footnotes and stray captions that interrupt a paragraph are floats
                 // and are skipped.
@@ -3293,11 +3318,14 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             && u.bbox.y0 - l.bbox.y1 < body * 0.8
                     });
                 let merge = match prev.map(|ix| &doc.nodes[ix]) {
-                    // The first lines of an entry start a paragraph of their own.
-                    _ if u.refs == refs::Ref::Start => false,
+                    // The first lines of an entry, and a numbered item, start a paragraph of their own.
+                    _ if u.refs == refs::Ref::Start || numbered => false,
                     // A reference entry is not continued by what follows the list.
                     Some(Node::Paragraph { .. }) if prev == ref_node => false,
-                    Some(Node::Paragraph { spans: prev_spans }) => {
+                    // A list item carries on only if it was a paragraph first (a numbered item):
+                    // a bullet or "(466)" alone is followed by a paragraph of its own.
+                    Some(Node::ListItem { .. }) if !last_para.as_ref().is_some_and(|l| Some(l.node) == prev) => false,
+                    Some(Node::Paragraph { spans: prev_spans } | Node::ListItem { spans: prev_spans }) => {
                         if vertical {
                             let (top, bottom) = vertical_text_area(&ordered, body);
                             // (The first column, the rightmost: the unit may hold several.)
@@ -3375,7 +3403,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
                 if merge {
                     let idx = prev.unwrap();
-                    if let Node::Paragraph { spans: prev } = &mut doc.nodes[idx] {
+                    if let Node::Paragraph { spans: prev } | Node::ListItem { spans: prev } = &mut doc.nodes[idx] {
                         let cjk = spans_text(prev).chars().last().is_some_and(is_cjk);
                         if !cjk && !vertical && !join_hyphenated(prev, &text, &lex) {
                             prev.push(Span { text: " ".into(), style: Style::default(), link: None });
@@ -3395,7 +3423,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     para_size.insert(idx, (size, p.page));
                 } else {
                     body_started |= text.chars().count() >= 400;
-                    doc.nodes.push(Node::Paragraph { spans });
+                    doc.nodes.push(if numbered { Node::ListItem { spans } } else { Node::Paragraph { spans } });
                     last_para = Some(LastPara { node: doc.nodes.len() - 1, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size, slot: u.bbox });
                     para_size.insert(doc.nodes.len() - 1, (size, p.page));
                 }
@@ -3439,6 +3467,19 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbered_items() {
+        assert_eq!(item_number("3. Internal velocity in the beds."), Some(3));
+        assert_eq!(item_number("4) Reflector continuity"), Some(4));
+        assert_eq!(item_number("12.5 mm wide"), None);
+        assert_eq!(item_number("2010. A year"), None);
+        assert_eq!(item_number("1. "), None);
+        assert_eq!(item_number("Figure 3. Something"), None);
+        // A numbered reference is no item of this kind.
+        assert_eq!(item_number("1. R. S. J. Sparks, J. Volcanol. Geotherm. Res. 3, 1–37 (1978)."), None);
+        assert_eq!(item_number("2. Smith, J., 2001, Title of the paper. Journal 1, 2-3."), None);
+    }
 
     #[test]
     fn heading_numbers() {
