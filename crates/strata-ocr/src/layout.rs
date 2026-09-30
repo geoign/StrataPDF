@@ -120,8 +120,10 @@ pub struct GraphInput {
 pub type Logits = (Vec<Vec<f32>>, Vec<Vec<f32>>);
 
 pub struct LayoutModel {
-    cnn: Mutex<Session>,
-    gnn: Mutex<Session>,
+    cnn: Vec<Mutex<Session>>,
+    gnn: Vec<Mutex<Session>>,
+    /// Which session the next caller tries first.
+    next: std::sync::atomic::AtomicUsize,
 }
 
 static CNN_ONNX: &[u8] = include_bytes!("../models/feature_imf1.onnx");
@@ -129,14 +131,30 @@ static GNN_ONNX: &[u8] = include_bytes!("../models/layout_rf2.4.1_imf1.onnx");
 
 impl LayoutModel {
     /// The models are embedded in the executable; they run on the CPU.
+    ///
+    /// Several sessions with a few threads each, so that pages are analysed side
+    /// by side: the networks are small, and one session on every core ran them
+    /// little faster than on four.
     pub fn load() -> Result<LayoutModel, OcrError> {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let sessions = (cores / 4).clamp(1, 6);
+        let threads = (cores / sessions).max(1);
         let build = |bytes: &[u8]| -> Result<Session, OcrError> {
             Ok(Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .map_err(|e| OcrError::Inference(e.to_string()))?
+                .with_intra_threads(threads)
+                .map_err(|e| OcrError::Inference(e.to_string()))?
                 .commit_from_memory(bytes)?)
         };
-        Ok(LayoutModel { cnn: Mutex::new(build(CNN_ONNX)?), gnn: Mutex::new(build(GNN_ONNX)?) })
+        let pool = |bytes: &[u8]| -> Result<Vec<Mutex<Session>>, OcrError> { (0..sessions).map(|_| build(bytes).map(Mutex::new)).collect() };
+        Ok(LayoutModel { cnn: pool(CNN_ONNX)?, gnn: pool(GNN_ONNX)?, next: Default::default() })
+    }
+
+    /// A free session of the pool, or (all busy) the next one in turn.
+    fn session<'a>(&self, pool: &'a [Mutex<Session>]) -> parking_lot::MutexGuard<'a, Session> {
+        let start = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (0..pool.len()).find_map(|k| pool[(start + k) % pool.len()].try_lock()).unwrap_or_else(|| pool[start % pool.len()].lock())
     }
 
     /// Classify the lines of a page. `rgb` is the page rendered at 72 dpi
@@ -174,7 +192,7 @@ impl LayoutModel {
     /// The CNN's feature map (160 channels) and class logits (12) over the 300×300 grey page.
     pub fn page_maps(&self, gray: &[f32]) -> Result<(Vec<f32>, Vec<f32>), OcrError> {
         let arr = Array4::from_shape_vec((1, 1, IMG, IMG), gray.to_vec()).map_err(|e| OcrError::Inference(e.to_string()))?;
-        let mut s = self.cnn.lock();
+        let mut s = self.session(&self.cnn);
         let out = s.run(ort::inputs!["input" => Tensor::from_array(arr)?])?;
         let feat: Vec<f32> = out["combined"].try_extract_array::<f32>()?.iter().copied().collect();
         let logits: Vec<f32> = out["logits"].try_extract_array::<f32>()?.iter().copied().collect();
@@ -195,7 +213,7 @@ impl LayoutModel {
         let tp = Array2::from_shape_fn((n, TEXT_PATTERN_LEN), |(i, j)| g.text_patterns[i][j]);
         let k = Array0::from_elem((), n.min(20) as i64);
         let batch = Array1::<i64>::zeros(n);
-        let mut s = self.gnn.lock();
+        let mut s = self.session(&self.gnn);
         let out = s.run(ort::inputs![
             "x" => Tensor::from_array(x)?,
             "edge_index" => Tensor::from_array(ei)?,

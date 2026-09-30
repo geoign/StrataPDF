@@ -239,20 +239,48 @@ fn is_math_char(c: char) -> bool {
 fn normalize_vertical(p: &mut RichPage) {
     for b in &mut p.blocks {
         let RichBlock::Text { bbox, lines } = b else { continue };
-        if lines.len() < 2 || lines.iter().any(|l| l.vertical) {
+        if lines.len() < 2 {
             continue;
         }
-        let chars: usize = lines.iter().map(|l| l.chars.iter().filter(|c| !c.c.is_whitespace()).count()).sum();
-        let single = lines.iter().filter(|l| l.chars.iter().filter(|c| !c.c.is_whitespace()).count() <= 1).count();
+        let glyphs = |l: &RichLine| l.chars.iter().filter(|c| !c.c.is_whitespace()).count();
+        let chars: usize = lines.iter().map(glyphs).sum();
+        let single = lines.iter().filter(|l| glyphs(l) <= 1).count();
         let size = lines.iter().map(line_size).fold(0.0f32, f32::max).max(1.0);
-        let tall = bbox.height() > bbox.width() * 2.0 && bbox.width() < size * 1.8;
-        if !(tall && single * 10 >= lines.len() * 8 && chars >= 2) {
+        // Characters stacked one per line: written vertically (an OCR text layer of
+        // vertical text puts every character on a line of its own), or a tall narrow
+        // block of horizontal one-character lines.
+        let stacked = lines.iter().all(|l| l.vertical) || (bbox.height() > bbox.width() * 2.0 && bbox.width() < size * 1.8);
+        if !(stacked && single * 10 >= lines.len() * 8 && chars >= 2) {
             continue;
         }
-        let mut all: Vec<_> = lines.drain(..).flat_map(|l| l.chars).filter(|c| !c.c.is_whitespace()).collect();
-        all.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0));
-        let lb = all.iter().skip(1).fold(all[0].bbox, |r, c| r.union(&c.bbox));
-        lines.push(RichLine { bbox: lb, vertical: true, dir: [0.0, 1.0], joined: false, chars: all });
+        // The columns, right to left: characters whose centres line up. (Ruby, set
+        // beside its column, makes a thin column of its own.)
+        let mut all: Vec<crate::rich::RichChar> = lines.drain(..).flat_map(|l| l.chars).filter(|c| !c.c.is_whitespace()).collect();
+        all.sort_by(|a, b| b.bbox.center().0.total_cmp(&a.bbox.center().0));
+        let mut cols: Vec<(f32, Vec<crate::rich::RichChar>)> = Vec::new();
+        for c in all {
+            let x = c.bbox.center().0;
+            match cols.last_mut() {
+                Some((cx, col)) if (x - *cx).abs() <= c.size.max(1.0) * 0.5 => {
+                    col.push(c);
+                    *cx += (x - *cx) / col.len() as f32;
+                }
+                _ => cols.push((x, vec![c])),
+            }
+        }
+        for (_, mut col) in cols {
+            col.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0));
+            // A wide gap down the column parts two lines (a heading above its text).
+            let mut start = 0;
+            for k in 1..=col.len() {
+                if k == col.len() || col[k].bbox.y0 - col[k - 1].bbox.y1 > col[k].size.max(col[k - 1].size) * 2.0 {
+                    let part: Vec<_> = col[start..k].to_vec();
+                    let lb = part.iter().skip(1).fold(part[0].bbox, |r, c| r.union(&c.bbox));
+                    lines.push(RichLine { bbox: lb, vertical: true, dir: [0.0, 1.0], joined: false, chars: part });
+                    start = k;
+                }
+            }
+        }
     }
 }
 
