@@ -47,13 +47,15 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
         {
             c.c = m;
         }
-        // A ToUnicode map that gives two code points for one glyph: the second
-        // copy has no width.
+        // A math font whose ToUnicode map gives two code points for one glyph: the
+        // second copy has no width. (Text fonts expand ligatures the same way,
+        // "ff" into "f" and a zero-width "f": those letters are real.)
         if let Some(prev) = out.last()
             && prev.c == c.c
             && prev.font == c.font
             && c.bbox.width() < 0.01
             && !c.c.is_whitespace()
+            && math_font(font_name(&c))
         {
             continue;
         }
