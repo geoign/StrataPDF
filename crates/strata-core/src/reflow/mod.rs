@@ -556,6 +556,50 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
     out
 }
 
+/// The pieces of one visual line joined into one line (horizontal text):
+/// consecutive lines of a row that sit side by side, closer than a word space
+/// or two (a gap wider than half an em is a column gutter or a tab stop,
+/// unless one side is a short fragment such as a superscript or a number). A
+/// space goes between them where the gap is a word space.
+fn join_rows(lines: Vec<RichLine>) -> Vec<RichLine> {
+    let mut out: Vec<RichLine> = Vec::with_capacity(lines.len());
+    for l in lines {
+        if let Some(prev) = out.last_mut()
+            && !prev.vertical
+            && !l.vertical
+            && prev.dir[1].abs() < 0.1
+            && l.dir[1].abs() < 0.1
+            && l.bbox.y1.min(prev.bbox.y1) - l.bbox.y0.max(prev.bbox.y0) >= 0.5 * l.bbox.height().min(prev.bbox.height())
+            && l.bbox.x0 >= prev.bbox.x1 - 1.0
+            && {
+                let em = line_size(&l).max(line_size(prev));
+                let gap = l.bbox.x0 - prev.bbox.x1;
+                let short = |x: &RichLine| x.chars.iter().filter(|c| !c.c.is_whitespace()).count() <= 3;
+                gap < em * 0.6 || ((short(&l) || short(prev)) && gap < em * 1.5)
+            }
+        {
+            let em = line_size(&l).max(line_size(prev));
+            let gap = l.bbox.x0 - prev.bbox.x1;
+            let spaced = prev.chars.last().is_some_and(|c| c.c == ' ') || l.chars.first().is_some_and(|c| c.c == ' ');
+            if gap > em * 0.15 && !spaced
+                && let Some(last) = prev.chars.last().copied()
+            {
+                let mut sp = last;
+                sp.c = ' ';
+                sp.bbox.x0 = prev.bbox.x1;
+                sp.bbox.x1 = l.bbox.x0;
+                prev.chars.push(sp);
+            }
+            prev.bbox = prev.bbox.union(&l.bbox);
+            prev.chars.extend(l.chars);
+            prev.joined = l.joined;
+            continue;
+        }
+        out.push(l);
+    }
+    out
+}
+
 /// "Almendros, J., Wilcock, W., ..." or "Av´e Lallemant, H.G., ...": the start of a
 /// reference entry (a surname, a comma, then initials).
 fn author_start(t: &str) -> bool {
@@ -886,6 +930,11 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     let mut units = merge_regions(units);
     if std::env::var("STRATA_NO_REGROUP").is_err() {
         units = regroup_references(units);
+    }
+    if !vertical {
+        for u in units.iter_mut().filter(|u| u.kind == UnitKind::Text && u.class != Some(strata_ocr::layout::TABLE)) {
+            u.lines = join_rows(std::mem::take(&mut u.lines));
+        }
     }
     for r in vector_figures(&p.rich.blocks, page_area) {
         units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None });
@@ -1992,7 +2041,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     let bonus = if u.class == Some(TITLE) { 1.3 } else { 1.0 } * if authors_below(k) { 1.5 } else { 1.0 };
                     u.size() * (u.text().chars().count().min(150) as f32).sqrt() * bonus
                 };
-                ordered
+                let cands = ordered
                     .iter()
                     .enumerate()
                     .filter(|(_, u)| {
@@ -2009,8 +2058,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             && !is_strong_byline(&t)
                             && !is_boilerplate(&t)
                     })
-                    .max_by(|a, b| score(*a).total_cmp(&score(*b)))
-                    .map(|(i, _)| i)
+                    .map(|(k, u)| (k, score((k, u)), u.bbox.y0, authors_below(k)))
+                    .collect::<Vec<_>>();
+                // Of titles of nearly equal weight (a paper titled in two languages,
+                // each followed by its authors), the upper one.
+                let best = cands.iter().max_by(|a, b| a.1.total_cmp(&b.1)).copied();
+                best.and_then(|(_, max, _, authors)| cands.iter().filter(|c| c.1 >= max * 0.8 && c.3 == authors).min_by(|a, b| a.2.total_cmp(&b.2)).map(|c| c.0))
             })
             .flatten();
         let title_top = page_title.map(|t| ordered[t].bbox.y0);
