@@ -1682,14 +1682,20 @@ struct LastPara {
 /// top or bottom margin (logos, icons) are dropped. Emptied nodes become empty
 /// paragraphs, removed at the end.
 fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, RectF>, width: f32, height: f32) {
-    let empty_fig = |doc: &ReflowDoc, k: usize| match &doc.nodes[k] {
-        Node::Figure { image, caption } if caption.is_empty() => Some(doc.images[*image].bbox),
+    // Figures (`table` false) or tables (true) without a caption.
+    let empty_float = |doc: &ReflowDoc, k: usize, table: bool| match &doc.nodes[k] {
+        Node::Figure { image, caption } if caption.is_empty() && !table => Some(doc.images[*image].bbox),
+        Node::Table { image, caption, .. } if caption.is_empty() && table => Some(doc.images[*image].bbox),
         _ => None,
     };
-    let captions: Vec<usize> = (first..doc.nodes.len())
-        .filter(|&k| matches!(&doc.nodes[k], Node::Paragraph { spans } if caption_kind(&spans_text(spans)) == Some(false)))
+    let empty_fig = |doc: &ReflowDoc, k: usize| empty_float(doc, k, false);
+    let captions: Vec<(usize, bool)> = (first..doc.nodes.len())
+        .filter_map(|k| match &doc.nodes[k] {
+            Node::Paragraph { spans } => caption_kind(&spans_text(spans)).map(|t| (k, t)),
+            _ => None,
+        })
         .collect();
-    for c in captions {
+    for (c, table) in captions {
         let Some(cb) = node_bbox.get(&c).copied() else { continue };
         let gap = |f: &RectF| {
             let h_overlap = f.x1.min(cb.x1) - f.x0.max(cb.x0);
@@ -1705,7 +1711,7 @@ fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, Re
             }
         };
         let best = (first..doc.nodes.len())
-            .filter_map(|k| empty_fig(doc, k).and_then(|f| gap(&f).map(|g| (k, g))))
+            .filter_map(|k| empty_float(doc, k, table).and_then(|f| gap(&f).map(|g| (k, g))))
             .filter(|&(_, g)| g < height * 0.2)
             .min_by(|a, b| a.1.total_cmp(&b.1));
         if let Some((f, _)) = best {
@@ -1713,7 +1719,7 @@ fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, Re
                 Node::Paragraph { spans } => std::mem::take(spans),
                 _ => continue,
             };
-            if let Node::Figure { caption, .. } = &mut doc.nodes[f] {
+            if let Node::Figure { caption, .. } | Node::Table { caption, .. } = &mut doc.nodes[f] {
                 *caption = spans;
             }
         }
@@ -2037,8 +2043,19 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         };
 
         // Pages without a usable text layer (scans, fonts lacking ToUnicode) are
-        // shown as images until OCR supplies text.
-        if let Some(reason) = needs_ocr(&p.rich) {
+        // shown as images until OCR supplies text; so are pages whose text is
+        // mostly turned by 90 degrees (landscape tables and figures), which the
+        // reading order cannot follow.
+        let (mut turned, mut upright) = (0usize, 0usize);
+        for b in &p.rich.blocks {
+            if let RichBlock::Text { lines, .. } = b {
+                for l in lines {
+                    if !l.vertical && l.dir[1].abs() > 0.5 { turned += l.chars.len() } else { upright += l.chars.len() }
+                }
+            }
+        }
+        let rotated = (!vertical && turned > 200 && turned > upright * 2).then(|| "横向きに組まれたページ（表・図）".to_string());
+        if let Some(reason) = needs_ocr(&p.rich).or(rotated) {
             let full = RectF { x0: 0.0, y0: 0.0, x1: p.rich.width, y1: p.rich.height };
             if let Some(img) = crop(full, opts.image_scale, &mut doc) {
                 doc.nodes.push(Node::PageImage { image: img, reason });
@@ -2106,6 +2123,28 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 i += 1;
                 continue;
             }
+            // A table without a caption here (continued from the page before, or its
+            // caption elsewhere): the model's table units that are not running text.
+            if !vertical && u.class == Some(strata_ocr::layout::TABLE) && !prose_like(&text) && caption_kind(&text).is_none() {
+                let mut j = i;
+                let mut region = u.bbox;
+                let mut rows = Vec::new();
+                while let Some(t) = ordered.get(j) {
+                    let table_unit = t.kind == UnitKind::Text && t.class == Some(strata_ocr::layout::TABLE) && !prose_like(&t.text()) && caption_kind(&t.text()).is_none();
+                    let figure_inside = t.kind == UnitKind::Figure && overlap_frac(&t.bbox, &region.union(&t.bbox)) > 0.0 && t.bbox.y0 < region.y1 + body * 2.0;
+                    if !(table_unit || (j > i && figure_inside)) {
+                        break;
+                    }
+                    region = region.union(&t.bbox);
+                    rows.extend(t.lines.iter().map(|l| l.text()));
+                    j += 1;
+                }
+                if let Some(img) = crop(region, opts.image_scale, &mut doc) {
+                    doc.nodes.push(Node::Table { image: img, caption: Vec::new(), rows });
+                    i = j;
+                    continue;
+                }
+            }
             // Running text that happens to start with "Table 2 summarizes..." is no
             // caption: with the layout model, a table caption must lead into a table.
             let running_text = matches!(u.class, Some(strata_ocr::layout::TEXT | strata_ocr::layout::LIST_ITEM));
@@ -2123,9 +2162,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             j += 1;
                             continue;
                         }
+                        // The table ends where running text resumes (cells can be set at
+                        // body size: the text decides, and the layout model's table class).
                         let s = t.size();
-                        let bodyish = s >= body * 0.97 && t.lines.len() >= 2;
-                        if bodyish || caption_kind(&t.text()).is_some() || numbered_heading_depth(&t.text()).is_some() && s >= body * 0.97 {
+                        let tt = t.text();
+                        let running = t.class != Some(strata_ocr::layout::TABLE) && s >= body * 0.97 && t.lines.len() >= 2 && prose_like(&tt);
+                        if running || caption_kind(&tt).is_some() || (numbered_heading_depth(&tt).is_some() && s >= body * 0.97) {
                             break;
                         }
                         region = Some(region.map_or(t.bbox, |r| r.union(&t.bbox)));
