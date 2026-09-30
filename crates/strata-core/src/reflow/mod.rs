@@ -292,8 +292,12 @@ fn attach_accents(chars: &[crate::rich::RichChar]) -> Vec<crate::rich::RichChar>
             let b = &chars[k].bbox;
             b.x1.min(c.bbox.x1) - b.x0.max(c.bbox.x0)
         };
-        let cands: Vec<usize> = [i.checked_sub(1), Some(i + 1)].into_iter().flatten().filter(|&k| letter(k)).collect();
-        base[i] = cands.into_iter().max_by(|&a, &b| overlap(a).total_cmp(&overlap(b)));
+        // The letters before and after it, across a space ("Universita` degli").
+        let before = (1..=2).filter_map(|d| i.checked_sub(d)).find(|&k| !chars[k].c.is_whitespace());
+        let after = (i + 1..=i + 2).find(|&k| chars.get(k).is_some_and(|c| !c.c.is_whitespace()));
+        let cands: Vec<usize> = [before, after].into_iter().flatten().filter(|&k| letter(k)).collect();
+        // On a tie (a spacing accent between two letters), the letter before it.
+        base[i] = cands.into_iter().rev().max_by(|&a, &b| overlap(a).total_cmp(&overlap(b)));
     }
     let mut out = Vec::with_capacity(chars.len());
     for (k, c) in chars.iter().enumerate() {

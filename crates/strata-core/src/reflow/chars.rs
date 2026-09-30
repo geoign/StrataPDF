@@ -30,9 +30,41 @@ fn is_exotic_space(c: char) -> bool {
 /// Clean the characters of one line (horizontal text).
 pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, math_font: impl Fn(&str) -> bool) -> Vec<RichChar> {
     let font_name = |c: &RichChar| fonts.get(c.font as usize).map(|f| f.name.as_str()).unwrap_or("");
+    // Ruby (furigana): kana in small type above the base text of the line.
+    let mut sizes: Vec<f32> = chars.iter().filter(|c| !c.c.is_whitespace()).map(|c| c.size).collect();
+    sizes.sort_by(f32::total_cmp);
+    let med = sizes.get(sizes.len() / 2).copied().unwrap_or(0.0);
+    let base_mid = {
+        let mut mids: Vec<f32> = chars.iter().filter(|c| c.size >= med * 0.9 && !c.c.is_whitespace()).map(|c| (c.bbox.y0 + c.bbox.y1) / 2.0).collect();
+        mids.sort_by(f32::total_cmp);
+        mids.get(mids.len() / 2).copied().unwrap_or(0.0)
+    };
+    let ruby = |c: &RichChar| matches!(c.c as u32, 0x3040..=0x30FF) && c.size < med * 0.7 && (c.bbox.y0 + c.bbox.y1) / 2.0 < base_mid - med * 0.3;
+    // Text set without space glyphs, words apart by a small gap only: the letter
+    // spacing is the median gap between glyphs, and a gap clearly wider is a
+    // word space ("significantlyto", "arc,Japan,and").
+    let glyphs: Vec<&RichChar> = chars.iter().filter(|c| !c.c.is_whitespace()).collect();
+    let spaces = chars.len() - glyphs.len();
+    // (Only with glyph boxes of the glyphs' own widths: Latin set in a CJK font
+    // has em-square boxes that overlap, and their gaps say nothing.)
+    let proportional = {
+        let mut widths: Vec<f32> = glyphs.iter().filter(|c| c.c.is_ascii_alphabetic()).map(|c| c.bbox.width() / c.size.max(0.1)).collect();
+        widths.sort_by(f32::total_cmp);
+        widths.get(widths.len() / 2).is_some_and(|&w| w < 0.75)
+    };
+    let letter_gap = (!scan && proportional && glyphs.len() >= 20 && spaces * 15 < glyphs.len())
+        .then(|| {
+            let mut gaps: Vec<f32> = glyphs.windows(2).filter(|w| (w[0].size - w[1].size).abs() < 0.1).map(|w| w[1].bbox.x0 - w[0].bbox.x1).collect();
+            gaps.sort_by(f32::total_cmp);
+            gaps.get(gaps.len() / 2).copied()
+        })
+        .flatten();
     let mut out: Vec<RichChar> = Vec::with_capacity(chars.len());
     for (i, c) in chars.iter().enumerate() {
         let mut c = *c;
+        if ruby(&c) {
+            continue;
+        }
         if is_zero_width(c.c) {
             continue;
         }
@@ -69,6 +101,19 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
             {
                 continue;
             }
+        } else if let (Some(lg), Some(a)) = (letter_gap, out.last())
+            && a.c != ' '
+            && (a.c.is_alphanumeric() || matches!(a.c, ',' | '.' | ';' | ':' | ')'))
+            && (c.c.is_alphanumeric() || c.c == '(')
+            && !(a.c.is_ascii_digit() && matches!(c.c, '0'..='9'))
+            && c.bbox.x0 - a.bbox.x1 > lg + c.size.max(a.size) * 0.08
+            && !math_font(font_name(&c))
+        {
+            let mut sp = c;
+            sp.c = ' ';
+            sp.bbox.x0 = a.bbox.x1;
+            sp.bbox.x1 = c.bbox.x0;
+            out.push(sp);
         } else if !scan
             && let Some(a) = out.last()
             && a.c.is_lowercase()
