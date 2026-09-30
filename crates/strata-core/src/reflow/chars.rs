@@ -188,6 +188,28 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
 }
 
 /// Only undecodable or private-use characters: glyphs of a badge or icon font.
+/// Drop spaces between Japanese characters, which OCR engines put after
+/// punctuation and around brackets ("よく、 都下", "」 『").
+pub(super) fn drop_cjk_spaces(chars: Vec<RichChar>) -> Vec<RichChar> {
+    if !chars.iter().any(|c| c.c == ' ') {
+        return chars;
+    }
+    let glyph = |k: usize| chars.get(k).map(|c| c.c).filter(|c| !c.is_whitespace());
+    let mut out = Vec::with_capacity(chars.len());
+    for (i, c) in chars.iter().enumerate() {
+        // (An ideographic space is typeset: "第一章　題名".)
+        if c.c == ' ' {
+            let before = (0..i).rev().find_map(glyph);
+            let after = (i + 1..chars.len()).find_map(glyph);
+            if before.is_some_and(super::is_cjk) && after.is_some_and(super::is_cjk) {
+                continue;
+            }
+        }
+        out.push(*c);
+    }
+    out
+}
+
 pub(super) fn is_junk(t: &str) -> bool {
     let mut any = false;
     for c in t.chars().filter(|c| !c.is_whitespace()) {

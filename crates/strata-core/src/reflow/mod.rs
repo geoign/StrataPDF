@@ -1858,6 +1858,7 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
             }
         }
         let cleaned = if vertical { l.chars.clone() } else { chars::clean_line(&l.chars, fonts, scan, is_math_font) };
+        let cleaned = if scan { chars::drop_cjk_spaces(cleaned) } else { cleaned };
         for c in &attach_accents(&cleaned) {
             let f = fonts.get(c.font as usize);
             let small = c.size < med * 0.8 && !vertical;
@@ -2904,6 +2905,14 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 && caps_heading(&text)
                 && !matches!(u.class, Some(strata_ocr::layout::TABLE | PICTURE | CAPTION | FOOTNOTE | PAGE_HEADER | PAGE_FOOTER));
             let mut level = level;
+            // A column of vertical text running down most of the text area is running
+            // text, whatever size an OCR estimated for it: headings are short columns.
+            if vertical && level.is_some() && u.lines.iter().all(|l| l.vertical) && text.chars().count() > 12 {
+                let (top, bottom) = vertical_text_area(&ordered, body);
+                if bottom > top && u.bbox.height() > (bottom - top) * 0.7 {
+                    level = None;
+                }
+            }
             // The next line of a heading set over several lines (a long title), which
             // alone would not pass for one.
             let heading_below = last_heading.and_then(|(ix, pg, bbox, hsize)| {
@@ -3097,7 +3106,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         if vertical {
                             let (top, _) = vertical_text_area(&ordered, body);
                             let indented = u.bbox.y0 > top + body * 0.5;
-                            last_col_full && !indented
+                            // An indented column still carries on a sentence the column
+                            // before left open ("…売尽し、"): a quotation set in from the top.
+                            last_col_full && (!indented || !ends_sentence(&spans_text(prev_spans)))
                         } else {
                             let prev_text = spans_text(prev_spans);
                             // A sentence cut at the edge of a column and resumed at the top
