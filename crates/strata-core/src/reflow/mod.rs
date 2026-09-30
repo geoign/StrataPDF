@@ -1211,11 +1211,15 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         cols.fold((f32::INFINITY, f32::NEG_INFINITY), |(t, b), l| (t.min(l.bbox.y0), b.max(l.bbox.y1)))
     };
     let vertical_margin = |l: &RichLine| {
-        vertical
-            && !l.vertical
-            && col_top < col_bottom
+        let head = !l.vertical
             && l.chars.len() <= 40
-            && ((l.bbox.y1 <= col_top + 1.0 && l.bbox.y1 < h * 0.15) || (l.bbox.y0 >= col_bottom - 1.0 && l.bbox.y0 > h * 0.85))
+            && ((l.bbox.y1 <= col_top + 1.0 && l.bbox.y1 < h * 0.15) || (l.bbox.y0 >= col_bottom - 1.0 && l.bbox.y0 > h * 0.85));
+        // A page number, which OCR may read as a short column ("144" as "14、").
+        let digits = l.chars.iter().filter(|c| c.c.is_ascii_digit() || ('０'..='９').contains(&c.c)).count();
+        let number = l.chars.len() <= 5
+            && digits * 2 >= l.chars.len()
+            && ((l.bbox.y0 < col_top - 2.0 && l.bbox.y1 < h * 0.15) || (l.bbox.y1 > col_bottom + 2.0 && l.bbox.y0 > h * 0.85));
+        vertical && col_top < col_bottom && (head || number)
     };
     // A running head stands alone in its band (a page number or another running
     // head beside it at most); a repeated fragment inside running text does not.
