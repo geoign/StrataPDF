@@ -593,12 +593,84 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
         {
             o.bbox = o.bbox.union(&u.bbox);
             o.lines.extend(u.lines);
-            o.lines.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0).then(a.bbox.x0.total_cmp(&b.bbox.x0)));
+            sort_rows(&mut o.lines);
             continue;
         }
         out.push(u);
     }
     out
+}
+
+/// Lines in reading order: rows by their vertical overlap (a superscript or
+/// a change of font splits a visual line into several extracted lines, whose
+/// tops differ: sorting by the top put "3, Kentaro" before "Keishiro"), top to
+/// bottom, each row left to right.
+fn sort_rows(lines: &mut [RichLine]) {
+    lines.sort_by(|a, b| (a.bbox.y0 + a.bbox.y1).total_cmp(&(b.bbox.y0 + b.bbox.y1)));
+    let mut rows: Vec<(f32, f32)> = Vec::new();
+    let mut row_of: Vec<usize> = Vec::with_capacity(lines.len());
+    for l in lines.iter() {
+        let b = l.bbox;
+        match rows.last_mut() {
+            Some((y0, y1)) if b.y1.min(*y1) - b.y0.max(*y0) >= 0.5 * b.height().min(*y1 - *y0) => {
+                *y0 = y0.min(b.y0);
+                *y1 = y1.max(b.y1);
+            }
+            _ => rows.push((b.y0, b.y1)),
+        }
+        row_of.push(rows.len() - 1);
+    }
+    let mut keyed: Vec<(usize, f32, RichLine)> = lines.iter().zip(row_of).map(|(l, r)| (r, l.bbox.x0, l.clone())).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    for (slot, (_, _, l)) in lines.iter_mut().zip(keyed) {
+        *slot = l;
+    }
+}
+
+/// One-line units that sit side by side on one baseline, in the same type,
+/// closer than a gutter: the pieces of one line that something between them
+/// (an ORCID or e-mail icon, a drawn mark) cut apart. Joined left to right,
+/// before the reading order could take the gaps for columns.
+fn stitch_rows(units: Vec<Unit>) -> Vec<Unit> {
+    let single = |u: &Unit| u.kind == UnitKind::Text && u.lines.len() == 1 && !matches!(u.class, Some(TITLE | SECTION_HEADER | strata_ocr::layout::TABLE | PICTURE));
+    let mut slots: Vec<Option<Unit>> = units.into_iter().map(Some).collect();
+    let mut order: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].as_ref().is_some_and(single)).collect();
+    order.sort_by(|&a, &b| {
+        let (ua, ub) = (slots[a].as_ref().unwrap(), slots[b].as_ref().unwrap());
+        ua.bbox.x0.total_cmp(&ub.bbox.x0)
+    });
+    for &i in &order {
+        let Some(u) = slots[i].take() else { continue };
+        let size = u.size();
+        let line = u.lines[0].bbox;
+        // The unit this one continues: the nearest one-line unit ending just left of it.
+        let target = (0..slots.len()).filter(|&k| slots[k].as_ref().is_some_and(single)).find(|&k| {
+            let o = slots[k].as_ref().unwrap();
+            let ob = o.lines.last().unwrap().bbox;
+            let gap = line.x0 - ob.x1;
+            (o.size() - size).abs() <= size.max(o.size()) * 0.05
+                && (ob.y1 - line.y1).abs() < size * 0.25
+                && gap > -1.0
+                && gap < size * 1.3
+        });
+        match target {
+            Some(k) => {
+                let o = slots[k].as_mut().unwrap();
+                let mut line = u.lines.into_iter().next().unwrap();
+                let last = o.lines.last_mut().unwrap();
+                if let Some(c) = last.chars.last().copied()
+                    && c.c != ' '
+                {
+                    last.chars.push(crate::rich::RichChar { c: ' ', bbox: RectF { x0: c.bbox.x1, x1: line.bbox.x0, ..c.bbox }, ..c });
+                }
+                last.bbox = last.bbox.union(&line.bbox);
+                last.chars.append(&mut line.chars);
+                o.bbox = o.bbox.union(&u.bbox);
+            }
+            None => slots[i] = Some(u),
+        }
+    }
+    slots.into_iter().flatten().collect()
 }
 
 /// The pieces of one visual line joined into one line (horizontal text):
@@ -958,6 +1030,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         for u in units.iter_mut().filter(|u| u.kind == UnitKind::Text && u.class != Some(strata_ocr::layout::TABLE)) {
             u.lines = join_rows(std::mem::take(&mut u.lines));
         }
+        units = stitch_rows(units);
     }
     for r in vector_figures(&p.rich.blocks, page_area) {
         units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No });
