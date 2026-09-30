@@ -380,6 +380,43 @@ pub fn needs_ocr(p: &RichPage) -> Option<String> {
     }
 }
 
+/// Share of the characters of a page's text layer that sit on plausible lines:
+/// running text (function words, or mostly words of three letters and more)
+/// or Japanese with kana and punctuation. OCR of figures and bad recognitions
+/// give runs of symbols, stray letters and unrelated kanji.
+fn ocr_layer_quality(p: &RichPage) -> f32 {
+    let (mut good, mut total) = (0usize, 0usize);
+    for b in &p.blocks {
+        let RichBlock::Text { lines, .. } = b else { continue };
+        for l in lines {
+            let t = l.text();
+            let n = t.chars().filter(|c| !c.is_whitespace()).count();
+            if n == 0 {
+                continue;
+            }
+            total += n;
+            let cjk = t.chars().filter(|&c| is_cjk(c)).count();
+            let plausible = if cjk * 2 >= n {
+                let kana = t.chars().filter(|c| ('\u{3041}'..='\u{3096}').contains(c)).count();
+                // (Recognised text runs on; figure garbage is scattered with spaces.)
+                let spaces = t.chars().filter(|c| *c == ' ').count();
+                (kana * 6 >= cjk || (cjk >= 10 && t.contains(['。', '、', '，', '．']))) && spaces * 4 < cjk
+            } else {
+                let words: Vec<&str> = t.split_whitespace().collect();
+                let wordy = words.iter().filter(|w| {
+                    let letters = w.chars().filter(|c| c.is_alphabetic()).count();
+                    letters >= 3 && letters * 10 >= w.chars().count() * 7
+                });
+                prose_like(&t) || (words.len() >= 2 && wordy.count() * 2 >= words.len())
+            };
+            if plausible {
+                good += n;
+            }
+        }
+    }
+    if total < 200 { 1.0 } else { good as f32 / total as f32 }
+}
+
 fn digits_key(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).map(|c| if c.is_ascii_digit() { '#' } else { c }).collect()
 }
@@ -2150,7 +2187,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
         }
         let rotated = (!vertical && turned > 200 && turned > upright * 2).then(|| "横向きに組まれたページ（表・図）".to_string());
-        if let Some(reason) = needs_ocr(&p.rich).or(rotated) {
+        // A text layer over a scan (not ours) too poor to read: mostly garbage from
+        // figures or a bad recognition. The page image reads better.
+        let poor = (p.scan && !p.ocr && ocr_layer_quality(&p.rich) < 0.4).then(|| "OCR テキスト層の品質が低いページ".to_string());
+        if let Some(reason) = needs_ocr(&p.rich).or(rotated).or(poor) {
             let full = RectF { x0: 0.0, y0: 0.0, x1: p.rich.width, y1: p.rich.height };
             if let Some(img) = crop(full, opts.image_scale, &mut doc) {
                 doc.nodes.push(Node::PageImage { image: img, reason });
