@@ -955,6 +955,54 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             figs.push(region);
         }
     }
+    // A figure caption with no figure next to it: the figure is the space above
+    // it, up to the running text (or the top of the page), across the caption's
+    // width, if drawings (or, on a scan, the page image) fill it. Its labels go
+    // with it.
+    let prose_block = |u: &Unit| u.lines.len() >= 2 && (prose_like(&u.text()) || ((u.size() - body).abs() < body * 0.1 && !p.scan)) && caption_kind(&u.text()).is_none();
+    let heading_block = |u: &Unit| {
+        let t = u.text();
+        u.lines.len() <= 3 && (matches!(u.class, Some(TITLE | SECTION_HEADER)) || u.size() >= body * 1.1 || heading_number(&t).is_some() || caps_heading(&t))
+    };
+    let caption_boxes: Vec<RectF> = texts.iter().flatten().filter(|u| caption_kind(&u.text()) == Some(false)).map(|u| u.bbox).collect();
+    for cb in caption_boxes {
+        if std::env::var("STRATA_NO_CAPFIG").is_ok() {
+            break;
+        }
+        let near_figure = figs.iter().any(|f| {
+            let h = f.x1.min(cb.x1) - f.x0.max(cb.x0);
+            let v = f.y1.min(cb.y1) - f.y0.max(cb.y0);
+            (h > 0.0 && (cb.y0 - f.y1).abs().min((f.y0 - cb.y1).abs()) < body * 4.0) || (v > 0.0 && (cb.x0 - f.x1).abs().min((f.x0 - cb.x1).abs()) < body * 4.0)
+        });
+        if near_figure {
+            continue;
+        }
+        let top = texts
+            .iter()
+            .flatten()
+            .filter(|u| u.bbox.y1 <= cb.y0 + 1.0 && u.bbox.x0 < cb.x1 && u.bbox.x1 > cb.x0 && (prose_block(u) || heading_block(u) || caption_kind(&u.text()).is_some()))
+            .map(|u| u.bbox.y1)
+            .fold(h * 0.06, f32::max);
+        let region = RectF { x0: cb.x0, y0: top + 2.0, x1: cb.x1, y1: cb.y0 - 2.0 };
+        if region.height() < (body * 4.0).max(40.0) {
+            continue;
+        }
+        let drawn = p.scan
+            || p.rich.blocks.iter().any(|b| matches!(b, RichBlock::Vector { bbox } | RichBlock::Image { bbox } if overlap_frac(bbox, &region) > 0.5 && bbox.width() * bbox.height() < page_area * 0.7));
+        if drawn {
+            // Grow sideways to the drawings that stick out of the caption's width.
+            let mut r = region;
+            for b in &p.rich.blocks {
+                if let RichBlock::Vector { bbox } | RichBlock::Image { bbox } = b
+                    && overlap_frac(bbox, &region) > 0.3
+                    && bbox.width() * bbox.height() < page_area * 0.7
+                {
+                    r = r.union(&RectF { x0: bbox.x0, y0: r.y0, x1: bbox.x1, y1: r.y1 });
+                }
+            }
+            figs.push(r);
+        }
+    }
     let mut out: Vec<Unit> = Vec::new();
     for u in texts.into_iter().flatten() {
         let inside = figs.iter().any(|f| overlap_frac(&u.bbox, f) > 0.8);
@@ -1007,12 +1055,23 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     }
     // Figures found by different means overlap (the panels of a figure and the
     // drawing around them): one figure each.
+    // Panels stacked one above the other with nothing but a narrow gap between
+    // them are one figure too.
+    let stacked = |a: &RectF, b: &RectF| {
+        let h_overlap = a.x1.min(b.x1) - a.x0.max(b.x0);
+        let (top, bottom) = if a.y0 <= b.y0 { (a, b) } else { (b, a) };
+        let gap = bottom.y0 - top.y1;
+        let band = RectF { x0: a.x0.max(b.x0), y0: top.y1, x1: a.x1.min(b.x1), y1: bottom.y0 };
+        h_overlap > 0.6 * a.width().min(b.width())
+            && gap < body * 1.5
+            && !out.iter().any(|u| u.bbox.x0 < band.x1 && u.bbox.x1 > band.x0 && u.bbox.y0 < band.y1 - 1.0 && u.bbox.y1 > band.y0 + 1.0)
+    };
     let mut merged: Vec<RectF> = Vec::with_capacity(figs.len());
     for f in figs {
         merged.push(f);
         loop {
             let last = *merged.last().unwrap();
-            let Some(j) = (0..merged.len() - 1).find(|&j| overlap_frac(&last, &merged[j]) > 0.5 || overlap_frac(&merged[j], &last) > 0.5) else { break };
+            let Some(j) = (0..merged.len() - 1).find(|&j| overlap_frac(&last, &merged[j]) > 0.5 || overlap_frac(&merged[j], &last) > 0.5 || stacked(&last, &merged[j])) else { break };
             let o = merged.remove(j);
             *merged.last_mut().unwrap() = last.union(&o);
         }
@@ -1021,9 +1080,47 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     (out, manuscript)
 }
 
+/// Running text: at least one in eight words is a function word (English and a
+/// few European languages), as figure labels and table cells are not; CJK
+/// text with sentence punctuation.
+fn prose_like(t: &str) -> bool {
+    const FUNCTION: [&str; 40] = [
+        "the", "of", "and", "in", "to", "a", "is", "are", "was", "were", "for", "on", "with", "by", "as", "at", "from", "that", "this", "be", "or", "an", "which", "we", "it", "its", "not", "has", "have", "der", "die", "und", "das", "le", "la", "les", "et", "des", "el", "los",
+    ];
+    let words: Vec<String> = t.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase()).filter(|w| !w.is_empty()).collect();
+    if t.chars().filter(|&c| is_cjk(c)).count() >= 10 {
+        return t.contains(['。', '、', '，', '．']);
+    }
+    words.len() >= 4 && words.iter().filter(|w| FUNCTION.contains(&w.as_str())).count() * 8 >= words.len()
+}
+
 fn caption_kind(t: &str) -> Option<bool> {
     // Some(true) for tables, Some(false) for figures.
     let t = t.trim_start();
+    // "Figure 4 shows…", "Table 2 summarizes…": running text, not a caption (the
+    // word after the number is a lowercase verb, not a title or a panel letter).
+    let verb_after_number = || {
+        let mut it = t.split_whitespace();
+        it.next();
+        let mut w = it.next().unwrap_or("");
+        if w.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            // "Figure 2." / "Fig. 3:" end the label: a caption, whatever follows.
+            if w.ends_with(['.', ':', '|']) {
+                return false;
+            }
+            w = it.next().unwrap_or("");
+        }
+        w.chars().next().is_some_and(char::is_lowercase) && w.chars().filter(|c| c.is_alphabetic()).count() >= 3
+    };
+    // "Fig.8(a)に求められた…": a Japanese sentence (a particle follows the number).
+    let particle_after_number = || {
+        let rest = t.trim_start_matches(|c: char| c.is_ascii_alphabetic() || c == '.' || c == ' ' || c == '図' || c == '表');
+        let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit() || ('０'..='９').contains(&c) || matches!(c, '(' | ')' | '（' | '）' | '.' | '-' | '–' | ',' | ' ') || c.is_ascii_lowercase());
+        rest.chars().next().is_some_and(|c| ('\u{3040}'..='\u{309F}').contains(&c))
+    };
+    if (!t.starts_with(['表', '図']) && verb_after_number()) || particle_after_number() {
+        return None;
+    }
     let starts = |p: &str| t.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)) && t.len() > p.len();
     let num_after = |p: &str| t.get(p.len()..).unwrap_or("").trim_start().chars().next().is_some_and(|c| c.is_ascii_digit() || matches!(c, 'I' | 'V' | 'X' | 'S'));
     if (starts("table") && num_after("table")) || t.starts_with('表') {
@@ -1418,6 +1515,59 @@ struct LastPara {
     size: f32,
 }
 
+/// Figures and captions of one page left apart by the reading order: each
+/// figure caption shown as a paragraph goes to the nearest figure without a
+/// caption, above, below or beside it. Small figures without a caption in the
+/// top or bottom margin (logos, icons) are dropped. Emptied nodes become empty
+/// paragraphs, removed at the end.
+fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, RectF>, width: f32, height: f32) {
+    let empty_fig = |doc: &ReflowDoc, k: usize| match &doc.nodes[k] {
+        Node::Figure { image, caption } if caption.is_empty() => Some(doc.images[*image].bbox),
+        _ => None,
+    };
+    let captions: Vec<usize> = (first..doc.nodes.len())
+        .filter(|&k| matches!(&doc.nodes[k], Node::Paragraph { spans } if caption_kind(&spans_text(spans)) == Some(false)))
+        .collect();
+    for c in captions {
+        let Some(cb) = node_bbox.get(&c).copied() else { continue };
+        let gap = |f: &RectF| {
+            let h_overlap = f.x1.min(cb.x1) - f.x0.max(cb.x0);
+            let v_overlap = f.y1.min(cb.y1) - f.y0.max(cb.y0);
+            if h_overlap > 0.3 * f.width().min(cb.width()) {
+                // Above (preferred) or below the caption.
+                if f.y1 <= cb.y0 + 2.0 { Some(cb.y0 - f.y1) } else if f.y0 >= cb.y1 - 2.0 { Some((f.y0 - cb.y1) * 1.2) } else { None }
+            } else if v_overlap > 0.3 * f.height().min(cb.height()) {
+                // Beside it.
+                Some(if f.x1 <= cb.x0 { cb.x0 - f.x1 } else { f.x0 - cb.x1 }.max(0.0) * 1.5)
+            } else {
+                None
+            }
+        };
+        let best = (first..doc.nodes.len())
+            .filter_map(|k| empty_fig(doc, k).and_then(|f| gap(&f).map(|g| (k, g))))
+            .filter(|&(_, g)| g < height * 0.2)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((f, _)) = best {
+            let spans = match &mut doc.nodes[c] {
+                Node::Paragraph { spans } => std::mem::take(spans),
+                _ => continue,
+            };
+            if let Node::Figure { caption, .. } = &mut doc.nodes[f] {
+                *caption = spans;
+            }
+        }
+    }
+    let page_area = width * height;
+    for k in first..doc.nodes.len() {
+        if let Some(f) = empty_fig(doc, k)
+            && f.width() * f.height() < page_area * 0.02
+            && (f.y1 < height * 0.12 || f.y0 > height * 0.92)
+        {
+            doc.nodes[k] = Node::Paragraph { spans: Vec::new() };
+        }
+    }
+}
+
 fn math_fraction(u: &Unit, fonts: &[FontInfo]) -> f32 {
     u.frac(|c| (is_math_char(c.c) || fonts.get(c.font as usize).is_some_and(|f| is_math_font(&f.name))) && c.c != '•')
 }
@@ -1731,8 +1881,18 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         }
 
         let mut last_anchor = (p.page, 0.0f32);
+        let first_node = doc.nodes.len();
+        // Box of each node made on this page (the unit it came from).
+        let mut node_bbox: HashMap<usize, RectF> = HashMap::new();
+        let mut pending: Option<(usize, RectF)> = None;
         let mut i = 0;
         while i < ordered.len() {
+            if let Some((start, b)) = pending.take() {
+                for k in start..doc.nodes.len() {
+                    node_bbox.entry(k).or_insert(b);
+                }
+            }
+            pending = Some((doc.nodes.len(), ordered[i].bbox));
             let u = &ordered[i];
             // Nodes created for this unit start at its top edge.
             doc.fill_anchors(last_anchor);
@@ -2178,11 +2338,29 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             i += 1;
         }
+        if let Some((start, b)) = pending.take() {
+            for k in start..doc.nodes.len() {
+                node_bbox.entry(k).or_insert(b);
+            }
+        }
         doc.fill_anchors(last_anchor);
+        pair_figures(&mut doc, first_node, &node_bbox, p.rich.width, p.rich.height);
         progress(2 * n + pi + 1, total);
     }
     let last = doc.anchors.last().copied().unwrap_or((0, 0.0));
     doc.fill_anchors(last);
+    // Nodes emptied by `pair_figures`.
+    let keep: Vec<bool> = doc.nodes.iter().map(|n| !matches!(n, Node::Paragraph { spans } if spans.is_empty())).collect();
+    let mut k = 0;
+    doc.nodes.retain(|_| {
+        k += 1;
+        keep[k - 1]
+    });
+    let mut k = 0;
+    doc.anchors.retain(|_| {
+        k += 1;
+        keep[k - 1]
+    });
     if doc.title.is_empty()
         && let Some(Node::Heading { spans, .. }) = doc.nodes.iter().find(|n| matches!(n, Node::Heading { .. }))
     {
@@ -2210,6 +2388,13 @@ mod tests {
         assert_eq!(caption_kind("Table 2"), Some(true));
         assert_eq!(caption_kind("Tables are"), None);
         assert_eq!(caption_kind("図3 地質図"), Some(false));
+        assert_eq!(caption_kind("Figure 4 shows spectrograms"), None);
+        assert_eq!(caption_kind("Table 2 summarizes the data"), None);
+        assert_eq!(caption_kind("Figure 2. volcanoes for five sets"), Some(false));
+        assert_eq!(caption_kind("Fig. 1a Map of the flow"), Some(false));
+        assert_eq!(caption_kind("Table 1 (continued)"), Some(true));
+        assert_eq!(caption_kind("Fig.8(a)に求められたバックスリップ量"), None);
+        assert_eq!(caption_kind("Fig. 8. 求められたバックスリップ量"), Some(false));
     }
 
     #[test]
