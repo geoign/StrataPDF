@@ -56,6 +56,18 @@ impl Lexicon {
         self.words.contains_key(w)
     }
 
+    /// The word, or a form of it (plural, past, gerund), is in the document.
+    fn has_form(&self, w: &str) -> bool {
+        self.has(w)
+            || ["s", "es", "ed", "d", "ing"].iter().any(|e| self.has(&format!("{w}{e}")))
+            || ["s", "es"].iter().any(|e| w.strip_suffix(e).is_some_and(|b| b.chars().count() >= 3 && self.has(b)))
+    }
+
+    /// Case-insensitive `has`, for callers outside this module.
+    pub(super) fn has_word(&self, w: &str) -> bool {
+        self.has(&w.to_lowercase())
+    }
+
     /// Whether "a-" at a line end and "b" at the start of the next line form a
     /// hyphenated compound (keep the hyphen) rather than one word broken in two.
     pub(super) fn keep_hyphen(&self, a: &str, b: &str) -> bool {
@@ -67,12 +79,12 @@ impl Lexicon {
         if self.has(&format!("{a}-{b}")) {
             return true;
         }
-        if self.has(&format!("{a}{b}")) {
+        if self.has_form(&format!("{a}{b}")) {
             return false;
         }
         // Both halves are words of three letters or more ("time-scale"), not
         // syllables ("infor-mation", "be-cause").
-        a.chars().count() >= 3 && b.chars().count() >= 3 && self.has(&a) && self.has(&b)
+        a.chars().count() >= 3 && b.chars().count() >= 3 && self.has_form(&a) && self.has_form(&b)
     }
 }
 
@@ -83,6 +95,13 @@ pub(super) fn word_before_hyphen(s: &str) -> Option<&str> {
     let start = body.rfind(|c: char| !c.is_alphanumeric()).map_or(0, |i| i + body[i..].chars().next().unwrap().len_utf8());
     let w = &body[start..];
     (!w.is_empty() && w.chars().last().is_some_and(char::is_alphabetic)).then_some(w)
+}
+
+/// The leading letters and digits of a line or paragraph, in any case.
+pub(super) fn word_after_any(s: &str) -> Option<&str> {
+    let t = s.trim_start();
+    let end = t.find(|c: char| !c.is_alphanumeric()).unwrap_or(t.len());
+    (end > 0).then(|| &t[..end])
 }
 
 /// The leading letters of a line or paragraph that starts in lowercase.

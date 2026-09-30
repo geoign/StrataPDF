@@ -14,6 +14,7 @@
 //! blocks that mix them. The heuristics remain for what it does not cover and
 //! for pages without its labels.
 
+mod chars;
 mod hyphen;
 mod order;
 pub mod output;
@@ -261,6 +262,11 @@ fn combining(c: char) -> Option<char> {
         '\u{02C7}' => Some('\u{030C}'),
         '\u{00B8}' => Some('\u{0327}'),
         '\u{02DA}' => Some('\u{030A}'),
+        '\u{00AF}' => Some('\u{0304}'),
+        '\u{02D8}' => Some('\u{0306}'),
+        '\u{02D9}' => Some('\u{0307}'),
+        '\u{02DB}' => Some('\u{0328}'),
+        '\u{02DD}' => Some('\u{030B}'),
         _ => None,
     }
 }
@@ -294,7 +300,9 @@ fn attach_accents(chars: &[crate::rich::RichChar]) -> Vec<crate::rich::RichChar>
         if base[k].is_some() {
             continue;
         }
-        out.push(*c);
+        let marked = base.contains(&Some(k));
+        // A dotless i carries the accent of "í" ("Reykjavı́k").
+        out.push(if marked && c.c == 'ı' { crate::rich::RichChar { c: 'i', ..*c } } else { *c });
         for (i, b) in base.iter().enumerate() {
             if *b == Some(k) {
                 let m = combining(chars[i].c).unwrap_or(chars[i].c);
@@ -1317,6 +1325,16 @@ fn is_list_marker(t: &str) -> bool {
     }
 }
 
+/// The last token of `prev` is a URL or DOI cut at a line end, and `next`
+/// carries on with it: no space between them.
+fn url_continues(prev: &str, next: &str) -> bool {
+    let Some(tok) = prev.split_whitespace().last() else { return false };
+    let url = tok.contains("://") || tok.starts_with("www.") || tok.starts_with("doi:") || tok.starts_with("doi.org") || (tok.starts_with("10.") && tok.contains('/'));
+    let open_end = tok.ends_with(['/', '.', '_', '-', '=', '?', '&', '#']);
+    let first = next.trim_start().chars().next();
+    url && open_end && first.is_some_and(|c| !c.is_uppercase() && !c.is_whitespace())
+}
+
 /// Join text that ends in a hyphen to the text that follows it (the next line,
 /// or the next part of a paragraph): without a space, dropping the hyphen of a
 /// word broken in two and keeping that of a compound. Returns false, and does
@@ -1327,13 +1345,17 @@ fn join_hyphenated(prev: &mut Vec<Span>, next: &str, lex: &hyphen::Lexicon) -> b
     }
     let Some(s) = prev.last_mut() else { return false };
     let t = s.text.trim_end();
-    let Some(h) = t.chars().last().filter(|&c| hyphen::is_hyphen(c)) else { return false };
+    let Some(h) = t.chars().last().filter(|&c| hyphen::is_hyphen(c) || c == '–') else { return false };
     let before = t[..t.len() - h.len_utf8()].chars().last();
     if !before.is_some_and(char::is_alphanumeric) || next.trim_start().is_empty() {
         return false;
     }
     let keep = match (hyphen::word_before_hyphen(t), hyphen::word_after(next)) {
+        // An en dash between words or numbers ("lithosphere–asthenosphere") stays.
+        _ if h == '–' => true,
         _ if h == '\u{00AD}' => false,
+        // "GE-" / "OFON": the joined word is in the document.
+        (Some(a), None) if hyphen::word_after_any(next).is_some_and(|b| lex.has_word(&format!("{a}{b}"))) => false,
         (Some(a), Some(b)) => lex.keep_hyphen(a, b),
         // Before a capital or a digit ("Plio-" / "Pleistocene", "1980-" / "1990"),
         // or after a digit ("SO2-" / "rich"): a compound.
@@ -1348,7 +1370,7 @@ fn join_hyphenated(prev: &mut Vec<Span>, next: &str, lex: &hyphen::Lexicon) -> b
 }
 
 /// Split a unit's characters into styled spans.
-fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: bool, lex: &hyphen::Lexicon) -> Vec<Span> {
+fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: bool, scan: bool, lex: &hyphen::Lexicon) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     let mut prev_last: Option<char> = None;
     for (li, l) in u.lines.iter().enumerate() {
@@ -1357,6 +1379,13 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
         let first = l.chars.first().map(|c| c.c);
         if li > 0 && !vertical && join_hyphenated(&mut spans, &l.text(), lex) {
             // Joined at a hyphen, without a space.
+        } else if li > 0 && !vertical && url_continues(&spans_text(&spans), &l.text()) {
+            // A URL or DOI broken at a line end ("https://doi." / "org/10…").
+            while let Some(s) = spans.last_mut()
+                && s.text.ends_with(' ')
+            {
+                s.text.pop();
+            }
         } else if li > 0 {
             let join_tight = vertical || matches!((prev_last, first), (Some(a), Some(b)) if is_cjk(a) || is_cjk(b));
             if !join_tight
@@ -1371,7 +1400,8 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
                 }
             }
         }
-        for c in &attach_accents(&l.chars) {
+        let cleaned = if vertical { l.chars.clone() } else { chars::clean_line(&l.chars, fonts, scan, is_math_font) };
+        for c in &attach_accents(&cleaned) {
             let f = fonts.get(c.font as usize);
             let small = c.size < med * 0.8 && !vertical;
             let cy = (c.bbox.y0 + c.bbox.y1) * 0.5;
@@ -1386,7 +1416,9 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
             let link = links.iter().find(|(r, _)| r.contains(cx, ccy)).map(|(_, u)| u.clone());
             match spans.last_mut() {
                 Some(s) if s.style == style && s.link == link => s.text.push(c.c),
-                Some(s) if c.c == ' ' && s.link == link => s.text.push(' '),
+                // A space after a superscript or subscript is a plain space (trimmed
+                // off the superscript below it would be lost: "km3of").
+                Some(s) if c.c == ' ' && s.link == link && !(s.style.sup || s.style.sub) => s.text.push(' '),
                 _ => spans.push(Span { text: c.c.to_string(), style, link }),
             }
         }
@@ -1904,7 +1936,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     && next.kind == UnitKind::Text
                     && caption_kind(&next.text()) == Some(false)
                 {
-                    caption = spans_of(next, &p.rich.fonts, &p.links, vertical, &lex);
+                    caption = spans_of(next, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
                     if let Some(img) = crop(u.bbox, opts.image_scale, &mut doc) {
                         doc.nodes.push(Node::Figure { image: img, caption });
                         last_caption = Some((doc.nodes.len() - 1, next.size(), next.bbox, p.page));
@@ -1920,6 +1952,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             let text = u.text();
             let size = u.size();
+            // Glyphs of a badge or icon font, all undecodable.
+            if chars::is_junk(&text) {
+                i += 1;
+                continue;
+            }
             let in_front = pi == 0 && !body_started;
             // The masthead above the title of the first page, and publisher
             // boilerplate: notes, outside the running text.
@@ -1929,7 +1966,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 Some(i) != page_title && u.bbox.y1 <= top + 2.0 && (size < title_size_pt * 0.95 || (text.split_whitespace().count() <= 5 && !text.chars().any(is_cjk)))
             });
             if masthead || is_boilerplate(&text) {
-                doc.nodes.push(Node::Footnote { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, &lex) });
+                doc.nodes.push(Node::Footnote { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex) });
                 i += 1;
                 continue;
             }
@@ -1940,7 +1977,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             match caption_kind(&text).filter(|&table| !(running_text && table && !leads_to_table)) {
                 Some(true) => {
                     // Table: caption, then small-font units until body text resumes.
-                    let caption = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
+                    let caption = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
                     let mut j = i + 1;
                     let mut region: Option<RectF> = None;
                     let mut rows = Vec::new();
@@ -1971,7 +2008,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
                 Some(false) => {
                     // Figure caption whose figure came earlier: attach if possible.
-                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
+                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
                     if let Some(Node::Figure { caption, .. }) = doc.nodes.last_mut()
                         && caption.is_empty()
                     {
@@ -1985,7 +2022,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
                 None if u.class == Some(CAPTION) => {
                     // The rest of a caption ("(b) PPL image of ...") belongs to the float before it.
-                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
+                    let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
                     let last = doc.nodes.len().saturating_sub(1);
                     match doc.nodes.last_mut() {
                         Some(Node::Figure { caption, .. } | Node::Table { caption, .. }) => {
@@ -2017,7 +2054,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 && !caption.is_empty()
                 && !ends_sentence(&spans_text(caption))
             {
-                let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
+                let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
                 if !join_hyphenated(caption, &text, &lex) {
                     caption.push(Span { text: " ".into(), style: Style::default(), link: None });
                 }
@@ -2156,14 +2193,14 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             // Author lines in the front matter are no headings.
             if in_front && level.is_some() && Some(i) != page_title && !is_front_heading(&text) && is_byline(&text) {
-                doc.nodes.push(Node::Paragraph { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, &lex) });
+                doc.nodes.push(Node::Paragraph { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex) });
                 i += 1;
                 continue;
             }
             if level.is_some() && (is_front_heading(&text) || heading_number(&text).is_some()) {
                 body_started = true;
             }
-            let mut spans = spans_of(u, &p.rich.fonts, &p.links, vertical, &lex);
+            let mut spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
             // Run-in heading: "4.1.1. Porous flow bands  Body text..." in one block.
             if level.is_none() {
                 let lead: usize = spans.iter().take_while(|s| s.style.bold || s.style.italic || s.text.trim().is_empty()).count();
