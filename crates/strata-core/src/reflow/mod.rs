@@ -391,7 +391,8 @@ fn ocr_layer_quality(p: &RichPage) -> f32 {
         for l in lines {
             let t = l.text();
             let n = t.chars().filter(|c| !c.is_whitespace()).count();
-            if n == 0 {
+            // Too short to judge (OCR layers can hold a word or a character per line).
+            if n < 4 {
                 continue;
             }
             total += n;
@@ -407,7 +408,7 @@ fn ocr_layer_quality(p: &RichPage) -> f32 {
                     let letters = w.chars().filter(|c| c.is_alphabetic()).count();
                     letters >= 3 && letters * 10 >= w.chars().count() * 7
                 });
-                prose_like(&t) || (words.len() >= 2 && wordy.count() * 2 >= words.len())
+                prose_like(&t) || (!words.is_empty() && wordy.count() * 2 >= words.len())
             };
             if plausible {
                 good += n;
