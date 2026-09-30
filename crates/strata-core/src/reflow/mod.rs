@@ -6,7 +6,8 @@
 //!    repeated header/footer lines, writing direction);
 //! 2. per page: drop headers/footers, turn images and vector clusters into
 //!    figures, order units by XY-cut, classify each unit;
-//! 3. rebuild reference lists entry by entry ([`refs`]);
+//! 3. rebuild reference lists entry by entry ([`refs`]), and cut other lists set with a
+//!    hanging indent (glossaries, numbered items) into their entries ([`entries`]);
 //! 4. merge paragraphs split by column or page breaks.
 //!
 //! For horizontal text, the layout model of PyMuPDF Layout ([`crate::layout`])
@@ -16,6 +17,7 @@
 //! for pages without its labels.
 
 mod chars;
+mod entries;
 mod hyphen;
 mod order;
 pub mod output;
@@ -752,11 +754,19 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
 /// tops differ: sorting by the top put "3, Kentaro" before "Keishiro"), top to
 /// bottom, each row left to right.
 fn sort_rows(lines: &mut [RichLine]) {
-    lines.sort_by(|a, b| (a.bbox.y0 + a.bbox.y1).total_cmp(&(b.bbox.y0 + b.bbox.y1)));
+    let order = row_order(lines);
+    let sorted: Vec<RichLine> = order.into_iter().map(|i| lines[i].clone()).collect();
+    lines.clone_from_slice(&sorted);
+}
+
+/// The indices of the lines in reading order (see [`sort_rows`]).
+fn row_order(lines: &[RichLine]) -> Vec<usize> {
+    let mut by_y: Vec<usize> = (0..lines.len()).collect();
+    by_y.sort_by(|&a, &b| (lines[a].bbox.y0 + lines[a].bbox.y1).total_cmp(&(lines[b].bbox.y0 + lines[b].bbox.y1)));
     let mut rows: Vec<(f32, f32)> = Vec::new();
-    let mut row_of: Vec<usize> = Vec::with_capacity(lines.len());
-    for l in lines.iter() {
-        let b = l.bbox;
+    let mut keyed: Vec<(usize, f32, usize)> = Vec::with_capacity(lines.len());
+    for &i in &by_y {
+        let b = lines[i].bbox;
         match rows.last_mut() {
             Some((y0, y1)) if b.y1.min(*y1) - b.y0.max(*y0) >= 0.5 * b.height().min(*y1 - *y0) => {
                 *y0 = y0.min(b.y0);
@@ -764,13 +774,10 @@ fn sort_rows(lines: &mut [RichLine]) {
             }
             _ => rows.push((b.y0, b.y1)),
         }
-        row_of.push(rows.len() - 1);
+        keyed.push((rows.len() - 1, b.x0, i));
     }
-    let mut keyed: Vec<(usize, f32, RichLine)> = lines.iter().zip(row_of).map(|(l, r)| (r, l.bbox.x0, l.clone())).collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    for (slot, (_, _, l)) in lines.iter_mut().zip(keyed) {
-        *slot = l;
-    }
+    keyed.into_iter().map(|k| k.2).collect()
 }
 
 /// A drop cap (a large initial letter set beside the first lines of a
@@ -1588,6 +1595,12 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         }
     }
     out.extend(merged.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No }));
+    // Lists are cut into entries last: the entries are small units, which the figure
+    // labels above would take for labels of a drawing nearby.
+    if !vertical {
+        let debug = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()) == Some(p.page + 1);
+        out = entries::split_hanging(out, p.scan, &p.rich.fonts, debug("STRATA_DEBUG_ENTRIES"));
+    }
     (out, manuscript)
 }
 
@@ -2149,6 +2162,12 @@ fn is_note(u: &Unit, units: &[Unit], i: usize, text: &str, body: f32) -> bool {
     if (mark || note_opening(text)) && u.lines.len() <= 8 {
         return true;
     }
+    // An entry of a bibliography that the extractor ran together (it has a year) is small
+    // like a note, but has no note's place at the foot of the page. (A numbered one may be
+    // a note: "1 Department of…", "3 Ferroan talc… (Chopin, 1981)".)
+    if u.refs == refs::Ref::Start && refs::has_year(text) && !text.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
     // Running text resumed below a figure starts in the middle of a sentence; a
     // note does not (the type sizes of scanned text are too rough to tell them).
     if text.trim_start().starts_with(char::is_lowercase) {
@@ -2642,6 +2661,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     "{:?} [{:.0},{:.0},{:.0},{:.0}] lines={} size={:.1} class={:?} group={:?} | {head} … {tail}",
                     u.kind, u.bbox.x0, u.bbox.y0, u.bbox.x1, u.bbox.y1, u.lines.len(), u.size(), u.class.map(|c| strata_ocr::layout::CLASSES[c]), u.group
                 );
+                // `STRATA_DEBUG_LINES` too: every line with its box.
+                if std::env::var("STRATA_DEBUG_LINES").is_ok() {
+                    for l in &u.lines {
+                        eprintln!("    [{:.0},{:.0},{:.0},{:.0}] {}", l.bbox.x0, l.bbox.y0, l.bbox.x1, l.bbox.y1, l.text());
+                    }
+                }
             }
         }
         doc.fill_anchors((p.page, 0.0));
@@ -2741,7 +2766,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             // Entries of a reference list: a paragraph each. The rest of an entry
             // that a column or page break cut joins it.
-            if u.refs != refs::Ref::No {
+            if matches!(u.refs, refs::Ref::Entry | refs::Ref::Cont) {
                 let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
                 match ref_node {
                     Some(ix) if u.refs == refs::Ref::Cont && matches!(doc.nodes.get(ix), Some(Node::Paragraph { .. })) => {
@@ -3258,6 +3283,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             && u.bbox.y0 - l.bbox.y1 < body * 0.8
                     });
                 let merge = match prev.map(|ix| &doc.nodes[ix]) {
+                    // The first lines of an entry start a paragraph of their own.
+                    _ if u.refs == refs::Ref::Start => false,
                     // A reference entry is not continued by what follows the list.
                     Some(Node::Paragraph { .. }) if prev == ref_node => false,
                     Some(Node::Paragraph { spans: prev_spans }) => {

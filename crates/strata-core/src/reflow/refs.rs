@@ -40,6 +40,10 @@ pub(super) enum Ref {
     Entry,
     /// The rest of the entry before it, across a column or page break.
     Cont,
+    /// The first lines of an entry of another kind of list (a glossary, a hanging-indent
+    /// list; see [`super::entries`]): a paragraph or list item of its own, which never
+    /// carries on the paragraph before.
+    Start,
 }
 
 /// What the pass needs to know of the page.
@@ -149,7 +153,7 @@ fn find_year(t: &str) -> Option<usize> {
 }
 
 /// The text has a year or the words that stand for one.
-fn has_year(t: &str) -> bool {
+pub(super) fn has_year(t: &str) -> bool {
     let l = t.to_lowercase();
     find_year(t).is_some() || l.contains("in press") || l.contains("submitted") || l.contains("forthcoming") || l.contains("n.d.")
 }
