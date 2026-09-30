@@ -390,6 +390,65 @@ pub(crate) fn scanned_with_text(p: &RichPage) -> bool {
         && p.blocks.iter().map(|b| if let RichBlock::Text { lines, .. } = b { lines.iter().map(|l| l.chars.len()).sum() } else { 0 }).sum::<usize>() > 100
 }
 
+/// Bytes of a PDF page's content streams and form XObjects as stored: how much the
+/// page draws, known before running it (0 for other formats).
+fn content_bytes(eng: &Engine, page: i32) -> usize {
+    let Engine::Pdf(pdf) = eng else { return 0 };
+    let Ok(obj) = pdf.find_page(page) else { return 0 };
+    let length = |o: &mupdf::pdf::PdfObject| o.get_dict("Length").ok().flatten().and_then(|l| l.as_int().ok()).unwrap_or(0).max(0) as usize;
+    let mut n = 0;
+    if let Ok(Some(c)) = obj.get_dict("Contents") {
+        if c.is_array().unwrap_or(false) {
+            n += (0..c.len().unwrap_or(0) as i32).filter_map(|i| c.get_array(i).ok().flatten()).map(|s| length(&s)).sum::<usize>();
+        } else {
+            n += length(&c);
+        }
+    }
+    if let Ok(Some(xobjects)) = obj.get_dict_inheritable("Resources").map(|r| r.and_then(|r| r.get_dict("XObject").ok().flatten())) {
+        for i in 0..xobjects.dict_len().unwrap_or(0) as i32 {
+            if let Ok(Some(x)) = xobjects.get_dict_val(i)
+                && x.get_dict("Subtype").ok().flatten().and_then(|t| t.as_name().ok()).is_some_and(|t| t == b"Form")
+            {
+                n += length(&x);
+            }
+        }
+    }
+    n
+}
+
+/// Drop characters too small to see (set at size zero, all on one point: a caption
+/// that a scanned page's text layer hid this way came out a letter per line).
+fn drop_invisible_chars(p: &mut RichPage) {
+    for b in &mut p.blocks {
+        if let RichBlock::Text { lines, .. } = b {
+            for l in lines.iter_mut() {
+                l.chars.retain(|c| c.size >= 1.0);
+            }
+            lines.retain(|l| !l.chars.is_empty());
+        }
+    }
+    p.blocks.retain(|b| !matches!(b, RichBlock::Text { lines, .. } if lines.is_empty()));
+}
+
+/// Drop the spaces that OCR text layers put at the start and end of lines: they
+/// would read as a paragraph indent, and keep a space where a line-end hyphen is
+/// joined ("char acteristics").
+fn trim_line_spaces(p: &mut RichPage) {
+    for b in &mut p.blocks {
+        if let RichBlock::Text { lines, .. } = b {
+            for l in lines.iter_mut() {
+                while l.chars.last().is_some_and(|c| c.c.is_whitespace()) {
+                    l.chars.pop();
+                }
+                // (An ideographic space opens a Japanese paragraph: it stays.)
+                let lead = l.chars.iter().take_while(|c| c.c.is_whitespace() && c.c != '\u{3000}').count();
+                l.chars.drain(..lead);
+            }
+            lines.retain(|l| !l.chars.is_empty());
+        }
+    }
+}
+
 /// A page's text, a line per line.
 pub(crate) fn page_text(p: &RichPage) -> String {
     let mut s = String::new();
@@ -1883,7 +1942,10 @@ fn open_end(t: &str) -> bool {
 /// with a comma or semicolon.
 fn continues_strongly(prev: &str, next: &str) -> bool {
     let Some(first) = next.trim_start().chars().next() else { return false };
-    !ends_sentence(prev) && !next.starts_with(['\u{3000}', ' ']) && (first.is_lowercase() || matches!(first, ',' | ';'))
+    // A closing bracket ends a citation or a figure reference as often as a
+    // sentence ("… (figs. 3A, 3B)" + "reveals that …"): the next word decides.
+    let bracket = prev.trim_end().ends_with(')');
+    (!ends_sentence(prev) || bracket) && !next.starts_with(['\u{3000}', ' ']) && (first.is_lowercase() || matches!(first, ',' | ';'))
 }
 
 /// `next` may carry on `prev`: it starts with a CJK character, a digit or an
@@ -1954,6 +2016,11 @@ fn is_note(u: &Unit, units: &[Unit], i: usize, text: &str, body: f32) -> bool {
     let mark = first.chars.first().is_some_and(|c| c.c.is_ascii_digit() && c.size < line_size(first) * 0.8);
     if (mark || note_opening(text)) && u.lines.len() <= 8 {
         return true;
+    }
+    // Running text resumed below a figure starts in the middle of a sentence; a
+    // note does not (the type sizes of scanned text are too rough to tell them).
+    if text.trim_start().starts_with(char::is_lowercase) {
+        return false;
     }
     let low = u.bbox.y0 > page_h * 0.6;
     let smaller = size <= body * 0.94;
@@ -2217,10 +2284,17 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         // Without table hunting: it takes the indent of a paragraph's first line
         // for a table column and cuts the first character off into a cell of its
         // own (Japanese text set with an indent), and reflow does not use its grid.
-        let flags = if std::env::var("STRATA_TABLE_HUNT").is_ok() { reflow_flags() } else { reflow_flags() & !mupdf::TextPageFlags::TABLE_HUNT };
+        let mut flags = if std::env::var("STRATA_TABLE_HUNT").is_ok() { reflow_flags() } else { reflow_flags() & !mupdf::TextPageFlags::TABLE_HUNT };
+        // MuPDF's segmentation takes time that grows faster than the number of
+        // vector paths: a map of 1.9 million paths took 87 s with it and 4 s without.
+        // Such pages are pictures; they go without it.
+        if content_bytes(&eng, p as i32) > 4 << 20 {
+            flags &= !mupdf::TextPageFlags::SEGMENT;
+        }
         let tp = page.to_text_page(flags | mupdf::TextPageFlags::COLLECT_VECTORS);
         let Ok(tp) = tp else { continue };
         let mut rich = RichPage::from_page(&page, &tp, b.width(), b.height());
+        drop_invisible_chars(&mut rich);
         // OCR text replaces an unusable text layer.
         let mut from_ocr = false;
         if let Some(o) = ocr.get(p as u32)
@@ -2246,6 +2320,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             .unwrap_or_default();
         let ocr = from_ocr || needs_ocr(&rich).is_some();
         let scan = ocr || scanned_with_text(&rich);
+        if scan {
+            trim_line_spaces(&mut rich);
+        }
         // Display lists are made when needed and dropped soon: kept for every page,
         // the images they hold fill MuPDF's store, and every later allocation then
         // scans it (a 27-page paper with large figures took minutes).
