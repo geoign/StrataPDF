@@ -6,7 +6,8 @@
 //!    repeated header/footer lines, writing direction);
 //! 2. per page: drop headers/footers, turn images and vector clusters into
 //!    figures, order units by XY-cut, classify each unit;
-//! 3. merge paragraphs split by column or page breaks.
+//! 3. rebuild reference lists entry by entry ([`refs`]);
+//! 4. merge paragraphs split by column or page breaks.
 //!
 //! For horizontal text, the layout model of PyMuPDF Layout ([`crate::layout`])
 //! labels each line (heading, caption, figure text, running head, footnote...);
@@ -18,6 +19,7 @@ mod chars;
 mod hyphen;
 mod order;
 pub mod output;
+mod refs;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -437,6 +439,8 @@ struct Unit {
     class: Option<usize>,
     /// Layout region of most of its text.
     group: Option<usize>,
+    /// Its part in a reference list (see [`refs`]).
+    refs: refs::Ref,
 }
 
 impl Unit {
@@ -526,7 +530,7 @@ fn majority_class(lines: &[(RichLine, Option<(usize, usize)>)]) -> Option<(usize
 /// Blocks of one layout region (the extractor splits some paragraphs, captions
 /// and reference entries into a block per line) become one unit, if they share
 /// a column. A reference list taken for one region is split into its entries
-/// again by [`regroup_references`].
+/// again by [`refs::Refs::page`].
 fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
     let mut out: Vec<Unit> = Vec::with_capacity(units.len());
     for u in units {
@@ -553,101 +557,6 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
         }
         out.push(u);
     }
-    out
-}
-
-/// "Almendros, J., Wilcock, W., ..." or "Av´e Lallemant, H.G., ...": the start of a
-/// reference entry (a surname, a comma, then initials).
-fn author_start(t: &str) -> bool {
-    let mut words = t.split_whitespace();
-    // The surname may have several words ("Av´e Lallemant,", "de Ronde,").
-    for _ in 0..3 {
-        let Some(w) = words.next() else { return false };
-        if w.ends_with(',') && w.chars().filter(|c| c.is_alphabetic()).count() >= 2 {
-            return words.next().is_some_and(|i| {
-                let letters: Vec<char> = i.chars().filter(|c| c.is_alphabetic()).collect();
-                !letters.is_empty() && letters.iter().all(|c| c.is_uppercase()) && letters.len() <= 3 && i.contains('.')
-            });
-        }
-    }
-    false
-}
-
-/// Reference lists set with a hanging indent, rebuilt from their lines: the
-/// extractor cuts them into blocks that do not follow the entries (a block per
-/// continuation line, or every other line of a column in one block). A column
-/// where at least three lines start with a name and initials at the same left
-/// edge is such a list; its blocks of the same type size whose lines either
-/// start an entry at that edge or are indented are pooled, their lines sorted
-/// top to bottom, and each line at the edge starts an entry. Body text (plain
-/// lines at the edge), headings and entries without personal names keep their blocks.
-fn regroup_references(units: Vec<Unit>) -> Vec<Unit> {
-    let text: Vec<usize> = (0..units.len()).filter(|&i| units[i].kind == UnitKind::Text && !units[i].lines.is_empty()).collect();
-    let starts: Vec<(RectF, f32)> = text
-        .iter()
-        .flat_map(|&i| units[i].lines.iter().map(move |l| (l, i)))
-        .filter(|(l, _)| author_start(&l.text()))
-        .map(|(l, i)| (l.bbox, units[i].size()))
-        .collect();
-    // Left edges shared by at least three entry starts.
-    let mut edges: Vec<(f32, f32, f32, usize)> = Vec::new(); // left, right, size, count
-    for (b, size) in &starts {
-        match edges.iter_mut().find(|e| (e.0 - b.x0).abs() < 1.5) {
-            Some(e) => {
-                e.1 = e.1.max(b.x1);
-                e.3 += 1;
-            }
-            None => edges.push((b.x0, b.x1, *size, 1)),
-        }
-    }
-    let edges: Vec<(f32, f32, f32)> = edges.into_iter().filter(|e| e.3 >= 3).map(|e| (e.0, e.1, e.2)).collect();
-    if edges.is_empty() {
-        return units;
-    }
-    let mut slots: Vec<Option<Unit>> = units.into_iter().map(Some).collect();
-    let mut rebuilt: Vec<Unit> = Vec::new();
-    for (left, right, size) in edges {
-        let tol = size * 0.5;
-        let at_edge = |x: f32| (x - left).abs() < tol;
-        let indented = |x: f32| x - left > tol && x - left < size * 4.0;
-        // Blocks of the list: every line at the edge or the indent, same size, within the column.
-        let members: Vec<usize> = text
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let Some(u) = slots[i].as_ref() else { return false };
-                !matches!(u.class, Some(TITLE | SECTION_HEADER | PICTURE | CAPTION))
-                    && (u.size() - size).abs() <= size * 0.1
-                    && u.lines.iter().all(|l| (at_edge(l.bbox.x0) || indented(l.bbox.x0)) && l.bbox.x1 <= right + size * 2.0)
-                    // Lines at the edge mostly start entries (body text has plain lines
-                    // there; some entries start with an organisation's name).
-                    && {
-                        let edge: Vec<&RichLine> = u.lines.iter().filter(|l| at_edge(l.bbox.x0)).collect();
-                        edge.iter().filter(|l| author_start(&l.text())).count() * 5 >= edge.len() * 3
-                    }
-            })
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        let first = members[0];
-        let (class, group) = slots[first].as_ref().map(|u| (u.class, u.group)).unwrap_or((None, None));
-        let mut lines: Vec<RichLine> = members.iter().filter_map(|&i| slots[i].take()).flat_map(|u| u.lines).collect();
-        lines.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0).then(a.bbox.x0.total_cmp(&b.bbox.x0)));
-        let mut entries: Vec<Vec<RichLine>> = Vec::new();
-        for l in lines {
-            match entries.last_mut() {
-                Some(e) if !at_edge(l.bbox.x0) => e.push(l),
-                _ => entries.push(vec![l]),
-            }
-        }
-        for e in entries {
-            let bbox = e.iter().skip(1).fold(e[0].bbox, |a, l| a.union(&l.bbox));
-            rebuilt.push(Unit { kind: UnitKind::Text, bbox, lines: e, class, group });
-        }
-    }
-    let mut out: Vec<Unit> = slots.into_iter().flatten().collect();
-    out.extend(rebuilt);
     out
 }
 
@@ -829,7 +738,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                     if run.iter().any(|(l, _)| l.chars.iter().any(|c| !c.c.is_whitespace())) {
                         let bbox = run.iter().skip(1).fold(run[0].0.bbox, |a, (l, _)| a.union(&l.bbox));
                         let cg = majority_class(&run);
-                        units.push(Unit { kind: UnitKind::Text, bbox, lines: run.into_iter().map(|(l, _)| l).collect(), class: cg.map(|c| c.0), group: cg.map(|c| c.1) });
+                        units.push(Unit { kind: UnitKind::Text, bbox, lines: run.into_iter().map(|(l, _)| l).collect(), class: cg.map(|c| c.0), group: cg.map(|c| c.1), refs: refs::Ref::No });
                     }
                 }
             }
@@ -837,7 +746,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                 // A page-sized image under a text layer is the scan of an OCRed page.
                 let background = bbox.width() * bbox.height() > page_area * 0.7 && text_chars > 100;
                 if !background && bbox.width() * bbox.height() > page_area * 0.005 {
-                    units.push(Unit { kind: UnitKind::Figure, bbox: *bbox, lines: Vec::new(), class: None, group: None });
+                    units.push(Unit { kind: UnitKind::Figure, bbox: *bbox, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No });
                 }
             }
             _ => {}
@@ -853,11 +762,8 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         !numbers.contains(&(k - 1))
     });
     let mut units = merge_regions(units);
-    if std::env::var("STRATA_NO_REGROUP").is_err() {
-        units = regroup_references(units);
-    }
     for r in vector_figures(&p.rich.blocks, page_area) {
-        units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None });
+        units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No });
     }
     // Merge overlapping figures; absorb labels inside figures.
     let mut figs: Vec<RectF> = Vec::new();
@@ -1084,7 +990,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             *merged.last_mut().unwrap() = last.union(&o);
         }
     }
-    out.extend(merged.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None, group: None }));
+    out.extend(merged.into_iter().map(|bbox| Unit { kind: UnitKind::Figure, bbox, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No }));
     (out, manuscript)
 }
 
@@ -1619,7 +1525,7 @@ fn has_equation_number(t: &str) -> bool {
 /// fragments that sit on neighbouring lines into one unit.
 fn merge_display_math(units: Vec<Unit>, fonts: &[FontInfo], body: f32) -> Vec<Unit> {
     let mathish = |u: &Unit| {
-        if u.kind != UnitKind::Text || u.lines.len() > 4 {
+        if u.kind != UnitKind::Text || u.lines.len() > 4 || u.refs != refs::Ref::No {
             return false;
         }
         let t = u.text();
@@ -1793,6 +1699,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // section (or a long paragraph); before it, on the first page, lie the title,
     // authors and affiliations.
     let mut body_started = false;
+    // The reference section (state carried across pages) and the node of its last entry.
+    let mut refs = refs::Refs::default();
+    let mut ref_node: Option<usize> = None;
     for (pi, p) in pages.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
@@ -1809,6 +1718,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 ordered.push(u);
             }
         }
+        if !vertical && std::env::var("STRATA_NO_REFS").is_err() {
+            ordered = refs.page(ordered, &refs::Cx { page: p.page, body, height: p.rich.height, scan: p.scan, fonts: &p.rich.fonts, lex: Some(&lex) });
+        }
         if !vertical {
             ordered = merge_display_math(ordered, &p.rich.fonts, body);
         }
@@ -1818,7 +1730,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         if !vertical {
             let mut out: Vec<Unit> = Vec::with_capacity(ordered.len());
             for mut u in ordered.drain(..) {
-                while u.kind == UnitKind::Text && u.lines.len() >= 2 {
+                while u.kind == UnitKind::Text && u.refs == refs::Ref::No && u.lines.len() >= 2 {
                     let first = &u.lines[0];
                     let ft = first.text();
                     let ft = ft.trim();
@@ -1827,11 +1739,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         break;
                     }
                     let rest = u.lines.split_off(1);
-                    let head = Unit { kind: UnitKind::Text, bbox: u.lines[0].bbox, lines: u.lines, class: u.class, group: u.group };
+                    let head = Unit { kind: UnitKind::Text, bbox: u.lines[0].bbox, lines: u.lines, class: u.class, group: u.group, refs: refs::Ref::No };
                     out.push(head);
                     forced_heading.push(true);
                     let bbox = rest.iter().skip(1).fold(rest[0].bbox, |a, l| a.union(&l.bbox));
-                    u = Unit { kind: UnitKind::Text, bbox, lines: rest, class: u.class, group: u.group };
+                    u = Unit { kind: UnitKind::Text, bbox, lines: rest, class: u.class, group: u.group, refs: refs::Ref::No };
                 }
                 out.push(u);
                 forced_heading.push(false);
@@ -1954,6 +1866,29 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             let size = u.size();
             // Glyphs of a badge or icon font, all undecodable.
             if chars::is_junk(&text) {
+                i += 1;
+                continue;
+            }
+            // Entries of a reference list: a paragraph each. The rest of an entry
+            // that a column or page break cut joins it.
+            if u.refs != refs::Ref::No {
+                let spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
+                match ref_node {
+                    Some(ix) if u.refs == refs::Ref::Cont && matches!(doc.nodes.get(ix), Some(Node::Paragraph { .. })) => {
+                        if let Node::Paragraph { spans: prev } = &mut doc.nodes[ix] {
+                            let cjk = spans_text(prev).chars().last().is_some_and(is_cjk) || text.trim_start().chars().next().is_some_and(is_cjk);
+                            if !cjk && !join_hyphenated(prev, &text, &lex) {
+                                prev.push(Span { text: " ".into(), style: Style::default(), link: None });
+                            }
+                            prev.extend(spans);
+                        }
+                    }
+                    _ => {
+                        doc.nodes.push(Node::Paragraph { spans });
+                        ref_node = Some(doc.nodes.len() - 1);
+                    }
+                }
+                last_para = None;
                 i += 1;
                 continue;
             }
@@ -2190,6 +2125,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 level = Some(heading_number(&text).map_or(3, |d| (d + 1).min(6)));
             } else if level.is_none() && caps {
                 level = Some(heading_number(&text).map_or(2, |d| (d + 1).min(6)));
+            } else if level.is_none() && u.lines.len() <= 2 && refs::is_refs_heading(&text) {
+                level = Some(2);
             }
             // Author lines in the front matter are no headings.
             if in_front && level.is_some() && Some(i) != page_title && !is_front_heading(&text) && is_byline(&text) {
@@ -2297,6 +2234,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     .map(|(ix, _)| ix);
                 let (at_top, at_bottom) = column_edges(&ordered, i);
                 let merge = match prev.map(|ix| &doc.nodes[ix]) {
+                    // A reference entry is not continued by what follows the list.
+                    Some(Node::Paragraph { .. }) if prev == ref_node => false,
                     Some(Node::Paragraph { spans: prev_spans }) => {
                         if vertical {
                             let (top, _) = vertical_text_area(&ordered, body);
@@ -2436,12 +2375,12 @@ mod tests {
 
     #[test]
     fn reference_starts() {
-        assert!(author_start("Almendros, J., Wilcock, W., Soule, D."));
-        assert!(author_start("Av´e Lallemant, H.G., Oldow, J.S., 2000."));
-        assert!(author_start("Arai, K., Matsuda, H."));
-        assert!(!author_start("Bru˜na, J.L."[..0].trim()));
-        assert!(!author_start("Geophysical investigation of rifting and volcanism"));
-        assert!(!author_start("In contrast, the northern part"));
+        assert!(refs::author_start("Almendros, J., Wilcock, W., Soule, D."));
+        assert!(refs::author_start("Av´e Lallemant, H.G., Oldow, J.S., 2000."));
+        assert!(refs::author_start("Arai, K., Matsuda, H."));
+        assert!(!refs::author_start("Bru˜na, J.L."[..0].trim()));
+        assert!(!refs::author_start("Geophysical investigation of rifting and volcanism"));
+        assert!(!refs::author_start("In contrast, the northern part"));
     }
 
     #[test]
