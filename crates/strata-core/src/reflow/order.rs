@@ -272,6 +272,46 @@ fn soft_columns(rects: &[RectF], lines: &[Lines], idx: &[usize], body: f32, part
 /// [`soft_columns`]). `imprecise`: the boxes come from OCR (a text layer over a
 /// scan), whose lines run into the gutter (trailing spaces, stray marks):
 /// columns may then touch or overlap by a few points.
+/// Units of one tier of vertical text in reading order: columns right to left. Pieces
+/// of one column (a run-in heading at its top and the text under it, the two lines
+/// of an inline note between two parts of a column) are read top to bottom, side by
+/// side right to left: they are one column slot, placed by its right edge.
+fn vertical_columns(rects: &[RectF], tier: &[usize], body: f32) -> Vec<usize> {
+    let n = tier.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    let narrow = |r: &RectF| r.width() <= body * 2.0;
+    for a in 0..n {
+        for b in a + 1..n {
+            let (ra, rb) = (&rects[tier[a]], &rects[tier[b]]);
+            let overlap = ra.x1.min(rb.x1) - ra.x0.max(rb.x0);
+            if narrow(ra) && narrow(rb) && overlap > 0.5 * ra.width().min(rb.width()) {
+                let (x, y) = (root(&mut parent, a), root(&mut parent, b));
+                parent[x] = y;
+            }
+        }
+    }
+    let slots: Vec<usize> = (0..n).map(|i| root(&mut parent, i)).collect();
+    let mut edge = vec![f32::NEG_INFINITY; n];
+    for i in 0..n {
+        edge[slots[i]] = edge[slots[i]].max(rects[tier[i]].x1);
+    }
+    // (Tops compared in steps of half a character: pieces side by side start together.)
+    let step = |r: &RectF| (r.y0 / (body * 0.5).max(1.0)).floor() as i64;
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let (ra, rb) = (&rects[tier[a]], &rects[tier[b]]);
+        edge[slots[b]].total_cmp(&edge[slots[a]]).then(slots[a].cmp(&slots[b])).then(step(ra).cmp(&step(rb))).then(rb.x1.total_cmp(&ra.x1))
+    });
+    order.into_iter().map(|i| tier[i]).collect()
+}
+
 pub fn reading_order(rects: &[RectF], lines: &[Lines], body: f32, vertical_text: bool, imprecise: bool) -> Vec<usize> {
     let idx: Vec<usize> = (0..rects.len()).collect();
     let mut out = Vec::with_capacity(rects.len());
@@ -292,9 +332,7 @@ fn cut(rects: &[RectF], lines: &[Lines], body: f32, idx: &[usize], part: bool, v
     if vertical_text {
         let tiers = split(rects, idx, true, MIN_GAP * 2.0);
         for tier in tiers {
-            let mut v = tier;
-            v.sort_by(|&a, &b| rects[b].x1.total_cmp(&rects[a].x1).then(rects[a].y0.total_cmp(&rects[b].y0)));
-            out.extend(v);
+            out.extend(vertical_columns(rects, &tier, body));
         }
         return;
     }
@@ -455,6 +493,22 @@ mod tests {
         // upper tier: two blocks (right one first), lower tier: one block
         let rects = [r(10.0, 10.0, 100.0, 200.0), r(120.0, 10.0, 200.0, 200.0), r(10.0, 230.0, 200.0, 400.0)];
         assert_eq!(order(&rects, true, false), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn a_run_in_heading_and_an_inline_note_are_read_down_their_column() {
+        // right column: heading at the top, text under it (its box a little further right);
+        // next column: text, a two-line inline note, text; then a last column
+        let rects = [
+            r(69.0, 68.0, 77.0, 148.0),
+            r(70.0, 162.0, 79.0, 435.0),
+            r(54.0, 59.0, 64.0, 200.0),
+            r(59.0, 202.0, 64.0, 300.0),
+            r(54.0, 202.0, 58.5, 300.0),
+            r(54.0, 302.0, 64.0, 435.0),
+            r(39.0, 58.0, 48.0, 435.0),
+        ];
+        assert_eq!(order(&rects, true, false), vec![0, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

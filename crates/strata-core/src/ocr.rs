@@ -29,6 +29,10 @@ pub struct OcrTextLine {
     pub text: String,
     pub vertical: bool,
     pub block: Option<u32>,
+    /// The engine's class of the line ("Main", "Title", "Caption", "Note",
+    /// "InlineNote", "Advert"); absent in older caches.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,6 +160,38 @@ impl PageOcr {
     }
 
     /// Structured text for reflow, with figure/table regions as image blocks.
+    /// The engine's layout of the page in the classes of the layout model: (line
+    /// box, class, region) per line, as reflow takes them from that model for pages
+    /// with a text layer. Titles become section headers, captions and notes stay
+    /// what they are, and lines inside a running head or page number region are
+    /// page headers. Empty for OCR results cached without line classes.
+    pub fn layout_classes(&self) -> Vec<(RectF, usize, usize)> {
+        use strata_ocr::layout::{CAPTION, FOOTNOTE, PAGE_FOOTER, PAGE_HEADER, SECTION_HEADER, TEXT};
+        if self.lines.iter().all(|l| l.kind.is_none()) {
+            return Vec::new();
+        }
+        let region_of = |b: &RectF| {
+            let (x, y) = ((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0);
+            self.regions.iter().find(|r| matches!(r.kind.as_str(), "Header" | "Folio") && r.bbox.x0 <= x && x <= r.bbox.x1 && r.bbox.y0 <= y && y <= r.bbox.y1).map(|r| r.kind.as_str())
+        };
+        self.lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let class = match (region_of(&l.bbox), l.kind.as_deref()) {
+                    (Some("Header"), _) => PAGE_HEADER,
+                    (Some(_), _) => PAGE_FOOTER,
+                    (None, Some("Title")) => SECTION_HEADER,
+                    (None, Some("Caption")) => CAPTION,
+                    (None, Some("Note")) => FOOTNOTE,
+                    _ => TEXT,
+                };
+                // (Lines of one text block are one region; others each their own.)
+                (l.bbox, class, l.block.map_or(10_000 + i, |b| b as usize))
+            })
+            .collect()
+    }
+
     pub fn to_rich(&self, width: f32, height: f32) -> RichPage {
         let mut blocks: Vec<RichBlock> = self
             .paragraph_blocks()
@@ -306,7 +342,7 @@ pub(crate) fn ocr_page(eng: &Engine, page: u32, ocr: &dyn OcrEngine, dpi: f32) -
         forced: false,
         engine: ocr.name().to_string(),
         vertical: res.vertical,
-        lines: res.lines.into_iter().map(|l| OcrTextLine { bbox: to_pt(l.bbox), text: l.text, vertical: l.vertical, block: l.block.map(|b| b as u32) }).collect(),
+        lines: res.lines.into_iter().map(|l| OcrTextLine { bbox: to_pt(l.bbox), text: l.text, vertical: l.vertical, block: l.block.map(|b| b as u32), kind: Some(format!("{:?}", l.kind)) }).collect(),
         regions: res.regions.into_iter().map(|r| OcrRegionInfo { bbox: to_pt(r.bbox), kind: format!("{:?}", r.kind) }).collect(),
     })
 }

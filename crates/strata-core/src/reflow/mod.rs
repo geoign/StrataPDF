@@ -2175,6 +2175,9 @@ struct LastPara {
     bbox: RectF,
     /// Type size of its last unit.
     size: f32,
+    /// Vertical text: the column its last pieces are in (the part of a column
+    /// above a two-line inline note, the note's lines, the part under it).
+    slot: RectF,
 }
 
 /// Figures and captions of one page left apart by the reading order: each
@@ -2427,12 +2430,15 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         let Ok(tp) = tp else { continue };
         let mut rich = RichPage::from_page(&page, &tp, b.width(), b.height());
         drop_invisible_chars(&mut rich);
-        // OCR text replaces an unusable text layer.
+        // OCR text replaces an unusable text layer; the engine's line classes stand in
+        // for the layout model's.
         let mut from_ocr = false;
+        let mut ocr_layout = Vec::new();
         if let Some(o) = ocr.get(p as u32)
             && (o.forced || needs_ocr(&rich).is_some())
         {
             rich = o.to_rich(b.width(), b.height());
+            ocr_layout = o.layout_classes();
             from_ocr = true;
         }
         normalize_vertical(&mut rich);
@@ -2458,7 +2464,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         // Display lists are made when needed and dropped soon: kept for every page,
         // the images they hold fill MuPDF's store, and every later allocation then
         // scans it (a 27-page paper with large figures took minutes).
-        pages.push(PageData { page: p as u32, rich, links, dl: None, ocr, scan, layout: Vec::new() });
+        pages.push(PageData { page: p as u32, rich, links, dl: None, ocr, scan, layout: ocr_layout });
         if p % 4 == 0 {
             progress(p + 1, total);
         }
@@ -3042,11 +3048,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             // A column of vertical text running down most of the text area is running
             // text, whatever size an OCR estimated for it: headings are short columns.
-            // Nor is a column of more than 30 characters or one that ends a sentence.
+            // Nor is a column of more than 30 characters, or one that ends a sentence or
+            // stops inside one (a comma, an opening bracket).
             if vertical && level.is_some() && u.lines.iter().all(|l| l.vertical) && text.chars().count() > 12 {
                 let (top, bottom) = vertical_text_area(&ordered, body);
                 let chars = text.chars().filter(|c| !c.is_whitespace()).count();
-                if (bottom > top && u.bbox.height() > (bottom - top) * 0.7) || chars > 30 || text.trim_end().ends_with(['。', '．']) {
+                if (bottom > top && u.bbox.height() > (bottom - top) * 0.7) || chars > 30 || text.trim_end().ends_with(['。', '．', '、', '，', '(', '（', '「', '『']) {
                     level = None;
                 }
             }
@@ -3236,6 +3243,20 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     })
                     .map(|(ix, _)| ix);
                 let (at_top, at_bottom) = column_edges(&ordered, i);
+                // Vertical text: the next piece of the same column, under a two-line
+                // inline note or the note's second line beside its first.
+                let same_column = vertical
+                    && last_para.as_ref().is_some_and(|l| {
+                        Some(l.node) == prev
+                            && l.page == p.page
+                            && u.bbox.width() <= body * 2.0
+                            && l.slot.width() <= body * 2.0
+                            && l.slot.x1.min(u.bbox.x1) - l.slot.x0.max(u.bbox.x0) > 0.5 * l.slot.width().min(u.bbox.width())
+                            && u.bbox.y0 >= l.bbox.y0 - 1.0
+                            // (Close under it: a run-in heading stands a character or so
+                            // above the text of its column.)
+                            && u.bbox.y0 - l.bbox.y1 < body * 0.8
+                    });
                 let merge = match prev.map(|ix| &doc.nodes[ix]) {
                     // A reference entry is not continued by what follows the list.
                     Some(Node::Paragraph { .. }) if prev == ref_node => false,
@@ -3250,7 +3271,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             let columns = bottom > top && u.lines.iter().all(|l| l.vertical);
                             // An indented column still carries on a sentence the column
                             // before left open ("…売尽し、"): a quotation set in from the top.
-                            columns && last_col_full && (!indented || !ends_sentence(&spans_text(prev_spans)))
+                            columns && (same_column || (last_col_full && (!indented || !ends_sentence(&spans_text(prev_spans)))))
                         } else {
                             let prev_text = spans_text(prev_spans);
                             // A sentence cut at the edge of a column and resumed at the top
@@ -3323,12 +3344,16 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         Some(l) if l.node == idx && u.lines.len() == 1 && text.chars().count() <= 30 => l.size,
                         _ => size,
                     };
-                    last_para = Some(LastPara { node: idx, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size });
+                    let slot = match &last_para {
+                        Some(l) if same_column => l.slot.union(&u.bbox),
+                        _ => u.bbox,
+                    };
+                    last_para = Some(LastPara { node: idx, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size, slot });
                     para_size.insert(idx, (size, p.page));
                 } else {
                     body_started |= text.chars().count() >= 400;
                     doc.nodes.push(Node::Paragraph { spans });
-                    last_para = Some(LastPara { node: doc.nodes.len() - 1, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size });
+                    last_para = Some(LastPara { node: doc.nodes.len() - 1, cut_at_edge, last_full, page: p.page, bbox: u.bbox, size, slot: u.bbox });
                     para_size.insert(doc.nodes.len() - 1, (size, p.page));
                 }
             }
