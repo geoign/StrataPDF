@@ -44,9 +44,12 @@ fn is_cjk(c: char) -> bool {
 /// inside a word are dropped, so "species-poor" and "speciespoor" agree),
 /// lowercased; each CJK character is a token of its own.
 fn tokens(s: &str) -> Vec<String> {
+    use unicode_normalization::UnicodeNormalization;
     let mut out = Vec::new();
     let mut cur = String::new();
-    let v: Vec<char> = s.chars().collect();
+    // NFC on both sides (the reflow output is NFC: compatibility ideographs,
+    // precomposed accents).
+    let v: Vec<char> = s.nfc().collect();
     for (i, &c) in v.iter().enumerate() {
         if is_cjk(c) {
             if !cur.is_empty() {
