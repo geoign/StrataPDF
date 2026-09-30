@@ -1361,12 +1361,22 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             && gap < body * 1.5
             && !out.iter().any(|u| u.bbox.x0 < band.x1 && u.bbox.x1 > band.x0 && u.bbox.y0 < band.y1 - 1.0 && u.bbox.y1 > band.y0 + 1.0)
     };
+    // Panels side by side, closer than a column gutter, with no text between.
+    let beside = |a: &RectF, b: &RectF| {
+        let v_overlap = a.y1.min(b.y1) - a.y0.max(b.y0);
+        let (left, right) = if a.x0 <= b.x0 { (a, b) } else { (b, a) };
+        let gap = right.x0 - left.x1;
+        let band = RectF { x0: left.x1, y0: a.y0.max(b.y0), x1: right.x0, y1: a.y1.min(b.y1) };
+        v_overlap > 0.6 * a.height().min(b.height())
+            && gap < body * 0.8
+            && !out.iter().any(|u| u.bbox.x0 < band.x1 - 1.0 && u.bbox.x1 > band.x0 + 1.0 && u.bbox.y0 < band.y1 && u.bbox.y1 > band.y0)
+    };
     let mut merged: Vec<RectF> = Vec::with_capacity(figs.len());
     for f in figs {
         merged.push(f);
         loop {
             let last = *merged.last().unwrap();
-            let Some(j) = (0..merged.len() - 1).find(|&j| overlap_frac(&last, &merged[j]) > 0.5 || overlap_frac(&merged[j], &last) > 0.5 || stacked(&last, &merged[j])) else { break };
+            let Some(j) = (0..merged.len() - 1).find(|&j| overlap_frac(&last, &merged[j]) > 0.5 || overlap_frac(&merged[j], &last) > 0.5 || stacked(&last, &merged[j]) || beside(&last, &merged[j])) else { break };
             let o = merged.remove(j);
             *merged.last_mut().unwrap() = last.union(&o);
         }
@@ -1996,6 +2006,9 @@ fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, Re
         if let Some(f) = empty_fig(doc, k)
             && ((f.width() * f.height() < page_area * 0.02 && (f.y1 < height * 0.12 || f.y0 > height * 0.92))
                 || f.width() * f.height() < page_area * 0.012
+                // A thin strip (a rotated watermark, a rule, a colour bar).
+                || f.height() > f.width() * 8.0
+                || f.width() > f.height() * 8.0
                 || title_top.is_some_and(|t| f.y1 <= t + 2.0))
         {
             doc.nodes[k] = Node::Paragraph { spans: Vec::new() };
@@ -2411,15 +2424,21 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         // shown as images until OCR supplies text; so are pages whose text is
         // mostly turned by 90 degrees (landscape tables and figures), which the
         // reading order cannot follow.
-        let (mut turned, mut upright) = (0usize, 0usize);
+        let (mut turned, mut upright, mut turned_lines) = (0usize, 0usize, 0usize);
         for b in &p.rich.blocks {
             if let RichBlock::Text { lines, .. } = b {
                 for l in lines {
-                    if !l.vertical && l.dir[1].abs() > 0.5 { turned += l.chars.len() } else { upright += l.chars.len() }
+                    if !l.vertical && l.dir[1].abs() > 0.5 {
+                        turned += l.chars.len();
+                        turned_lines += 1;
+                    } else {
+                        upright += l.chars.len()
+                    }
                 }
             }
         }
-        let rotated = (!vertical && turned > 200 && turned > upright * 2).then(|| "横向きに組まれたページ（表・図）".to_string());
+        // (Lines of text or table rows: labels of an upright map are short.)
+        let rotated = (!vertical && turned > 200 && turned > upright * 2 && turned >= turned_lines * 15).then(|| "横向きに組まれたページ（表・図）".to_string());
         // A text layer over a scan (not ours) too poor to read: mostly garbage from
         // figures or a bad recognition. The page image reads better.
         let poor = (p.scan && !p.ocr && ocr_layer_quality(&p.rich) < 0.4).then(|| "OCR テキスト層の品質が低いページ".to_string());
