@@ -2017,6 +2017,48 @@ fn has_equation_number(t: &str) -> bool {
         })
 }
 
+/// A numbered display equation set in the same block as the text around it
+/// ("…is given by" / "X = SA (1)" / "where S is…"): the equation's line
+/// becomes a unit of its own, so that it can be taken for a formula; the text
+/// before and after joins up again as a paragraph.
+fn split_equation_lines(units: Vec<Unit>, fonts: &[FontInfo]) -> Vec<Unit> {
+    let equation = |l: &RichLine| {
+        let t = l.text();
+        let t = t.trim();
+        let mathy = l.chars.iter().filter(|c| is_math_char(c.c) || fonts.get(c.font as usize).is_some_and(|f| is_math_font(&f.name))).count();
+        // (More than the number: an equation number on a line of its own stays
+        // with its equation.)
+        let before_number = t.rfind('(').map_or("", |i| t[..i].trim());
+        has_equation_number(t) && before_number.chars().count() >= 3 && t.chars().count() < 90 && (t.contains('=') || mathy * 5 >= t.chars().count())
+    };
+    let mut out: Vec<Unit> = Vec::with_capacity(units.len());
+    for u in units {
+        if u.kind != UnitKind::Text || u.lines.len() < 2 || u.refs != refs::Ref::No || !u.lines.iter().any(|l| equation(l)) {
+            out.push(u);
+            continue;
+        }
+        let Unit { lines, class, group, .. } = u;
+        let mut part: Vec<RichLine> = Vec::new();
+        let flush = |part: &mut Vec<RichLine>, out: &mut Vec<Unit>| {
+            if !part.is_empty() {
+                let bbox = part.iter().skip(1).fold(part[0].bbox, |a, l| a.union(&l.bbox));
+                out.push(Unit { kind: UnitKind::Text, bbox, lines: std::mem::take(part), class, group, refs: refs::Ref::No });
+            }
+        };
+        for l in lines {
+            if equation(&l) {
+                flush(&mut part, &mut out);
+                part.push(l);
+                flush(&mut part, &mut out);
+            } else {
+                part.push(l);
+            }
+        }
+        flush(&mut part, &mut out);
+    }
+    out
+}
+
 /// A display formula is often extracted as several fragments (numerator,
 /// radical sign, denominator, equation number). Merge consecutive math-like
 /// fragments that sit on neighbouring lines into one unit.
@@ -2264,6 +2306,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             ordered = refs.page(ordered, &refs::Cx { page: p.page, body, height: p.rich.height, scan: p.scan, fonts: &p.rich.fonts, lex: Some(&lex) });
         }
         if !vertical {
+            ordered = split_equation_lines(ordered, &p.rich.fonts);
             ordered = merge_display_math(ordered, &p.rich.fonts, body);
         }
         // A numbered heading that opens a block ("I. はじめに", then the paragraph):
