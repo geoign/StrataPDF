@@ -1716,18 +1716,12 @@ fn column_edges(units: &[Unit], i: usize) -> (bool, bool) {
 /// mark, "Corresponding author", "Received"...) in the front matter or the
 /// lower half of the page; or it is set smaller than the running text at the
 /// foot of a column, with no running text of that column below it.
-fn is_note(u: &Unit, units: &[Unit], i: usize, text: &str) -> bool {
+fn is_note(u: &Unit, units: &[Unit], i: usize, text: &str, body: f32) -> bool {
     let Some(first) = u.lines.first() else { return false };
     let size = u.size();
     let page_h = units.iter().map(|o| o.bbox.y1).fold(0.0f32, f32::max).max(1.0);
-    let body = {
-        // The running text of the page: the most common size of multi-line units.
-        let mut hist: HashMap<i32, usize> = HashMap::new();
-        for o in units.iter().filter(|o| o.kind == UnitKind::Text && o.lines.len() >= 3) {
-            *hist.entry((o.size() * 2.0).round() as i32).or_default() += o.chars();
-        }
-        hist.into_iter().max_by_key(|e| e.1).map_or(size, |e| e.0 as f32 / 2.0)
-    };
+    // (The document's body size: on a first page the abstract, set larger, can
+    // hold more text than the running text below it.)
     if caption_kind(text).is_some() || u.lines.len() > 12 || size > body * 1.02 {
         return false;
     }
@@ -2647,7 +2641,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         last_heading = Some((doc.nodes.len() - 1, p.page, u.bbox, size));
                     }
                 }
-            } else if u.class == Some(FOOTNOTE) || (!vertical && !in_refs && is_note(u, &ordered, i, &text)) {
+            } else if u.class == Some(FOOTNOTE) || (!vertical && !in_refs && is_note(u, &ordered, i, &text, body)) {
                 doc.nodes.push(Node::Footnote { spans });
             } else if is_list_marker(&text)
                 && !(text.trim_start().starts_with('(')
