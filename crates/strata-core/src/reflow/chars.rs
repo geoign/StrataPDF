@@ -152,6 +152,19 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
             {
                 continue;
             }
+            // A space inside a word after a ligature that MuPDF split into letters
+            // ("Th e", "fi ssure"): the letters after the first have no width, and the
+            // next glyph starts where the ligature glyph ends. (A word ending in a
+            // ligature has a real gap before the next word.)
+            if let (Some(a), Some(b)) = (out.last(), chars[i + 1..].iter().find(|x| !x.c.is_whitespace()))
+                && a.bbox.width() < 0.01
+                && !a.c.is_whitespace()
+                && a.c.is_alphabetic()
+                && b.c.is_alphabetic()
+                && b.bbox.x0 - a.bbox.x1 < a.size.max(b.size) * 0.08
+            {
+                continue;
+            }
         } else if let (Some(lg), Some(a)) = (letter_gap, out.last())
             && a.c != ' '
             && (a.c.is_alphanumeric() || matches!(a.c, ',' | '.' | ';' | ':' | ')'))
@@ -235,5 +248,24 @@ mod tests {
         assert_eq!(symbol_char(0xE5), Some('∑'));
         assert!(is_junk("\u{FFFD} \u{FFFD}"));
         assert!(!is_junk("a\u{FFFD}"));
+    }
+
+    fn glyph(c: char, x0: f32, x1: f32) -> RichChar {
+        RichChar { c, bbox: crate::geom::RectF { x0, y0: 0.0, x1, y1: 10.0 }, size: 10.0, font: 0, bold: false, argb: 0 }
+    }
+
+    fn text(chars: &[RichChar]) -> String {
+        clean_line(chars, &[], false, |_| false).iter().map(|c| c.c).collect()
+    }
+
+    #[test]
+    fn no_space_inside_a_word_after_a_split_ligature() {
+        // "Th" is one glyph that MuPDF split into "T" and an "h" without width, and
+        // it added a space inside the glyph.
+        let inside = [glyph('T', 0.0, 10.7), glyph('h', 10.7, 10.7), glyph(' ', 5.3, 7.6), glyph('e', 10.6, 15.0)];
+        assert_eq!(text(&inside), "The");
+        // A word that ends in a ligature has a real gap before the next word.
+        let word_end = [glyph('f', 0.0, 3.0), glyph('f', 3.0, 3.0), glyph(' ', 3.0, 5.3), glyph('a', 5.5, 10.0)];
+        assert_eq!(text(&word_end), "ff a");
     }
 }
