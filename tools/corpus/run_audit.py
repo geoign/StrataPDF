@@ -32,7 +32,9 @@ def load_corpus(path):
 
 
 def toks(s):
-    s = unicodedata.normalize("NFKC", s or "").lower()
+    # Superscript/subscript marks of the dump ("km^{3}") are not text.
+    s = (s or "").replace("^{", "").replace("_{", "").replace("}", "")
+    s = unicodedata.normalize("NFKC", s).lower()
     s = re.sub(r"(?<=\w)[-\u2010\u2011\u00ad'’](?=\w)", "", s)
     out = []
     for m in re.finditer(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]|[^\W_]+", s):

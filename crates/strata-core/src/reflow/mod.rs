@@ -1287,8 +1287,9 @@ fn heading_number(t: &str) -> Option<u8> {
 
 /// Front-matter headings that are headings even before the body starts.
 fn is_front_heading(t: &str) -> bool {
-    let l = t.trim().trim_end_matches([':', '.']).to_lowercase();
-    ["abstract", "summary", "key points", "keywords", "key words", "highlights", "plain language summary", "introduction", "要旨", "概要", "要約", "はじめに", "序論", "緒言"].contains(&l.as_str())
+    // Compared without spaces: tracked capitals come with stray ones ("SU MMARY").
+    let l: String = t.trim().trim_end_matches([':', '.']).to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    ["abstract", "summary", "keypoints", "keywords", "highlights", "plainlanguagesummary", "introduction", "要旨", "概要", "要約", "はじめに", "序論", "緒言"].contains(&l.as_str())
 }
 
 /// An author line: personal names ("A. B. Surname", "Firstname Surname",
@@ -1629,9 +1630,12 @@ fn continues_weakly(prev: &str, next: &str) -> bool {
 /// as an abstract above two columns do not count as the same column.
 fn column_edges(units: &[Unit], i: usize) -> (bool, bool) {
     let u = &units[i];
+    // A block reaching well beyond the column on either side (an abstract over
+    // one and a half columns, a full-width title) is not of the column.
     let same_column = |o: &Unit| {
         let overlap = u.bbox.x1.min(o.bbox.x1) - u.bbox.x0.max(o.bbox.x0);
-        overlap > 0.3 * u.bbox.width().min(o.bbox.width()) && o.bbox.width() < u.bbox.width() * 1.5
+        let beyond = (u.bbox.x0 - o.bbox.x0).max(o.bbox.x1 - u.bbox.x1);
+        overlap > 0.3 * u.bbox.width().min(o.bbox.width()) && beyond <= u.bbox.width() * 0.25
     };
     // Only the running text of the column counts: captions, figure labels,
     // tables and notes above or below it are floats.
@@ -2471,6 +2475,29 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 && caps_heading(&text)
                 && !matches!(u.class, Some(strata_ocr::layout::TABLE | PICTURE | CAPTION | FOOTNOTE | PAGE_HEADER | PAGE_FOOTER));
             let mut level = level;
+            // The next line of a heading set over several lines (a long title), which
+            // alone would not pass for one.
+            let heading_below = last_heading.and_then(|(ix, pg, bbox, hsize)| {
+                let Some(Node::Heading { level: hl, .. }) = doc.nodes.get(ix) else { return None };
+                // Display type only: a heading at body size is followed by its paragraph.
+                (ix + 1 == doc.nodes.len()
+                    && pg == p.page
+                    && hsize >= body * 1.15
+                    && (size - hsize).abs() <= hsize * 0.05
+                    && u.lines.len() <= 2
+                    && text.chars().count() <= 100
+                    && !ends_sentence(&text)
+                    && u.bbox.y0 >= bbox.y1 - 2.0
+                    && u.bbox.y0 - bbox.y1 < size * 1.3
+                    && u.bbox.x0 < bbox.x1
+                    && u.bbox.x1 > bbox.x0)
+                    .then_some(*hl)
+            });
+            if level.is_none()
+                && let Some(hl) = heading_below
+            {
+                level = Some(hl);
+            }
             if Some(i) == page_title {
                 level = Some(1);
                 doc.title = text.trim().to_string();
@@ -2483,7 +2510,16 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 level = Some(2);
             }
             // Author lines in the front matter are no headings.
-            if in_front && level.is_some() && Some(i) != page_title && !is_front_heading(&text) && is_byline(&text) {
+            // (Not the next line of a heading, nor a line opening in lowercase: "and
+            // Analog Modelling" is the end of a title.)
+            if in_front
+                && level.is_some()
+                && Some(i) != page_title
+                && heading_below.is_none()
+                && !text.trim_start().starts_with(char::is_lowercase)
+                && !is_front_heading(&text)
+                && is_byline(&text)
+            {
                 doc.nodes.push(Node::Paragraph { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex) });
                 i += 1;
                 continue;
@@ -2533,12 +2569,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     ps.push(Span { text: format!("{num} "), style: Style::default(), link: None });
                     ps.extend(spans);
                 } else if let Some((ix, pg, bbox, hsize)) = last_heading
-                    && (u.class.is_some() || caps || level == 1)
+                    && (u.class.is_some() || caps || level == 1 || heading_below.is_some())
                     && ix + 1 == doc.nodes.len()
                     && pg == p.page
                     && (size - hsize).abs() <= hsize * 0.05
                     && numbered.is_none()
-                    && ((u.bbox.y0 >= bbox.y1 - 2.0 && u.bbox.y0 - bbox.y1 < size * 0.8 && u.bbox.x0 < bbox.x1 && u.bbox.x1 > bbox.x0)
+                    && ((u.bbox.y0 >= bbox.y1 - 2.0 && u.bbox.y0 - bbox.y1 < size * if level == 1 { 1.3 } else { 0.8 } && u.bbox.x0 < bbox.x1 && u.bbox.x1 > bbox.x0)
                         || ((u.bbox.y0 - bbox.y0).abs() < 2.0 && u.bbox.x0 >= bbox.x1 - 1.0 && u.bbox.x0 - bbox.x1 < size * 1.5))
                 {
                     // The next line, or the rest of the line, of the same heading.
@@ -2559,7 +2595,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
             } else if u.class == Some(FOOTNOTE) || (!vertical && !in_refs && is_note(u, &ordered, i, &text)) {
                 doc.nodes.push(Node::Footnote { spans });
-            } else if is_list_marker(&text) {
+            } else if is_list_marker(&text)
+                && !(text.trim_start().starts_with('(')
+                    && doc.nodes.iter().rev().find(|n| !matches!(n, Node::PageStart { .. } | Node::Figure { .. } | Node::Table { .. } | Node::Footnote { .. })).is_some_and(|n| matches!(n, Node::Paragraph { spans } if !ends_sentence(&spans_text(spans)))))
+            {
+                // (A citation or a symbol in brackets that carries on an open sentence,
+                // "(22)", "(dz)", is no list marker.)
                 doc.nodes.push(Node::ListItem { spans });
             } else {
                 // Continuation across a column or page break; figures, tables,

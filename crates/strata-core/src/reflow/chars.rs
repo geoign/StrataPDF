@@ -27,8 +27,56 @@ fn is_exotic_space(c: char) -> bool {
     matches!(c, '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
 }
 
+/// A line set letter-spaced ("a r t i c l e  i n f o", "S U M M A R Y"), whose
+/// letters come with a space between each: the spaces stay only where the gap
+/// between the letters is clearly wider than between the others (the word
+/// spaces).
+fn unspace_letters(chars: &[RichChar]) -> Option<Vec<RichChar>> {
+    let letters: Vec<&RichChar> = chars.iter().filter(|c| !c.c.is_whitespace()).collect();
+    // Runs of non-space characters between spaces: nearly all single letters.
+    let mut runs: Vec<usize> = Vec::new();
+    let mut n = 0;
+    for c in chars {
+        if c.c.is_whitespace() {
+            if n > 0 {
+                runs.push(n);
+            }
+            n = 0;
+        } else {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        runs.push(n);
+    }
+    let singles = runs.iter().filter(|&&r| r == 1).count();
+    if letters.len() < 4 || runs.len() < 4 || singles * 10 < runs.len() * 8 || !letters.iter().all(|c| c.c.is_alphabetic() || c.c == '-') {
+        return None;
+    }
+    let gaps: Vec<f32> = letters.windows(2).map(|w| w[1].bbox.x0 - w[0].bbox.x1).collect();
+    let mut sorted = gaps.clone();
+    sorted.sort_by(f32::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let em = letters.iter().map(|c| c.size).fold(0.0f32, f32::max);
+    let word = |g: f32| g > median * 1.6 && g > median + em * 0.12;
+    let mut out: Vec<RichChar> = Vec::with_capacity(letters.len() + 4);
+    for (k, c) in letters.iter().enumerate() {
+        if k > 0 && word(gaps[k - 1]) {
+            let mut sp = **c;
+            sp.c = ' ';
+            out.push(sp);
+        }
+        out.push(**c);
+    }
+    Some(out)
+}
+
 /// Clean the characters of one line (horizontal text).
 pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, math_font: impl Fn(&str) -> bool) -> Vec<RichChar> {
+    let unspaced = unspace_letters(chars);
+    // (A letter-spaced line keeps its wide letter gaps: no spaces are added back.)
+    let letter_spaced = unspaced.is_some();
+    let chars: &[RichChar] = unspaced.as_deref().unwrap_or(chars);
     let font_name = |c: &RichChar| fonts.get(c.font as usize).map(|f| f.name.as_str()).unwrap_or("");
     // Ruby (furigana): kana in small type above the base text of the line.
     let mut sizes: Vec<f32> = chars.iter().filter(|c| !c.c.is_whitespace()).map(|c| c.size).collect();
@@ -52,17 +100,33 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
         widths.sort_by(f32::total_cmp);
         widths.get(widths.len() / 2).is_some_and(|&w| w < 0.75)
     };
-    let letter_gap = (!scan && proportional && glyphs.len() >= 20 && spaces * 15 < glyphs.len())
+    let letter_gap = (!scan && !letter_spaced && proportional && glyphs.len() >= 20 && spaces * 15 < glyphs.len())
         .then(|| {
             let mut gaps: Vec<f32> = glyphs.windows(2).filter(|w| (w[0].size - w[1].size).abs() < 0.1).map(|w| w[1].bbox.x0 - w[0].bbox.x1).collect();
             gaps.sort_by(f32::total_cmp);
             gaps.get(gaps.len() / 2).copied()
         })
         .flatten();
+    // The gap between letters set next to each other: a space whose gap is no
+    // wider is one MuPDF invented inside tracked capitals ("SU MMARY").
+    let tight_gap = {
+        let mut g: Vec<f32> = chars.windows(2).filter(|w| w[0].c.is_alphabetic() && w[1].c.is_alphabetic()).map(|w| w[1].bbox.x0 - w[0].bbox.x1).collect();
+        g.sort_by(f32::total_cmp);
+        (g.len() >= 3).then(|| g[g.len() / 2])
+    };
     let mut out: Vec<RichChar> = Vec::with_capacity(chars.len());
     for (i, c) in chars.iter().enumerate() {
         let mut c = *c;
         if ruby(&c) {
+            continue;
+        }
+        if c.c == ' '
+            && let (Some(tg), Some(a), Some(b)) = (tight_gap, i.checked_sub(1).and_then(|k| chars.get(k)), chars.get(i + 1))
+            && a.c.is_alphabetic()
+            && b.c.is_alphabetic()
+            && b.bbox.x0 - a.bbox.x1 < tg + a.size.max(b.size) * 0.05
+            && tg > a.size * 0.05
+        {
             continue;
         }
         if is_zero_width(c.c) {
@@ -115,6 +179,7 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
             sp.bbox.x1 = c.bbox.x0;
             out.push(sp);
         } else if !scan
+            && !letter_spaced
             && let Some(a) = out.last()
             && a.c.is_lowercase()
             && c.c.is_lowercase()
