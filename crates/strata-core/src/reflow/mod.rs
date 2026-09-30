@@ -1599,7 +1599,7 @@ fn is_strong_byline(t: &str) -> bool {
 fn note_opening(t: &str) -> bool {
     let t = t.trim_start();
     let l = t.to_lowercase();
-    const STARTS: [&str; 22] = [
+    const STARTS: [&str; 23] = [
         "corresponding author",
         "*corresponding",
         "* corresponding",
@@ -1609,6 +1609,7 @@ fn note_opening(t: &str) -> bool {
         "received",
         "accepted",
         "editorial handling",
+        "editorial responsibility",
         "handling editor",
         "responsible editor",
         "communicated by",
@@ -1623,7 +1624,8 @@ fn note_opening(t: &str) -> bool {
         "additional supporting information",
         "orcid",
     ];
-    STARTS.iter().any(|s| l.starts_with(s)) || t.starts_with(['*', '†', '‡', '§', '¶', '©', '∗'])
+    // (Not "§", which numbers sections as often as notes.)
+    STARTS.iter().any(|s| l.starts_with(s)) || t.starts_with(['*', '†', '‡', '©', '∗'])
 }
 
 /// "References", "Literature Cited", "参考文献"...
@@ -2809,6 +2811,32 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 level = Some(2);
             } else if level.is_none() && u.lines.len() <= 2 && refs::is_refs_heading(&text) {
                 level = Some(2);
+            } else if level.is_none()
+                && u.lines.len() == 1
+                && numbered_heading_depth(&text).is_some_and(|d| d >= 2)
+                && text.chars().count() <= 100
+                // The title after the number opens with a capital or a CJK character
+                // ("5.6 and greater…" is running text).
+                && text.trim_start().split_whitespace().nth(1).and_then(|w| w.chars().next()).is_some_and(|c| c.is_uppercase() || is_cjk(c))
+                && !text.trim_end().ends_with(['.', ',', ';', ':'])
+            {
+                // "3.1.3 NW Palawan–Mindoro…": numbering of two levels or more marks a
+                // section heading even in the body's type (lists are numbered 1, 2, 3).
+                level = numbered_heading_depth(&text).map(|d| (d + 1).min(6));
+            }
+            // Notes and identifiers are no headings: "Received: …", "Editorial
+            // responsibility: …", a DOI.
+            let doi = {
+                let t = text.trim().to_lowercase();
+                t.starts_with("doi") || t.starts_with("https://doi") || (t.starts_with("10.") && t.contains('/') && !t.contains(' '))
+            };
+            // (A bare label such as "Supplementary Information" stays a heading; a
+            // label with a colon, "Citation:", is a sidebar's.)
+            let noted = note_opening(&text) && (text.trim().chars().count() > 30 || text.trim_end().ends_with(':'));
+            if level.is_some() && Some(i) != page_title && !is_front_heading(&text) && (noted || is_boilerplate(&text) || doi) {
+                doc.nodes.push(Node::Footnote { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex) });
+                i += 1;
+                continue;
             }
             // Author lines in the front matter are no headings.
             // (Not the next line of a heading, nor a line opening in lowercase: "and
