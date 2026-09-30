@@ -792,6 +792,46 @@ fn attach_drop_caps(units: Vec<Unit>, body: f32) -> Vec<Unit> {
 /// short of the right edge and the next line is indented from the unit's
 /// usual left edge. A hanging indent (reference lists: the first line out to
 /// the left) is not such an indent.
+/// Paragraphs of vertical text that one unit runs together: a paragraph opens
+/// with a column set a character or so below the top of the others, after a
+/// column that ends a sentence.
+fn split_vertical_paragraphs(units: Vec<Unit>, body: f32) -> Vec<Unit> {
+    let mut out: Vec<Unit> = Vec::with_capacity(units.len());
+    for mut u in units {
+        if u.kind != UnitKind::Text || u.lines.len() < 2 || !u.lines.iter().all(|l| l.vertical) {
+            out.push(u);
+            continue;
+        }
+        // Columns right to left.
+        u.lines.sort_by(|a, b| b.bbox.x1.total_cmp(&a.bbox.x1));
+        // The usual top: the most common start of the columns.
+        let starts: Vec<f32> = u.lines.iter().map(|l| l.bbox.y0).collect();
+        let top = starts.iter().copied().max_by_key(|&y| starts.iter().filter(|&&s| (s - y).abs() < body * 0.3).count()).unwrap_or(u.bbox.y0);
+        let cuts: Vec<usize> = (1..u.lines.len())
+            .filter(|&k| {
+                let indent = u.lines[k].bbox.y0 - top;
+                ends_sentence(&u.lines[k - 1].text()) && indent > body * 0.6 && indent < body * 4.0
+            })
+            .collect();
+        if cuts.is_empty() {
+            out.push(u);
+            continue;
+        }
+        let Unit { lines, class, group, .. } = u;
+        let mut parts: Vec<Vec<RichLine>> = Vec::new();
+        let mut rest = lines;
+        for &k in cuts.iter().rev() {
+            parts.push(rest.split_off(k));
+        }
+        parts.push(rest);
+        for lines in parts.into_iter().rev() {
+            let bbox = lines.iter().skip(1).fold(lines[0].bbox, |a, l| a.union(&l.bbox));
+            out.push(Unit { kind: UnitKind::Text, bbox, lines, class, group, refs: refs::Ref::No });
+        }
+    }
+    out
+}
+
 fn split_paragraphs(units: Vec<Unit>, body: f32) -> Vec<Unit> {
     let mut out: Vec<Unit> = Vec::with_capacity(units.len());
     for u in units {
@@ -1245,6 +1285,8 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         units = stitch_rows(units);
         units = attach_drop_caps(units, body);
         units = split_paragraphs(units, body);
+    } else {
+        units = split_vertical_paragraphs(units, body);
     }
     for r in vector_figures(&p.rich.blocks, page_area) {
         units.push(Unit { kind: UnitKind::Figure, bbox: r, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No });
@@ -1540,9 +1582,16 @@ fn caption_kind(t: &str) -> Option<bool> {
     }
     let starts = |p: &str| t.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)) && t.len() > p.len();
     let num_after = |p: &str| t.get(p.len()..).unwrap_or("").trim_start().chars().next().is_some_and(|c| c.is_ascii_digit() || matches!(c, 'I' | 'V' | 'X' | 'S'));
-    if (starts("table") && num_after("table")) || t.starts_with('表') {
+    // "表1", "図 2.3", "図一", "第3表": the label and its number. (A column of running
+    // text can start with 表 or 図 too: "…地" + "表風化でできた…".)
+    let numeral = |c: char| c.is_ascii_digit() || ('０'..='９').contains(&c) || "一二三四五六七八九十〇ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ".contains(c);
+    let cjk_label = |k: char| {
+        t.strip_prefix(k).is_some_and(|r| r.trim_start().chars().next().is_some_and(numeral))
+            || t.strip_prefix('第').is_some_and(|r| r.trim_start_matches(numeral).starts_with(k) && r.starts_with(numeral))
+    };
+    if (starts("table") && num_after("table")) || cjk_label('表') {
         Some(true)
-    } else if (starts("fig.") && num_after("fig.")) || (starts("figure") && num_after("figure")) || t.starts_with('図') || (starts("plate") && num_after("plate")) {
+    } else if (starts("fig.") && num_after("fig.")) || (starts("figure") && num_after("figure")) || cjk_label('図') || (starts("plate") && num_after("plate")) {
         Some(false)
     } else {
         None
@@ -2907,9 +2956,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             let mut level = level;
             // A column of vertical text running down most of the text area is running
             // text, whatever size an OCR estimated for it: headings are short columns.
+            // Nor is a column of more than 30 characters or one that ends a sentence.
             if vertical && level.is_some() && u.lines.iter().all(|l| l.vertical) && text.chars().count() > 12 {
                 let (top, bottom) = vertical_text_area(&ordered, body);
-                if bottom > top && u.bbox.height() > (bottom - top) * 0.7 {
+                let chars = text.chars().filter(|c| !c.is_whitespace()).count();
+                if (bottom > top && u.bbox.height() > (bottom - top) * 0.7) || chars > 30 || text.trim_end().ends_with(['。', '．']) {
                     level = None;
                 }
             }
@@ -3105,7 +3156,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     Some(Node::Paragraph { spans: prev_spans }) => {
                         if vertical {
                             let (top, _) = vertical_text_area(&ordered, body);
-                            let indented = u.bbox.y0 > top + body * 0.5;
+                            // (The first column, the rightmost: the unit may hold several.)
+                            let first = u.lines.iter().max_by(|a, b| a.bbox.x1.total_cmp(&b.bbox.x1)).map_or(u.bbox.y0, |l| l.bbox.y0);
+                            let indented = first > top + body * 0.5;
                             // An indented column still carries on a sentence the column
                             // before left open ("…売尽し、"): a quotation set in from the top.
                             last_col_full && (!indented || !ends_sentence(&spans_text(prev_spans)))
@@ -3163,7 +3216,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 let cut_at_edge = at_bottom && last_full;
                 if vertical {
                     let (_, bottom) = vertical_text_area(&ordered, body);
-                    last_col_full = u.bbox.y1 >= bottom - body * 1.5;
+                    // (Its last column, the leftmost.)
+                    let last = u.lines.iter().min_by(|a, b| a.bbox.x0.total_cmp(&b.bbox.x0)).map_or(u.bbox.y1, |l| l.bbox.y1);
+                    last_col_full = last >= bottom - body * 1.5;
                 }
                 if merge {
                     let idx = prev.unwrap();
@@ -3249,6 +3304,11 @@ mod tests {
         assert_eq!(caption_kind("Fig. 1a Map of the flow"), Some(false));
         assert_eq!(caption_kind("Table 1 (continued)"), Some(true));
         assert_eq!(caption_kind("Fig.8(a)に求められたバックスリップ量"), None);
+        assert_eq!(caption_kind("表風化でできたものだから"), None);
+        assert_eq!(caption_kind("図のように"), None);
+        assert_eq!(caption_kind("表１ 主な火山"), Some(true));
+        assert_eq!(caption_kind("図一四 大島"), Some(false));
+        assert_eq!(caption_kind("第3表 化学組成"), Some(true));
         assert_eq!(caption_kind("Fig. 8. 求められたバックスリップ量"), Some(false));
     }
 
