@@ -44,6 +44,8 @@ pub(super) enum Ref {
     /// list; see [`super::entries`]): a paragraph or list item of its own, which never
     /// carries on the paragraph before.
     Start,
+    /// An entry of a table of contents or an index (see [`super::toc`]): a list item of its own.
+    Item,
 }
 
 /// What the pass needs to know of the page.
@@ -438,7 +440,7 @@ fn split_wide_gaps(l: &RichLine) -> Vec<RichLine> {
 /// on one baseline) cut at it. A gutter is a band, at least 0.35 em wide, that (nearly)
 /// no glyph of any line touches, with a column of at least six ems on each side: a
 /// list's number markers, set apart from their text, are no column.
-fn ink_columns(lines: Vec<(RichLine, Option<usize>, Option<usize>)>) -> Vec<Vec<(RichLine, Option<usize>, Option<usize>)>> {
+pub(super) fn ink_columns(lines: Vec<(RichLine, Option<usize>, Option<usize>)>) -> Vec<Vec<(RichLine, Option<usize>, Option<usize>)>> {
     let n = lines.len();
     let em = median(lines.iter().map(|l| line_size(&l.0)).collect()).max(1.0);
     let ink = |l: &RichLine| l.chars.iter().filter(|c| !c.c.is_whitespace()).map(|c| c.bbox).collect::<Vec<_>>();

@@ -6,8 +6,9 @@
 //!    repeated header/footer lines, writing direction);
 //! 2. per page: drop headers/footers, turn images and vector clusters into
 //!    figures, order units by XY-cut, classify each unit;
-//! 3. rebuild reference lists entry by entry ([`refs`]), and cut other lists set with a
-//!    hanging indent (glossaries, numbered items) into their entries ([`entries`]);
+//! 3. rebuild reference lists entry by entry ([`refs`]), cut other lists set with a
+//!    hanging indent (glossaries, numbered items) into their entries ([`entries`]), and
+//!    rebuild tables of contents and indexes as lists ([`toc`]);
 //! 4. merge paragraphs split by column or page breaks.
 //!
 //! For horizontal text, the layout model of PyMuPDF Layout ([`crate::layout`])
@@ -22,6 +23,7 @@ mod hyphen;
 mod order;
 pub mod output;
 mod refs;
+mod toc;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1599,6 +1601,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     // labels above would take for labels of a drawing nearby.
     if !vertical {
         let debug = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()) == Some(p.page + 1);
+        out = toc::lists(out, debug("STRATA_DEBUG_TOC"));
         out = entries::split_hanging(out, p.scan, &p.rich.fonts, debug("STRATA_DEBUG_ENTRIES"));
     }
     (out, manuscript)
@@ -2761,6 +2764,13 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             let size = u.size();
             // Glyphs of a badge or icon font, all undecodable.
             if chars::is_junk(&text) {
+                i += 1;
+                continue;
+            }
+            // Entries of a table of contents or an index: a list item each.
+            if u.refs == refs::Ref::Item {
+                doc.nodes.push(Node::ListItem { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex) });
+                last_para = None;
                 i += 1;
                 continue;
             }

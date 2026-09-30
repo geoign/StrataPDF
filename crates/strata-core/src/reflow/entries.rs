@@ -225,7 +225,7 @@ fn eligible(u: &Unit) -> bool {
 /// no more than a line and a half apart, transitively (the entries of a list follow one
 /// another; text with a stretch of page between it and the list is another matter). A
 /// unit across two columns does not tie them together: it joins the one it overlaps most.
-fn columns(units: &[Option<Unit>], idx: &[usize]) -> Vec<Vec<usize>> {
+pub(super) fn columns(units: &[Option<Unit>], idx: &[usize]) -> Vec<Vec<usize>> {
     let unit = |i: usize| units[i].as_ref().unwrap();
     // The narrow units first: the columns form before a wide unit meets them.
     let mut idx: Vec<usize> = idx.to_vec();
@@ -243,7 +243,7 @@ fn columns(units: &[Option<Unit>], idx: &[usize]) -> Vec<Vec<usize>> {
                     let em = unit(i).size().max(unit(j).size());
                     let gap = (b.y0 - o.y1).max(o.y0 - b.y1);
                     // Side by side on one row: a marker or a number ("2.", "•", "(a)") and its text.
-                    let mark = |u: &Unit| u.lines.len() == 1 && u.lines[0].chars.iter().filter(|c| !c.c.is_whitespace()).count() <= 4;
+                    let mark = |u: &Unit| u.lines.iter().all(|l| l.chars.iter().filter(|c| !c.c.is_whitespace()).count() <= 4);
                     let beside = gap < 0.0 && b.y1.min(o.y1) - b.y0.max(o.y0) >= 0.5 * b.height().min(o.height()) && (b.x0 - o.x1).max(o.x0 - b.x1) <= 1.5 * em && (mark(unit(i)) || mark(unit(j)));
                     beside || (b.x1.min(o.x1) - b.x0.max(o.x0) >= 0.3 * b.width().min(o.width()) && gap <= 1.5 * em)
                 })
