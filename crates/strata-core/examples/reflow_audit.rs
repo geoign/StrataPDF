@@ -22,6 +22,20 @@ fn text(spans: &[Span]) -> String {
     spans.iter().map(|s| s.text.as_str()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Text for the dump: superscripts and subscripts marked (`10^{7}`, `CO_{2}`),
+/// which the reviewers of the dump could not tell from plain digits.
+fn marked(spans: &[Span]) -> String {
+    let s: String = spans
+        .iter()
+        .map(|s| match (s.style.sup, s.style.sub) {
+            (true, _) if !s.text.trim().is_empty() => format!("^{{{}}}", s.text.trim()),
+            (_, true) if !s.text.trim().is_empty() => format!("_{{{}}}", s.text.trim()),
+            _ => s.text.clone(),
+        })
+        .collect();
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn is_cjk(c: char) -> bool {
     matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
 }
@@ -224,6 +238,7 @@ fn main() {
     // Output text by node, with the page it starts on.
     let mut kinds: HashMap<&'static str, usize> = HashMap::new();
     let mut out_lines: Vec<(u32, &'static str, String)> = Vec::new();
+    let mut dump_lines: Vec<String> = Vec::new();
     let mut page = 0u32;
     for n in &d.nodes {
         let (k, t) = match n {
@@ -241,12 +256,17 @@ fn main() {
             Node::PageImage { reason, .. } => ("IMG", reason.clone()),
         };
         *kinds.entry(k).or_default() += 1;
+        dump_lines.push(match n {
+            Node::Heading { spans, .. } | Node::Paragraph { spans } | Node::ListItem { spans } | Node::Footnote { spans } => marked(spans),
+            Node::Figure { caption, .. } => marked(caption),
+            _ => t.clone(),
+        });
         out_lines.push((page, k, t));
     }
     if let Some(dump) = dump {
         let mut s = String::new();
         let mut last = u32::MAX;
-        for (p, k, t) in &out_lines {
+        for ((p, k, _), t) in out_lines.iter().zip(&dump_lines) {
             if *p != last {
                 s.push_str(&format!("=== p{}\n", p + 1));
                 last = *p;
