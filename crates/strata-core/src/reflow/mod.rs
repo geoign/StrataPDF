@@ -1720,7 +1720,7 @@ struct LastPara {
 /// caption, above, below or beside it. Small figures without a caption in the
 /// top or bottom margin (logos, icons) are dropped. Emptied nodes become empty
 /// paragraphs, removed at the end.
-fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, RectF>, width: f32, height: f32) {
+fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, RectF>, width: f32, height: f32, title_top: Option<f32>) {
     // Figures (`table` false) or tables (true) without a caption.
     let empty_float = |doc: &ReflowDoc, k: usize, table: bool| match &doc.nodes[k] {
         Node::Figure { image, caption } if caption.is_empty() && !table => Some(doc.images[*image].bbox),
@@ -1763,11 +1763,14 @@ fn pair_figures(doc: &mut ReflowDoc, first: usize, node_bbox: &HashMap<usize, Re
             }
         }
     }
+    // Decoration without a caption: logos and badges in the margins or above the
+    // title of the first page, and icons (ORCID, open access, licence) anywhere.
     let page_area = width * height;
     for k in first..doc.nodes.len() {
         if let Some(f) = empty_fig(doc, k)
-            && f.width() * f.height() < page_area * 0.02
-            && (f.y1 < height * 0.12 || f.y0 > height * 0.92)
+            && ((f.width() * f.height() < page_area * 0.02 && (f.y1 < height * 0.12 || f.y0 > height * 0.92))
+                || f.width() * f.height() < page_area * 0.012
+                || title_top.is_some_and(|t| f.y1 <= t + 2.0))
         {
             doc.nodes[k] = Node::Paragraph { spans: Vec::new() };
         }
@@ -2722,7 +2725,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
         }
         doc.fill_anchors(last_anchor);
-        pair_figures(&mut doc, first_node, &node_bbox, p.rich.width, p.rich.height);
+        pair_figures(&mut doc, first_node, &node_bbox, p.rich.width, p.rich.height, title_top);
         if timing {
             eprintln!("page {}: units {:?}, total {:?}", p.page + 1, t_units, t_page.elapsed());
         }
