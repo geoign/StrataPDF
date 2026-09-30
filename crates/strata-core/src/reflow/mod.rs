@@ -1907,7 +1907,11 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         }
         let Ok(page) = eng.load_page(p as i32) else { continue };
         let b = page.bounds().map_err(|e| e.to_string())?;
-        let tp = page.to_text_page(reflow_flags() | mupdf::TextPageFlags::COLLECT_VECTORS);
+        // Without table hunting: it takes the indent of a paragraph's first line
+        // for a table column and cuts the first character off into a cell of its
+        // own (Japanese text set with an indent), and reflow does not use its grid.
+        let flags = if std::env::var("STRATA_TABLE_HUNT").is_ok() { reflow_flags() } else { reflow_flags() & !mupdf::TextPageFlags::TABLE_HUNT };
+        let tp = page.to_text_page(flags | mupdf::TextPageFlags::COLLECT_VECTORS);
         let Ok(tp) = tp else { continue };
         let mut rich = RichPage::from_text_page(&tp, b.width(), b.height());
         // OCR text replaces an unusable text layer.
