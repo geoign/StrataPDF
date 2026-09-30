@@ -2915,8 +2915,34 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
                 words
             };
+            // On a scan the fonts tell nothing: a short line with "=" and an equation
+            // number at its end, without Japanese prose, is a display formula (its OCR
+            // text is garbage; the crop reads).
+            // (Or without a number, when no word of prose is left: "where x = 2 and…" is text.)
+            let scan_equation = p.scan && u.lines.len() <= 3 && text.chars().count() < 120 && text.contains(['=', '＝']) && text.chars().filter(|c| ('\u{3041}'..='\u{3096}').contains(c)).count() < 3 && {
+                let numbered = has_equation_number(
+                    &text
+                        .chars()
+                        .map(|c| match c {
+                            '（' => '(',
+                            '）' => ')',
+                            '．' => '.',
+                            '０'..='９' => char::from_u32(c as u32 - '０' as u32 + '0' as u32).unwrap_or(c),
+                            _ => c,
+                        })
+                        .collect::<String>(),
+                );
+                // Words: four letters or more, or three in lower case that name no function.
+                const FUNCTIONS: [&str; 13] = ["exp", "log", "sin", "cos", "tan", "erf", "max", "min", "det", "div", "lim", "sup", "inf"];
+                let words = text.split(|c: char| !c.is_ascii_alphabetic()).filter(|w| w.len() >= 4 || (w.len() == 3 && w.starts_with(|c: char| c.is_ascii_lowercase()) && !FUNCTIONS.contains(w))).count();
+                // (Subscripted names come out of OCR as words too, "Tcore": operators
+                // around them still make a formula.)
+                let operators = text.chars().filter(|c| matches!(c, '=' | '＝' | '+' | '-' | '−' | '/' | '×' | '·' | '*' | '^' | '<' | '>' | '≤' | '≥' | '±')).count();
+                (numbered && text.chars().count() < 80 && words <= 2) || words <= 1 || (operators >= 3 && words <= 4)
+            };
             let display_math = (prose_words < 4 && (math >= 0.35 || (math >= 0.12 && has_equation_number(&text) && text.chars().count() < 160)))
-                || (prose_words <= 1 && math >= 0.2 && u.lines.len() <= 4);
+                || (prose_words <= 1 && math >= 0.2 && u.lines.len() <= 4)
+                || scan_equation;
             if !vertical && display_math && u.lines.len() <= 8 && u.chars() >= 3 {
                 if let Some(img) = crop(u.bbox, opts.formula_scale, &mut doc) {
                     let (latex, number) = match &opts.formula {
@@ -3008,6 +3034,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 && caps_heading(&text)
                 && !matches!(u.class, Some(strata_ocr::layout::TABLE | PICTURE | CAPTION | FOOTNOTE | PAGE_HEADER | PAGE_FOOTER));
             let mut level = level;
+            // On a scan, a line of Japanese prose ("この場合も,エネルギーは…") whose OCR box
+            // came out tall (fractions, subscripts) is no heading: headings do not pause
+            // with a comma after a kana.
+            if p.scan && level.is_some() && Some(i) != page_title && text.chars().zip(text.chars().skip(1)).any(|(a, b)| ('\u{3041}'..='\u{3096}').contains(&a) && matches!(b, '、' | '，' | ',')) {
+                level = None;
+            }
             // A column of vertical text running down most of the text area is running
             // text, whatever size an OCR estimated for it: headings are short columns.
             // Nor is a column of more than 30 characters or one that ends a sentence.
@@ -3209,13 +3241,16 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     Some(Node::Paragraph { .. }) if prev == ref_node => false,
                     Some(Node::Paragraph { spans: prev_spans }) => {
                         if vertical {
-                            let (top, _) = vertical_text_area(&ordered, body);
+                            let (top, bottom) = vertical_text_area(&ordered, body);
                             // (The first column, the rightmost: the unit may hold several.)
                             let first = u.lines.iter().max_by(|a, b| a.bbox.x1.total_cmp(&b.bbox.x1)).map_or(u.bbox.y0, |l| l.bbox.y0);
                             let indented = first > top + body * 0.5;
+                            // Columns only: horizontal lines of a vertical book (a colophon,
+                            // a table) have no column top to be indented from.
+                            let columns = bottom > top && u.lines.iter().all(|l| l.vertical);
                             // An indented column still carries on a sentence the column
                             // before left open ("…売尽し、"): a quotation set in from the top.
-                            last_col_full && (!indented || !ends_sentence(&spans_text(prev_spans)))
+                            columns && last_col_full && (!indented || !ends_sentence(&spans_text(prev_spans)))
                         } else {
                             let prev_text = spans_text(prev_spans);
                             // A sentence cut at the edge of a column and resumed at the top
@@ -3269,10 +3304,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 };
                 let cut_at_edge = at_bottom && last_full;
                 if vertical {
-                    let (_, bottom) = vertical_text_area(&ordered, body);
+                    let (top, bottom) = vertical_text_area(&ordered, body);
                     // (Its last column, the leftmost.)
                     let last = u.lines.iter().min_by(|a, b| a.bbox.x0.total_cmp(&b.bbox.x0)).map_or(u.bbox.y1, |l| l.bbox.y1);
-                    last_col_full = last >= bottom - body * 1.5;
+                    last_col_full = bottom > top && u.lines.iter().all(|l| l.vertical) && last >= bottom - body * 1.5;
                 }
                 if merge {
                     let idx = prev.unwrap();
