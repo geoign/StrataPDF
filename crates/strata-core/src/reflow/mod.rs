@@ -709,6 +709,10 @@ fn role(c: usize) -> u8 {
 /// Merge vector blocks into clusters; clusters that look like drawings (not just
 /// table rules or underlines) become figure candidates.
 fn vector_figures(blocks: &[RichBlock], page_area: f32) -> Vec<RectF> {
+    let vectors = blocks.iter().filter(|b| matches!(b, RichBlock::Vector { .. })).count();
+    if vectors > 3000 {
+        return vector_figures_grid(blocks, page_area);
+    }
     let mut clusters: Vec<(RectF, usize, usize)> = Vec::new(); // bbox, members, non-line members
     for b in blocks {
         let RichBlock::Vector { bbox } = b else { continue };
@@ -742,6 +746,78 @@ fn vector_figures(blocks: &[RichBlock], page_area: f32) -> Vec<RectF> {
             area > page_area * 0.02 && *shapes >= 3 && *n >= 5 && area < page_area * 0.9
         })
         .map(|c| c.0)
+        .collect()
+}
+
+/// `vector_figures` for pages of many thousands of drawings (detailed maps):
+/// drawings mark the cells of an 8 pt grid they cover, and connected cells
+/// form the clusters, in time linear in the number of drawings.
+fn vector_figures_grid(blocks: &[RichBlock], page_area: f32) -> Vec<RectF> {
+    const CELL: f32 = 8.0;
+    let rects: Vec<RectF> = blocks.iter().filter_map(|b| if let RichBlock::Vector { bbox } = b { Some(*bbox) } else { None }).collect();
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for r in &rects {
+        (x0, y0, x1, y1) = (x0.min(r.x0), y0.min(r.y0), x1.max(r.x1), y1.max(r.y1));
+    }
+    let cols = (((x1 - x0) / CELL).ceil() as usize + 1).min(2000);
+    let rows = (((y1 - y0) / CELL).ceil() as usize + 1).min(2000);
+    let cell = |x: f32, y: f32| (((x - x0) / CELL) as usize).min(cols - 1) + (((y - y0) / CELL) as usize).min(rows - 1) * cols;
+    let mut marked = vec![false; cols * rows];
+    for r in &rects {
+        let (c0, r0) = ((((r.x0 - x0) / CELL) as usize).min(cols - 1), (((r.y0 - y0) / CELL) as usize).min(rows - 1));
+        let (c1, r1) = ((((r.x1 - x0) / CELL) as usize).min(cols - 1), (((r.y1 - y0) / CELL) as usize).min(rows - 1));
+        for row in r0..=r1 {
+            for col in c0..=c1 {
+                marked[col + row * cols] = true;
+            }
+        }
+    }
+    // Connected components of marked cells (8-neighbourhood: a gap under a cell joins).
+    let mut comp = vec![usize::MAX; cols * rows];
+    let mut n = 0;
+    let mut stack = Vec::new();
+    for start in 0..cols * rows {
+        if !marked[start] || comp[start] != usize::MAX {
+            continue;
+        }
+        comp[start] = n;
+        stack.push(start);
+        while let Some(k) = stack.pop() {
+            let (c, r) = ((k % cols) as i64, (k / cols) as i64);
+            for dr in -1..=1i64 {
+                for dc in -1..=1i64 {
+                    let (nc, nr) = (c + dc, r + dr);
+                    if nc < 0 || nr < 0 || nc >= cols as i64 || nr >= rows as i64 {
+                        continue;
+                    }
+                    let j = nc as usize + nr as usize * cols;
+                    if marked[j] && comp[j] == usize::MAX {
+                        comp[j] = n;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        n += 1;
+    }
+    let mut clusters: Vec<(Option<RectF>, usize, usize)> = vec![(None, 0, 0); n];
+    for r in &rects {
+        let k = comp[cell((r.x0 + r.x1) / 2.0, (r.y0 + r.y1) / 2.0)];
+        if k == usize::MAX {
+            continue;
+        }
+        let c = &mut clusters[k];
+        c.0 = Some(c.0.map_or(*r, |b| b.union(r)));
+        c.1 += 1;
+        c.2 += (r.width() >= 1.5 && r.height() >= 1.5) as usize;
+    }
+    clusters
+        .into_iter()
+        .filter_map(|(r, n, shapes)| {
+            let r = r?;
+            let area = r.width() * r.height();
+            (area > page_area * 0.02 && shapes >= 3 && n >= 5 && area < page_area * 0.9).then_some(r)
+        })
         .collect()
 }
 
@@ -1832,6 +1908,13 @@ fn merge_display_math(units: Vec<Unit>, fonts: &[FontInfo], body: f32) -> Vec<Un
     out
 }
 
+/// Whether the layout model is worth running on a page. Feature extraction
+/// scans every drawing: a detailed map (hundreds of thousands of paths) takes
+/// many seconds for a handful of text lines, which the heuristics handle alone.
+fn layout_worth(p: &PageData) -> bool {
+    p.rich.blocks.iter().filter(|b| matches!(b, RichBlock::Vector { .. })).count() <= 20_000
+}
+
 /// Label the lines of every page with the layout model, on several threads
 /// (one for documents whose display lists must not run concurrently).
 fn run_layout(model: &strata_ocr::layout::LayoutModel, pages: &mut [PageData], serial: bool, cancel: &AtomicBool, progress: &(dyn Fn(usize) + Sync)) {
@@ -1849,12 +1932,8 @@ fn run_layout(model: &strata_ocr::layout::LayoutModel, pages: &mut [PageData], s
                         break;
                     }
                     let p = &pages_ref[i];
-                    // Feature extraction scans every drawing: a detailed map (hundreds of
-                    // thousands of paths) takes many seconds for a handful of text lines,
-                    // which the heuristics handle alone.
-                    let drawings = p.rich.blocks.iter().filter(|b| matches!(b, RichBlock::Vector { .. })).count();
                     if !p.ocr
-                        && drawings <= 20_000
+                        && layout_worth(p)
                         && let Some(dl) = &p.dl
                     {
                         match crate::layout::analyze_display_list(model, dl, p.rich.width, p.rich.height) {
@@ -1899,6 +1978,9 @@ fn vertical_text_area(units: &[Unit], body: f32) -> (f32, f32) {
 fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + Sync), cancel: &AtomicBool, ocr: &crate::ocr::OcrStore, serial: bool) -> Result<Option<ReflowDoc>, String> {
     let n = eng.page_count().map_err(|e| e.to_string())?.max(0) as usize;
     let total = n * 3;
+    // `STRATA_DEBUG_TIMING`: time of each stage on stderr.
+    let timing = std::env::var("STRATA_DEBUG_TIMING").is_ok();
+    let t_start = std::time::Instant::now();
     // Pass 1: extraction.
     let mut pages = Vec::with_capacity(n);
     for p in 0..n {
@@ -1942,10 +2024,16 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         let over_scan = rich.blocks.iter().any(|b| matches!(b, RichBlock::Image { bbox } if bbox.width() * bbox.height() > area * 0.7))
             && rich.blocks.iter().map(|b| if let RichBlock::Text { lines, .. } = b { lines.iter().map(|l| l.chars.len()).sum() } else { 0 }).sum::<usize>() > 100;
         let scan = ocr || over_scan;
-        pages.push(PageData { page: p as u32, rich, links, dl: page.to_display_list(true).ok(), ocr, scan, layout: Vec::new() });
+        // Display lists are made when needed and dropped soon: kept for every page,
+        // the images they hold fill MuPDF's store, and every later allocation then
+        // scans it (a 27-page paper with large figures took minutes).
+        pages.push(PageData { page: p as u32, rich, links, dl: None, ocr, scan, layout: Vec::new() });
         if p % 4 == 0 {
             progress(p + 1, total);
         }
+    }
+    if timing {
+        eprintln!("extraction {:?}", t_start.elapsed());
     }
     let body = body_size(&pages);
     let repeated = repeated_margin_lines(&pages);
@@ -1965,7 +2053,26 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         && !vertical
         && let Some(model) = crate::layout::shared_model()
     {
-        run_layout(&model, &mut pages, serial, cancel, &|done| progress(n + done, total));
+        let t_layout = std::time::Instant::now();
+        // In batches, with the display lists of one batch alive at a time.
+        let batch = if serial { 1 } else { std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8) };
+        let mut start = 0;
+        while start < pages.len() {
+            let end = (start + batch).min(pages.len());
+            for p in &mut pages[start..end] {
+                if !p.ocr && layout_worth(p) {
+                    p.dl = eng.load_page(p.page as i32).ok().and_then(|pg| pg.to_display_list(true).ok());
+                }
+            }
+            run_layout(&model, &mut pages[start..end], serial, cancel, &|done| progress(n + start + done, total));
+            for p in &mut pages[start..end] {
+                p.dl = None;
+            }
+            start = end;
+        }
+        if timing {
+            eprintln!("layout {:?}", t_layout.elapsed());
+        }
     }
 
     // Pass 2: per page layout and classification.
@@ -1992,7 +2099,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
+        let t_page = std::time::Instant::now();
         let (mut units, manuscript) = page_units(p, body, &repeated, pages.len(), opts, vertical);
+        let t_units = t_page.elapsed();
         // Double-spaced manuscripts leave a blank line's height between lines.
         let line_gap = if manuscript { body * 1.8 } else { body * 0.6 };
         let rects: Vec<RectF> = units.iter().map(|u| u.bbox).collect();
@@ -2090,10 +2199,16 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         doc.fill_anchors((p.page, 0.0));
         doc.nodes.push(Node::PageStart { page: p.page });
         doc.fill_anchors((p.page, 0.0));
+        // This page's display list, for crops; dropped with the page.
+        let page_dl = eng.load_page(p.page as i32).ok().and_then(|pg| pg.to_display_list(true).ok());
         let crop = |bbox: RectF, scale: f32, doc: &mut ReflowDoc| -> Option<usize> {
-            let dl = p.dl.as_ref()?;
+            let dl = page_dl.as_ref()?;
             let pad = RectF { x0: bbox.x0 - 2.0, y0: bbox.y0 - 2.0, x1: bbox.x1 + 2.0, y1: bbox.y1 + 2.0 };
+            let t_crop = std::time::Instant::now();
             let (w, h, png) = render_region_png(dl, pad, scale).ok()?;
+            if timing && t_crop.elapsed().as_millis() > 300 {
+                eprintln!("  crop {:?} at {scale}: {:?} ({w}x{h}, {} KB)", bbox, t_crop.elapsed(), png.len() / 1024);
+            }
             let id = format!("p{}_{}.png", p.page + 1, doc.images.len() + 1);
             doc.images.push(ReflowImage { id, page: p.page, bbox, width: w, height: h, png });
             Some(doc.images.len() - 1)
@@ -2624,6 +2739,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         }
         doc.fill_anchors(last_anchor);
         pair_figures(&mut doc, first_node, &node_bbox, p.rich.width, p.rich.height);
+        if timing {
+            eprintln!("page {}: units {:?}, total {:?}", p.page + 1, t_units, t_page.elapsed());
+        }
         progress(2 * n + pi + 1, total);
     }
     let last = doc.anchors.last().copied().unwrap_or((0, 0.0));
