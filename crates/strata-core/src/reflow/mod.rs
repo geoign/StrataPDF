@@ -538,6 +538,12 @@ fn overlap_frac(inner: &RectF, outer: &RectF) -> f32 {
     (x1 - x0) * (y1 - y0) / a
 }
 
+/// The box of a line without its blanks (OCR lines end in spaces that reach into the gutter).
+fn ink_box(l: &RichLine) -> RectF {
+    let b = l.chars.iter().filter(|c| !c.c.is_whitespace()).fold(RectF::EMPTY, |a, c| a.union(&c.bbox));
+    if b.is_empty() { l.bbox } else { b }
+}
+
 /// Layout class and region of a line: those of the layout line holding most of its characters.
 fn line_class(layout: &[(RectF, usize, usize)], l: &RichLine) -> Option<(usize, usize)> {
     let cand: Vec<&(RectF, usize, usize)> = layout.iter().filter(|(r, ..)| overlap_frac(&l.bbox, r) > 0.0).collect();
@@ -2245,7 +2251,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         // Double-spaced manuscripts leave a blank line's height between lines.
         let line_gap = if manuscript { body * 1.8 } else { body * 0.6 };
         let rects: Vec<RectF> = units.iter().map(|u| u.bbox).collect();
-        let order = order::reading_order(&rects, vertical, p.scan);
+        let lines: Vec<order::Lines> = units.iter().map(|u| order::Lines { boxes: u.lines.iter().map(ink_box).collect(), size: u.size() }).collect();
+        let order = order::reading_order(&rects, &lines, body, vertical, p.scan);
         let mut ordered: Vec<Unit> = Vec::with_capacity(units.len());
         let mut slots: Vec<Option<Unit>> = units.drain(..).map(Some).collect();
         for i in order {
@@ -2848,7 +2855,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     .rev()
                     .find(|(ix, n)| match n {
                         Node::PageStart { .. } | Node::Figure { .. } | Node::Table { .. } | Node::Footnote { .. } => false,
-                        Node::Paragraph { spans } if caption_kind(&spans_text(spans)).is_some() => false,
+                        // Captions, and those that `pair_figures` took away, are floats.
+                        Node::Paragraph { spans } if spans.is_empty() || caption_kind(&spans_text(spans)).is_some() => false,
                         Node::Paragraph { .. }
                             if !vertical
                                 && !p.scan
