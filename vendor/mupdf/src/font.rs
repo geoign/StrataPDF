@@ -102,6 +102,11 @@ impl Font {
             .map(|inner| Self { inner })
     }
 
+    /// The `fz_font` pointer, for direct FFI calls (glyph names).
+    pub fn as_raw(&self) -> *mut fz_font {
+        self.inner
+    }
+
     pub fn name(&self) -> &str {
         let f_name = unsafe { fz_font_name(context(), self.inner) };
         let c_name = unsafe { CStr::from_ptr(f_name) };

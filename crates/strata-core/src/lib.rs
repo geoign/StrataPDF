@@ -5,6 +5,7 @@ pub mod doc;
 pub mod fonts;
 pub mod geom;
 pub mod glyphs;
+pub mod recode;
 pub mod images;
 pub mod layout;
 pub mod ocr;

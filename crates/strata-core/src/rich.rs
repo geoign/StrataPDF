@@ -251,11 +251,11 @@ unsafe fn glyph_name(ctx: *mut fz_context, font: *mut fz_font, gid: i32) -> Opti
     Some(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
 }
 
-/// A glyph that stands for several characters ("fi"): the characters share its box.
-fn split_char(c: RichChar, text: &str) -> impl Iterator<Item = RichChar> {
+/// A glyph that stands for several characters ("fi"): the characters share its box, side by side in a
+/// horizontal line and one above the other in a vertical one.
+fn split_char(c: RichChar, text: &str, horizontal: bool) -> impl Iterator<Item = RichChar> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1) as f32;
-    let horizontal = c.bbox.width() >= c.bbox.height();
     chars.into_iter().enumerate().map(move |(i, ch)| {
         let mut b = c.bbox;
         if horizontal {
@@ -336,7 +336,7 @@ impl RichPage {
                     }
                     match unknown(c).then(|| recover(c)).flatten() {
                         Some(t) => {
-                            out.extend(split_char(*c, &t));
+                            out.extend(split_char(*c, &t, horizontal));
                             after_named = true;
                         }
                         None => {
@@ -360,6 +360,106 @@ impl RichPage {
             let p = tp.as_raw();
             walk(ctx, (*p).first_block, &mut blocks, &mut fonts, 0);
         }
-        RichPage { width, height, blocks, fonts: fonts.fonts }
+        let mut rich = RichPage { width, height, blocks, fonts: fonts.fonts };
+        rich.recode();
+        rich
+    }
+
+    /// Repair the characters that MuPDF decodes wrongly in symbol and "special character" fonts
+    /// ([`crate::recode`]): the degree sign that is a "8", the "=" that is a "1/4".
+    fn recode(&mut self) {
+        let RichPage { blocks, fonts, .. } = self;
+        let tables: Vec<Option<_>> = fonts.iter().map(|f| crate::recode::table(&f.name)).collect();
+        if tables.iter().all(Option::is_none) {
+            return;
+        }
+        // A replaced glyph that swallows the character next to it: where it is, and how big.
+        let mut swallow: Option<(char, RectF, f32)> = None;
+        for b in blocks.iter_mut() {
+            let RichBlock::Text { lines, .. } = b else { continue };
+            for line in lines.iter_mut() {
+                let horizontal = !line.vertical && line.dir[1].abs() < 0.1;
+                let mut out = Vec::with_capacity(line.chars.len());
+                let mut i = 0;
+                while i < line.chars.len() {
+                    let c = line.chars[i];
+                    i += 1;
+                    if let Some((next, at, size)) = swallow.take()
+                        && c.c == next
+                        && (c.bbox.x0 - at.x0).abs() < size * 1.5
+                        && (c.bbox.y0 - at.y0).abs() < size * 1.5
+                    {
+                        continue;
+                    }
+                    let Some(table) = tables.get(c.font as usize).copied().flatten() else {
+                        out.push(c);
+                        continue;
+                    };
+                    // MuPDF splits a ligature glyph into its letters, the later ones without width;
+                    // the glyph is one character of the table ("\u{FB03}", the bar of a radical).
+                    let (key, len) = ligature(&line.chars[i - 1..]).unwrap_or((c.c, 1));
+                    let row = table.iter().find(|(k, _)| *k == key);
+                    if len > 1 {
+                        i += len - 1;
+                    }
+                    let Some((_, text)) = row else {
+                        out.extend_from_slice(&line.chars[i - len..i]);
+                        continue;
+                    };
+                    if let Some(next) = fonts.get(c.font as usize).and_then(|f| crate::recode::swallows(&f.name, c.c)) {
+                        swallow = Some((next, c.bbox, c.size));
+                    }
+                    out.extend(split_char(c, text, horizontal));
+                }
+                line.chars = out;
+            }
+            lines.retain(|l| !l.chars.is_empty());
+        }
+        blocks.retain(|b| !matches!(b, RichBlock::Text { lines, .. } if lines.is_empty()));
+    }
+}
+
+/// A ligature MuPDF has split into letters at the start of `chars`: the ligature and the number of
+/// characters it took. The letters after the first have no width.
+fn ligature(chars: &[RichChar]) -> Option<(char, usize)> {
+    const LIGATURES: [(&str, char); 6] = [("ffi", '\u{FB03}'), ("ffl", '\u{FB04}'), ("ff", '\u{FB00}'), ("fi", '\u{FB01}'), ("fl", '\u{FB02}'), ("st", '\u{FB06}')];
+    let first = chars.first()?;
+    LIGATURES.iter().find_map(|&(letters, lig)| {
+        let n = letters.chars().count();
+        let ok = chars.len() >= n
+            && chars.iter().zip(letters.chars()).all(|(c, l)| c.c == l)
+            && chars[1..n].iter().all(|c| c.font == first.font && c.bbox.width() < 0.01);
+        ok.then_some((lig, n))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ch(c: char, x0: f32, x1: f32) -> RichChar {
+        RichChar { c, bbox: RectF { x0, y0: 0.0, x1, y1: 10.0 }, size: 10.0, font: 0, bold: false, argb: 0 }
+    }
+
+    #[test]
+    fn ligatures_are_recognised_by_their_zero_width_letters() {
+        let ffi = [ch('f', 0.0, 8.0), ch('f', 8.0, 8.0), ch('i', 8.0, 8.0), ch('x', 9.0, 15.0)];
+        assert_eq!(ligature(&ffi), Some(('\u{FB03}', 3)));
+        let fi = [ch('f', 0.0, 6.0), ch('i', 6.0, 6.0)];
+        assert_eq!(ligature(&fi), Some(('\u{FB01}', 2)));
+        // Letters with width are letters: "of" + "i".
+        assert_eq!(ligature(&[ch('f', 0.0, 4.0), ch('i', 4.0, 6.0)]), None);
+        assert_eq!(ligature(&[ch('f', 0.0, 4.0)]), None);
+    }
+
+    #[test]
+    fn split_gives_each_letter_a_share_of_the_box() {
+        let parts: Vec<RichChar> = split_char(ch('f', 0.0, 9.0), "ffi", true).collect();
+        assert_eq!(parts.iter().map(|c| c.c).collect::<String>(), "ffi");
+        assert!((parts[1].bbox.x0 - 3.0).abs() < 1e-4 && (parts[2].bbox.x1 - 9.0).abs() < 1e-4);
+        assert_eq!(split_char(ch('f', 0.0, 9.0), "", true).count(), 0);
+        // In a vertical line the letters stack.
+        let stacked: Vec<RichChar> = split_char(ch('f', 0.0, 9.0), "fi", false).collect();
+        assert!((stacked[1].bbox.y0 - 5.0).abs() < 1e-4 && stacked[1].bbox.x1 == 9.0);
     }
 }

@@ -44,7 +44,7 @@ pub fn glyph_text(font: &str, glyph: &str) -> Option<String> {
 /// Normalised font name: lower case, without the subset prefix `ABCDEF+` and
 /// without the random word some producers put in front of an Advent name
 /// (`XxkbtbAdvP4C4E46`).
-fn family(font: &str) -> String {
+pub(crate) fn family(font: &str) -> String {
     let mut s = font;
     if s.len() > 7 && s.as_bytes()[6] == b'+' && s[..6].bytes().all(|b| b.is_ascii_uppercase()) {
         s = &s[7..];
