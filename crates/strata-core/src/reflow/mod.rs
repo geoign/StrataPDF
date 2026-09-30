@@ -1322,11 +1322,17 @@ fn heading_number(t: &str) -> Option<u8> {
     None
 }
 
+/// Text set letter by letter: four or more tokens, nearly all single letters.
+fn letter_spaced(t: &str) -> bool {
+    let tokens: Vec<&str> = t.split_whitespace().collect();
+    tokens.len() >= 4 && tokens.iter().filter(|w| w.chars().count() == 1).count() * 10 >= tokens.len() * 8
+}
+
 /// Front-matter headings that are headings even before the body starts.
 fn is_front_heading(t: &str) -> bool {
     // Compared without spaces: tracked capitals come with stray ones ("SU MMARY").
     let l: String = t.trim().trim_end_matches([':', '.']).to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
-    ["abstract", "summary", "keypoints", "keywords", "highlights", "plainlanguagesummary", "introduction", "要旨", "概要", "要約", "はじめに", "序論", "緒言"].contains(&l.as_str())
+    ["abstract", "summary", "keypoints", "keywords", "highlights", "plainlanguagesummary", "introduction", "articleinfo", "要旨", "概要", "要約", "はじめに", "序論", "緒言"].contains(&l.as_str())
 }
 
 /// An author line: personal names ("A. B. Surname", "Firstname Surname",
@@ -2461,7 +2467,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             let short = short && sups <= 2;
             // A heading has a word of two letters, or is a bare section number ("3.2")
             // whose title follows.
-            let wordy = text.split_whitespace().any(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2);
+            // (Letter-spaced text counts as the words it spells: "a b s t r a c t".)
+            let spelled: String = if letter_spaced(&text) { text.chars().filter(|c| !c.is_whitespace()).collect() } else { text.clone() };
+            let wordy = spelled.split_whitespace().any(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2);
             let number_only = !text.trim().is_empty() && text.trim().chars().all(|c| c.is_ascii_digit() || c == '.');
             let level = if let Some(c) = u.class {
                 // The layout model decides what is a heading; size and numbering give the level.
@@ -2549,6 +2557,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 level = Some(heading_number(&text).map_or(3, |d| (d + 1).min(6)));
             } else if level.is_none() && caps {
                 level = Some(heading_number(&text).map_or(2, |d| (d + 1).min(6)));
+            } else if level.is_none() && u.lines.len() == 1 && is_front_heading(&text) {
+                // A line that is only "Abstract", "Summary", "Keywords"...
+                level = Some(2);
             } else if level.is_none() && u.lines.len() <= 2 && refs::is_refs_heading(&text) {
                 level = Some(2);
             }
