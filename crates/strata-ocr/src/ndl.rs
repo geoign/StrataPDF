@@ -245,28 +245,56 @@ impl NdlOcr {
         Ok(text)
     }
 
+    /// The line read by each recognizer (30, 50 and 100 characters), for diagnosis.
+    #[doc(hidden)]
+    pub fn read_with_each(&self, line: &RgbImage) -> Result<[String; 3], OcrError> {
+        Ok([self.read(&self.rec30, line)?, self.read(&self.rec50, line)?, self.read(&self.rec100, line)?])
+    }
+
     /// Cascade: short model first, escalate when the result nearly fills it;
     /// very long horizontal lines are read in two halves.
     fn read_line(&self, img: &RgbImage, class: f32) -> Result<String, OcrError> {
         let class = class.round() as i32;
+        // The line's length in characters (Japanese characters are about square and
+        // take some 80% of the line's thickness). A model for shorter lines given a
+        // longer one may drop a stretch from its middle instead of stopping at its
+        // limit: a result far shorter than that goes on to the next model.
+        // (Characters without the spaces the models put after punctuation.)
+        let n = |t: &str| t.chars().filter(|c| !c.is_whitespace()).count();
+        let (w, h) = img.dimensions();
+        let expected = w.max(h) as f32 / (w.min(h).max(1) as f32 * 0.8);
+        let dropped = |t: &str| (n(t) as f32) < expected * 0.7;
         if class == 3 {
             let t = self.read(&self.rec30, img)?;
-            if t.chars().count() < 25 {
+            if n(&t) < 25 && !dropped(&t) {
                 return Ok(t);
             }
         }
+        let mut shorter_model: Option<String> = None;
         if class == 3 || class == 2 {
             let t = self.read(&self.rec50, img)?;
-            if t.chars().count() < 45 {
+            if n(&t) < 45 && !dropped(&t) {
                 return Ok(t);
             }
+            shorter_model = Some(t);
         }
         let t = self.read(&self.rec100, img)?;
-        let (w, h) = img.dimensions();
-        if t.chars().count() >= 98 && h < w {
+        if n(&t) >= 98 && h < w {
             let left = imageops::crop_imm(img, 0, 0, w / 2, h).to_image();
             let right = imageops::crop_imm(img, w / 2, 0, w - w / 2, h).to_image();
             return Ok(self.read(&self.rec100, &left)? + &self.read(&self.rec100, &right)?);
+        }
+        // The larger model can drop a stretch too: when it reads clearly less than the
+        // 50-character model (asked now if it was not), that reading stands.
+        let other = match shorter_model {
+            Some(s) => Some(s),
+            None if dropped(&t) => Some(self.read(&self.rec50, img)?),
+            None => None,
+        };
+        if let Some(s) = other
+            && n(&s) * 10 > n(&t) * 12
+        {
+            return Ok(s);
         }
         Ok(t)
     }
@@ -326,11 +354,31 @@ impl OcrEngine for NdlOcr {
                 Class::Line(kind) => raw_lines.push((bb, kind, conf, count)),
             }
         }
-        // The detector returns overlapping candidates; keep the most confident line.
+        // The detector returns overlapping candidates; keep the most confident line,
+        // unless a less confident one is the whole line that it is part of: the same
+        // thickness, longer, holding it (and any other parts kept). Keeping the
+        // confident part lost the rest of the line, a clause or a sentence.
         raw_lines.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let area = |r: &[f32; 4]| ((r[2] - r[0]) * (r[3] - r[1])).max(1e-3);
         let mut kept: Vec<([f32; 4], LineKind, f32, f32)> = Vec::with_capacity(raw_lines.len());
         for l in raw_lines {
-            if !kept.iter().any(|k| overlap(&k.0, &l.0) > 0.4) {
+            let over: Vec<usize> = (0..kept.len()).filter(|&i| overlap(&kept[i].0, &l.0) > 0.4).collect();
+            if over.is_empty() {
+                kept.push(l);
+                continue;
+            }
+            let b = l.0;
+            let vertical = b[3] - b[1] > b[2] - b[0];
+            let thickness = |r: &[f32; 4]| if vertical { r[2] - r[0] } else { r[3] - r[1] };
+            let whole = over.iter().all(|&i| {
+                let k = &kept[i].0;
+                let inside = ((k[2].min(b[2]) - k[0].max(b[0])).max(0.0) * (k[3].min(b[3]) - k[1].max(b[1])).max(0.0)) / area(k);
+                inside > 0.7 && thickness(&b) <= thickness(k) * 1.3 && area(&b) > area(k) * 1.3
+            });
+            if whole {
+                for &i in over.iter().rev() {
+                    kept.remove(i);
+                }
                 kept.push(l);
             }
         }
