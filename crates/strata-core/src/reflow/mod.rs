@@ -1794,7 +1794,12 @@ fn run_layout(model: &strata_ocr::layout::LayoutModel, pages: &mut [PageData], s
                         break;
                     }
                     let p = &pages_ref[i];
+                    // Feature extraction scans every drawing: a detailed map (hundreds of
+                    // thousands of paths) takes many seconds for a handful of text lines,
+                    // which the heuristics handle alone.
+                    let drawings = p.rich.blocks.iter().filter(|b| matches!(b, RichBlock::Vector { .. })).count();
                     if !p.ocr
+                        && drawings <= 20_000
                         && let Some(dl) = &p.dl
                     {
                         match crate::layout::analyze_display_list(model, dl, p.rich.width, p.rich.height) {
