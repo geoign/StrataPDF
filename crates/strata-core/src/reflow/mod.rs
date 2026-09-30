@@ -731,9 +731,17 @@ fn line_number_column(units: &[Unit], body: f32) -> Vec<usize> {
         let right = others.iter().filter(|b| b.x1 > x0 + 1.0).count();
         left * 10 <= others.len() || right * 10 <= others.len()
     };
+    // Line numbers count up in steps of 1, 5 or 10 (a column of table values does not).
+    let counts_up = |g: &[usize]| {
+        let mut v: Vec<(f32, u32)> = g.iter().filter_map(|&i| units[i].text().trim().parse::<u32>().ok().map(|n| (units[i].bbox.y0, n))).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let steps: Vec<i64> = v.windows(2).map(|w| w[1].1 as i64 - w[0].1 as i64).collect();
+        let regular = steps.iter().filter(|&&d| matches!(d, 1 | 2 | 5 | 10)).count();
+        !steps.is_empty() && regular * 10 >= steps.len() * 7
+    };
     groups
         .into_iter()
-        .filter(|g| g.1.len() >= 8 && one_side(g.1.iter().map(|&i| units[i].bbox.x0).fold(f32::INFINITY, f32::min), g.0))
+        .filter(|g| g.1.len() >= 8 && counts_up(&g.1) && one_side(g.1.iter().map(|&i| units[i].bbox.x0).fold(f32::INFINITY, f32::min), g.0))
         .flat_map(|g| g.1)
         .collect()
 }
@@ -755,6 +763,29 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             _ => 0,
         })
         .sum();
+    // Lines of the margin bands with their text length and whether they repeat.
+    let margin_lines: Vec<(RectF, usize, bool)> = p
+        .rich
+        .blocks
+        .iter()
+        .flat_map(|b| match b {
+            RichBlock::Text { lines, .. } => lines.iter().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .filter(|l| l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85)
+        .map(|l| {
+            let t = l.text();
+            (l.bbox, t.trim().chars().count(), repeated.get(&digits_key(&t)).copied().unwrap_or(0) >= threshold)
+        })
+        .collect();
+    // A running head stands alone in its band (a page number or another running
+    // head beside it at most); a repeated fragment inside running text does not.
+    let alone_in_band = |b: &RectF| {
+        !margin_lines.iter().any(|(o, len, rep)| {
+            let v = o.y1.min(b.y1) - o.y0.max(b.y0);
+            (o.x0 - b.x0).abs() + (o.y0 - b.y0).abs() > 0.5 && v > 0.5 * o.height().min(b.height()) && *len > 8 && !rep
+        })
+    };
     for b in &p.rich.blocks {
         match b {
             RichBlock::Text { lines, .. } => {
@@ -769,7 +800,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                         if opts.strip_headers && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
                             let t = l.text();
                             let k = digits_key(&t);
-                            if repeated.get(&k).copied().unwrap_or(0) >= threshold && n_pages > 1 {
+                            if repeated.get(&k).copied().unwrap_or(0) >= threshold && n_pages > 1 && k.chars().filter(|&c| c != '#').count() >= 3 && alone_in_band(&l.bbox) {
                                 return false;
                             }
                             // Lone page numbers in the margins.
@@ -928,9 +959,15 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     // graphics around it make a figure.
     let grow = |r: &RectF| RectF { x0: r.x0 - margin, y0: r.y0 - margin, x1: r.x1 + margin, y1: r.y1 + margin };
     let mut clusters: Vec<(RectF, Vec<usize>)> = Vec::new();
+    // A line of running text the model put into a picture stays text.
+    let prose_line = |u: &Unit| {
+        let t = u.text();
+        t.split_whitespace().count() >= 8 && prose_like(&t)
+    };
     for (i, slot) in texts.iter().enumerate() {
         if let Some(u) = slot
             && u.class == Some(PICTURE)
+            && !prose_line(u)
         {
             match clusters.iter_mut().find(|c| overlap_frac(&u.bbox, &grow(&c.0)) > 0.0) {
                 Some(c) => {
@@ -956,7 +993,9 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                 }
             }
         }
-        if graphics >= 3 {
+        // Drawings around the text, several labels together, or a scan (the
+        // drawing is in the page image): a figure.
+        if graphics >= 1 || members.len() >= 3 || p.scan {
             for i in members {
                 texts[i] = None;
             }
@@ -1014,7 +1053,8 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     let mut out: Vec<Unit> = Vec::new();
     for u in texts.into_iter().flatten() {
         let inside = figs.iter().any(|f| overlap_frac(&u.bbox, f) > 0.8);
-        let bodyish = u.lines.len() >= 3 && (u.size() - body).abs() < body * 0.1;
+        // Running text survives inside a figure's box (on a scan, sizes vary).
+        let bodyish = (u.lines.len() >= 3 && (u.size() - body).abs() < body * 0.1) || (prose_like(&u.text()) && u.text().split_whitespace().count() >= 8);
         if inside && !bodyish {
             continue;
         }
@@ -1289,6 +1329,45 @@ fn is_strong_byline(t: &str) -> bool {
     is_byline(t) && (initials || separators >= 2 || t.contains(['*', '＊', '∗', '†', '‡']) || t.chars().any(|c| c.is_ascii_digit()))
 }
 
+/// The opening of a note (affiliation, correspondence, dates, editor, copyright,
+/// supplementary material), as opposed to running text.
+fn note_opening(t: &str) -> bool {
+    let t = t.trim_start();
+    let l = t.to_lowercase();
+    const STARTS: [&str; 22] = [
+        "corresponding author",
+        "*corresponding",
+        "* corresponding",
+        "e-mail",
+        "email:",
+        "email address",
+        "received",
+        "accepted",
+        "editorial handling",
+        "handling editor",
+        "responsible editor",
+        "communicated by",
+        "citation:",
+        "present address",
+        "current address",
+        "tel.",
+        "tel:",
+        "fax:",
+        "electronic supplementary material",
+        "supplementary information",
+        "additional supporting information",
+        "orcid",
+    ];
+    STARTS.iter().any(|s| l.starts_with(s)) || t.starts_with(['*', '†', '‡', '§', '¶', '©', '∗'])
+}
+
+/// "References", "Literature Cited", "参考文献"...
+fn is_references_heading(t: &str) -> bool {
+    let l = t.trim().trim_end_matches([':', '.']).to_lowercase();
+    let l = l.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ');
+    ["references", "reference", "bibliography", "literature cited", "references cited", "cited literature", "works cited", "参考文献", "引用文献", "文献", "references and notes"].contains(&l)
+}
+
 /// Publisher boilerplate that is not part of the text: copyright and licence
 /// lines, banners, download stamps. Shown as notes and kept out of paragraphs.
 fn is_boilerplate(t: &str) -> bool {
@@ -1490,15 +1569,24 @@ fn ends_sentence(t: &str) -> bool {
     t.ends_with(['.', '!', '?', ':', '。', '．', '！', '？', '」', '』', '）', ')']) || t.is_empty()
 }
 
+#[cfg(test)]
 fn continues(prev: &str, next: &str) -> bool {
+    continues_strongly(prev, next) || continues_weakly(prev, next)
+}
+
+/// `next` carries on the sentence `prev` left open: it starts in lowercase or
+/// with a comma or semicolon.
+fn continues_strongly(prev: &str, next: &str) -> bool {
     let Some(first) = next.trim_start().chars().next() else { return false };
-    if ends_sentence(prev) {
-        return false;
-    }
-    if next.starts_with(['\u{3000}', ' ']) {
-        return false;
-    }
-    first.is_lowercase() || is_cjk(first) || first.is_ascii_digit() || matches!(first, ',' | ';' | '(' | '[' | '、')
+    !ends_sentence(prev) && !next.starts_with(['\u{3000}', ' ']) && (first.is_lowercase() || matches!(first, ',' | ';'))
+}
+
+/// `next` may carry on `prev`: it starts with a CJK character, a digit or an
+/// opening bracket, as the next sentence of a note or a list can too; the
+/// layout has to confirm it.
+fn continues_weakly(prev: &str, next: &str) -> bool {
+    let Some(first) = next.trim_start().chars().next() else { return false };
+    !ends_sentence(prev) && !next.starts_with(['\u{3000}', ' ']) && (is_cjk(first) || first.is_ascii_digit() || matches!(first, '(' | '[' | '、'))
 }
 
 /// Whether a text unit starts or ends its column: no other text of the same
@@ -1510,9 +1598,17 @@ fn column_edges(units: &[Unit], i: usize) -> (bool, bool) {
         let overlap = u.bbox.x1.min(o.bbox.x1) - u.bbox.x0.max(o.bbox.x0);
         overlap > 0.3 * u.bbox.width().min(o.bbox.width()) && o.bbox.width() < u.bbox.width() * 1.5
     };
+    // Only the running text of the column counts: captions, figure labels,
+    // tables and notes above or below it are floats.
+    let size = u.size();
+    let flow = |o: &Unit| {
+        !matches!(o.class, Some(CAPTION | PICTURE | FOOTNOTE | PAGE_HEADER | PAGE_FOOTER | strata_ocr::layout::TABLE))
+            && caption_kind(&o.text()).is_none()
+            && (o.size() - size).abs() <= size.max(o.size()) * 0.08
+    };
     let (mut above, mut below) = (f32::NEG_INFINITY, f32::INFINITY);
     for (j, o) in units.iter().enumerate() {
-        if j == i || o.kind != UnitKind::Text || !same_column(o) {
+        if j == i || o.kind != UnitKind::Text || !same_column(o) || !flow(o) {
             continue;
         }
         if o.bbox.y1 <= u.bbox.y0 + 2.0 {
@@ -1531,6 +1627,39 @@ fn column_edges(units: &[Unit], i: usize) -> (bool, bool) {
     let top = above == f32::NEG_INFINITY || figure_between(above, u.bbox.y0);
     let bottom = below == f32::INFINITY || figure_between(u.bbox.y1, below);
     (top, bottom)
+}
+
+/// A note (footnote, affiliation, correspondence) rather than running text:
+/// it opens like one (an affiliation number set as a superscript, a note
+/// mark, "Corresponding author", "Received"...) in the front matter or the
+/// lower half of the page; or it is set smaller than the running text at the
+/// foot of a column, with no running text of that column below it.
+fn is_note(u: &Unit, units: &[Unit], i: usize, text: &str) -> bool {
+    let Some(first) = u.lines.first() else { return false };
+    let size = u.size();
+    let page_h = units.iter().map(|o| o.bbox.y1).fold(0.0f32, f32::max).max(1.0);
+    let body = {
+        // The running text of the page: the most common size of multi-line units.
+        let mut hist: HashMap<i32, usize> = HashMap::new();
+        for o in units.iter().filter(|o| o.kind == UnitKind::Text && o.lines.len() >= 3) {
+            *hist.entry((o.size() * 2.0).round() as i32).or_default() += o.chars();
+        }
+        hist.into_iter().max_by_key(|e| e.1).map_or(size, |e| e.0 as f32 / 2.0)
+    };
+    if caption_kind(text).is_some() || u.lines.len() > 12 || size > body * 1.02 {
+        return false;
+    }
+    let mark = first.chars.first().is_some_and(|c| c.c.is_ascii_digit() && c.size < line_size(first) * 0.8);
+    if (mark || note_opening(text)) && u.lines.len() <= 8 {
+        return true;
+    }
+    let low = u.bbox.y0 > page_h * 0.6;
+    let smaller = size <= body * 0.94;
+    let body_below = units.iter().enumerate().any(|(j, o)| {
+        let overlap = u.bbox.x1.min(o.bbox.x1) - u.bbox.x0.max(o.bbox.x0);
+        j != i && o.kind == UnitKind::Text && overlap > 0.3 * u.bbox.width().min(o.bbox.width()) && o.bbox.y0 >= u.bbox.y1 - 2.0 && (o.size() - body).abs() <= body * 0.06 && o.lines.len() >= 2
+    });
+    low && smaller && !body_below
 }
 
 /// Where the last paragraph unit sat, for joining a sentence cut by a column,
@@ -1793,6 +1922,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // section (or a long paragraph); before it, on the first page, lie the title,
     // authors and affiliations.
     let mut body_started = false;
+    // Inside a reference list (its small type at the foot of columns is no note).
+    let mut in_refs = false;
     for (pi, p) in pages.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
@@ -2200,6 +2331,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             if level.is_some() && (is_front_heading(&text) || heading_number(&text).is_some()) {
                 body_started = true;
             }
+            if level.is_some() {
+                in_refs = is_references_heading(&text);
+            }
             let mut spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
             // Run-in heading: "4.1.1. Porous flow bands  Body text..." in one block.
             if level.is_none() {
@@ -2263,10 +2397,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         last_heading = Some((doc.nodes.len() - 1, p.page, u.bbox, size));
                     }
                 }
+            } else if u.class == Some(FOOTNOTE) || (!vertical && !in_refs && is_note(u, &ordered, i, &text)) {
+                doc.nodes.push(Node::Footnote { spans });
             } else if is_list_marker(&text) {
                 doc.nodes.push(Node::ListItem { spans });
-            } else if u.class == Some(FOOTNOTE) || (u.class.is_none() && !vertical && size <= body * 0.92 && u.bbox.y0 > p.rich.height * 0.6 && u.lines.len() <= 8) {
-                doc.nodes.push(Node::Footnote { spans });
             } else {
                 // Continuation across a column or page break; figures, tables,
                 // footnotes and stray captions that interrupt a paragraph are floats
@@ -2287,7 +2421,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             if !vertical
                                 && !p.scan
                                 && skipped < 3
-                                && para_size.get(ix).is_some_and(|&(s, pg)| pg + 1 >= p.page && (s - size).abs() > s.max(size) * 0.12) =>
+                                && para_size.get(ix).is_some_and(|&(s, pg)| pg + 1 >= p.page && (s - size).abs() > s.max(size) * 0.07) =>
                         {
                             skipped += 1;
                             false
@@ -2330,8 +2464,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             // OCR sizes are estimates.
                             // A short fragment (the end of a sentence in a math font) is exempt.
                             let fragment = u.lines.len() == 1 && text.chars().count() <= 30;
-                            let same_size = p.scan || fragment || last_para.as_ref().is_none_or(|l| Some(l.node) != prev || (l.size - size).abs() <= l.size.max(size) * 0.12);
-                            same_size && (continues(&prev_text, &text) || (!ends_sentence(&prev_text) && !first_indented && bodyish && ((cut && at_top) || adjacent)))
+                            let same_size = p.scan || fragment || last_para.as_ref().is_none_or(|l| Some(l.node) != prev || (l.size - size).abs() <= l.size.max(size) * 0.07);
+                            // A CJK character, digit or bracket continues only where the
+                            // layout agrees: the next lines of the column, or a column top
+                            // after a column cut at its edge.
+                            let weak = continues_weakly(&prev_text, &text) && (adjacent || (cut && at_top));
+                            same_size && (continues_strongly(&prev_text, &text) || weak || (!ends_sentence(&prev_text) && !first_indented && bodyish && ((cut && at_top) || adjacent)))
                         }
                     }
                     _ => false,
