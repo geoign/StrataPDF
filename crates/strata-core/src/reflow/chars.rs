@@ -2,22 +2,9 @@
 //! exotic spaces, spaces MuPDF invents or misses, doubled glyphs from broken
 //! ToUnicode maps, and Symbol-font private-use code points.
 
+use crate::glyphs::symbol_char;
 use crate::rich::RichChar;
 use crate::text::FontInfo;
-
-/// Adobe Symbol encoding (codes 0x20-0xFF) for the code points MuPDF gives as
-/// U+F0xx when a Symbol font has no usable ToUnicode. 0 = keep the code point.
-fn symbol_char(code: u8) -> Option<char> {
-    const LOW: &str = " !∀#∃%&∋()∗+,−./0123456789:;<=>?≅ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟΠΘΡΣΤΥςΩΞΨΖ[∴]⊥_‾αβχδεφγηιϕκλμνοπθρστυϖωξψζ{|}∼";
-    const HIGH: &str = "€ϒ′≤⁄∞ƒ♣♦♥♠↔←↑→↓°±″≥×∝∂•÷≠≡≈…⏐⎯↵ℵℑℜ℘⊗⊕∅∩∪⊃⊇⊄⊂⊆∈∉∠∇®©™∏√⋅¬∧∨⇔⇐⇑⇒⇓◊〈®©™∑";
-    match code {
-        0x20..=0x7E => LOW.chars().nth((code - 0x20) as usize),
-        0xA0..=0xE5 => HIGH.chars().nth((code - 0xA0) as usize),
-        0xF1 => Some('〉'),
-        0xF2 => Some('∫'),
-        _ => None,
-    }
-}
 
 fn is_zero_width(c: char) -> bool {
     matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}')

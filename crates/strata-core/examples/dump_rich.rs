@@ -11,7 +11,7 @@ fn main() {
     let b = page.bounds().unwrap();
     let t = std::time::Instant::now();
     let tp = page.to_text_page(reflow_flags()).unwrap();
-    let rp = RichPage::from_text_page(&tp, b.width(), b.height());
+    let rp = RichPage::from_page(&page, &tp, b.width(), b.height());
     eprintln!("extract {:?}", t.elapsed());
     let mut depth = 0usize;
     for blk in &rp.blocks {

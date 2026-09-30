@@ -316,7 +316,7 @@ pub(crate) fn text_layer_unusable(eng: &Engine, page: u32) -> bool {
     let Ok(pg) = eng.load_page(page as i32) else { return false };
     let Ok(b) = pg.bounds() else { return false };
     let Ok(tp) = pg.to_text_page(reflow_flags()) else { return true };
-    crate::reflow::needs_ocr(&RichPage::from_text_page(&tp, b.width(), b.height())).is_some()
+    crate::reflow::needs_ocr(&RichPage::from_page(&pg, &tp, b.width(), b.height())).is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

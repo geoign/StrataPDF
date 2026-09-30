@@ -1909,7 +1909,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         let b = page.bounds().map_err(|e| e.to_string())?;
         let tp = page.to_text_page(reflow_flags() | mupdf::TextPageFlags::COLLECT_VECTORS);
         let Ok(tp) = tp else { continue };
-        let mut rich = RichPage::from_text_page(&tp, b.width(), b.height());
+        let mut rich = RichPage::from_page(&page, &tp, b.width(), b.height());
         // OCR text replaces an unusable text layer.
         let mut from_ocr = false;
         if let Some(o) = ocr.get(p as u32)
