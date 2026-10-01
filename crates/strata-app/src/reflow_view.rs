@@ -40,6 +40,8 @@ pub struct ReflowPane {
     visible: bool,
     theme: Option<Theme>,
     font: Option<f32>,
+    /// Font families last sent to the page (JSON of CSS variables).
+    fonts: Option<String>,
     /// 1-based page and page-space y of the first visible block.
     pub at_page: u32,
     pub at_y: f32,
@@ -102,6 +104,12 @@ const JS_BRIDGE: &str = r#"
     document.body.style.fontSize = (17 * s) + 'px';
     if (keep) keep.scrollIntoView({block: 'start', inline: 'start'});
   };
+  // Font families as CSS variables: {"--font-body": "...", ...}.
+  window.strataSetFonts = v => {
+    const keep = firstVisible();
+    for (const k in v) document.documentElement.style.setProperty(k, v[k]);
+    if (keep) keep.scrollIntoView({block: 'start', inline: 'start'});
+  };
   let last = 0;
   const report = () => {
     const el = firstVisible();
@@ -149,6 +157,7 @@ impl ReflowPane {
             visible: false,
             theme: None,
             font: None,
+            fonts: None,
             at_page: 1,
             at_y: 0.0,
             pending_goto: None,
@@ -287,6 +296,7 @@ impl ReflowPane {
                     self.page_ready = true;
                     self.theme = None;
                     self.font = None;
+                    self.fonts = None;
                     self.pending_goto = Some((self.at_page, self.at_y));
                     self.unsent = self.translations.keys().chain(self.failed.iter()).copied().collect();
                 }
@@ -334,7 +344,7 @@ impl ReflowPane {
     /// Draw progress in egui, or place the webview over `rect` (and give it the
     /// keyboard when it appears in the focused tab).
     #[allow(clippy::too_many_arguments)]
-    pub fn ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: Option<&winit::window::Window>, ctx: Option<&mut wry::WebContext>, theme: Theme, font: f32, focused: bool) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect, window: Option<&winit::window::Window>, ctx: Option<&mut wry::WebContext>, theme: Theme, font: f32, fonts: &crate::text_font::TextFonts, focused: bool) {
         self.poll();
         if let Some(e) = &self.error {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, format!("テキスト化できませんでした\n{e}"), egui::FontId::proportional(15.0), egui::Color32::RED);
@@ -405,6 +415,13 @@ impl ReflowPane {
             ));
             self.font = Some(font);
         }
+        let fonts = fonts.json();
+        if self.fonts.as_ref() != Some(&fonts) {
+            let _ = w.evaluate_script(&format!(
+                "(function g(n){{ if (window.strataSetFonts) window.strataSetFonts({fonts}); else if (n < 50) setTimeout(() => g(n + 1), 100); }})(0)"
+            ));
+            self.fonts = Some(fonts);
+        }
         if let Some((p, y)) = self.pending_goto.take() {
             // The page may still be loading; the script defines strataGotoPos at the end.
             let _ = w.evaluate_script(&format!(
@@ -438,10 +455,10 @@ impl ReflowPane {
         std::fs::write(path, md)
     }
 
-    pub fn export_html(&self, path: &Path, theme: Theme) -> std::io::Result<()> {
+    pub fn export_html(&self, path: &Path, theme: Theme, fonts: &crate::text_font::TextFonts) -> std::io::Result<()> {
         let Some(d) = &self.doc else { return Ok(()) };
         let src = |im: &ReflowImage| format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&im.png));
-        let html = output::to_html(d, &HtmlOptions { theme, page_markers: false, image_src: &src, extra_css: "", bilingual: None });
+        let html = output::to_html(d, &HtmlOptions { theme, page_markers: false, image_src: &src, extra_css: &fonts.css_rule(), bilingual: None });
         std::fs::write(path, html)
     }
 }

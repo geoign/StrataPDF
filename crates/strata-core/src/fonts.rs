@@ -25,6 +25,18 @@ struct Face {
 #[derive(Default)]
 struct Index {
     by_name: HashMap<String, Vec<Face>>,
+    families: Vec<FontFamily>,
+}
+
+/// An installed font family, for font pickers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontFamily {
+    /// English family name (what CSS and DirectWrite match).
+    pub name: String,
+    /// Japanese family name when the font has one, else `name`.
+    pub display: String,
+    /// Has kana and kanji.
+    pub japanese: bool,
 }
 
 static INDEX: OnceLock<Index> = OnceLock::new();
@@ -63,7 +75,7 @@ fn strip_subset(name: &str) -> &str {
     }
 }
 
-fn index_file(path: &Path, out: &mut Vec<(String, Face)>) {
+fn index_file(path: &Path, out: &mut Vec<(String, Face)>, fams: &mut Vec<FontFamily>) {
     let Ok(file) = std::fs::File::open(path) else { return };
     // SAFETY: font files are not modified while we read their name tables.
     let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { return };
@@ -72,6 +84,9 @@ fn index_file(path: &Path, out: &mut Vec<(String, Face)>) {
     for index in 0..n {
         let Ok(face) = ttf_parser::Face::parse(&map, index) else { continue };
         let f = Face { path: path.clone(), index, bold: face.is_bold() || face.weight().to_number() >= 600, italic: face.is_italic() || face.is_oblique() };
+        if let Some(fam) = family_of(&face) {
+            fams.push(fam);
+        }
         for rec in face.names() {
             use ttf_parser::name_id::*;
             if !matches!(rec.name_id, FAMILY | FULL_NAME | POST_SCRIPT_NAME | TYPOGRAPHIC_FAMILY) {
@@ -82,6 +97,26 @@ fn index_file(path: &Path, out: &mut Vec<(String, Face)>) {
             }
         }
     }
+}
+
+/// The family a face belongs to; the typographic family (name ID 16) groups the
+/// weights that the legacy family name (ID 1) splits into separate families.
+fn family_of(face: &ttf_parser::Face) -> Option<FontFamily> {
+    use ttf_parser::Language;
+    use ttf_parser::name_id::{FAMILY, TYPOGRAPHIC_FAMILY};
+    let get = |id: u16, ja: bool| {
+        let want = if ja { Language::Japanese_Japan } else { Language::English_UnitedStates };
+        // Mac-platform records share the language but do not decode to a string.
+        face.names().into_iter().filter(|r| r.name_id == id && r.language() == want).find_map(|r| r.to_string())
+    };
+    let name = get(TYPOGRAPHIC_FAMILY, false).or_else(|| get(FAMILY, false))?;
+    // Vertical-writing aliases of CJK fonts.
+    if name.starts_with('@') {
+        return None;
+    }
+    let display = get(TYPOGRAPHIC_FAMILY, true).or_else(|| get(FAMILY, true)).unwrap_or_else(|| name.clone());
+    let japanese = face.glyph_index('あ').is_some() && face.glyph_index('漢').is_some();
+    Some(FontFamily { name, display, japanese })
 }
 
 fn build_index() -> Index {
@@ -99,28 +134,38 @@ fn build_index() -> Index {
     }
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
     let chunk = files.len().div_ceil(threads).max(1);
-    let parts: Vec<Vec<(String, Face)>> = std::thread::scope(|s| {
+    let parts: Vec<(Vec<(String, Face)>, Vec<FontFamily>)> = std::thread::scope(|s| {
         let handles: Vec<_> = files
             .chunks(chunk)
             .map(|c| {
                 s.spawn(move || {
-                    let mut out = Vec::new();
+                    let (mut out, mut fams) = (Vec::new(), Vec::new());
                     for p in c {
-                        index_file(p, &mut out);
+                        index_file(p, &mut out, &mut fams);
                     }
-                    out
+                    (out, fams)
                 })
             })
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
     let mut idx = Index::default();
-    for (name, face) in parts.into_iter().flatten() {
-        let v = idx.by_name.entry(name).or_default();
-        if !v.iter().any(|f| f.path == face.path && f.index == face.index) {
-            v.push(face);
+    for (names, fams) in parts {
+        for (name, face) in names {
+            let v = idx.by_name.entry(name).or_default();
+            if !v.iter().any(|f| f.path == face.path && f.index == face.index) {
+                v.push(face);
+            }
         }
+        idx.families.extend(fams);
     }
+    idx.families.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    idx.families.dedup_by(|a, b| {
+        let same = a.name == b.name;
+        // A family is Japanese if any of its faces is.
+        b.japanese |= same && a.japanese;
+        same
+    });
     idx
 }
 
@@ -152,6 +197,11 @@ pub fn find_face(names: &[&str]) -> Option<(PathBuf, u32)> {
         let f = IndexedFontLoader::pick(idx.by_name.get(&normalize(n))?, false, false);
         Some((f.path.to_path_buf(), f.index))
     })
+}
+
+/// Installed font families sorted by name. Blocks until the index is built.
+pub fn families() -> &'static [FontFamily] {
+    &index().families
 }
 
 #[derive(Default)]

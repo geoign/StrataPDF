@@ -182,10 +182,12 @@ const CSS: &str = r#"
 :root { --bg:#fbfaf7; --fg:#1d1d1f; --muted:#6b6b70; --rule:#dddad2; --link:#1f5fbf; --card:#ffffff; --pm:#b5b1a6; --hover:rgba(0,0,0,.035); }
 @media (prefers-color-scheme: dark) { :root:not(.light) { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; --hover:rgba(255,255,255,.04); } }
 :root.dark { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; --hover:rgba(255,255,255,.04); }
+/* Fonts; the viewer replaces these with the user's choice. */
+:root { --font-body: "Charis SIL", "Cambria", "Georgia", "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "Source Han Serif", "BIZ UDPMincho", "Yu Mincho", serif; --font-ja: "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "Source Han Serif", "BIZ UDPMincho", "Yu Mincho", serif; --font-head: "Segoe UI", "Noto Sans JP", "Noto Sans CJK JP", "Source Han Sans JP", "Source Han Sans", "BIZ UDPGothic", "Yu Gothic", sans-serif; }
 html { background: var(--bg); color: var(--fg); }
-body { margin: 0; font-family: "Charis SIL", "Cambria", "Georgia", "Yu Mincho", "YuMincho", "Noto Serif JP", serif; font-size: 17px; line-height: 1.7; }
+body { margin: 0; font-family: var(--font-body); font-size: 17px; line-height: 1.7; }
 main { max-width: 46em; margin: 0 auto; padding: 2.5em 1.5em 6em; position: relative; }
-h1, h2, h3, h4, h5, h6 { font-family: "Segoe UI", "Yu Gothic UI", "Yu Gothic", "Meiryo", sans-serif; line-height: 1.35; margin: 1.6em 0 .6em; }
+h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); line-height: 1.35; margin: 1.6em 0 .6em; }
 h1 { font-size: 1.7em; } h2 { font-size: 1.35em; } h3 { font-size: 1.15em; } h4, h5, h6 { font-size: 1em; }
 p { margin: 0 0 .9em; text-align: justify; hyphens: auto; }
 /* Long URLs and identifiers wrap instead of widening the page. */
@@ -212,7 +214,7 @@ ul { padding-left: 1.4em; } li { margin: .2em 0; }
 .pm-anchor { display: block; height: 0; }
 /* Vertical writing (Japanese books). */
 body.vertical { overflow-x: auto; overflow-y: hidden; }
-body.vertical main { writing-mode: vertical-rl; max-width: none; height: calc(100vh - 5em); margin: 0; padding: 2.5em 3em; font-family: "Yu Mincho", "YuMincho", "Noto Serif JP", serif; line-height: 1.9; }
+body.vertical main { writing-mode: vertical-rl; max-width: none; height: calc(100vh - 5em); margin: 0; padding: 2.5em 3em; font-family: var(--font-ja); line-height: 1.9; }
 body.vertical p { text-align: justify; margin: 0; }
 html:lang(ja) p { text-indent: 1em; }
 html:lang(ja) p.fn { text-indent: 0; }
@@ -223,7 +225,7 @@ main.bi-main { max-width: 96em; }
 .bi { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 2.4em; align-items: start; border-radius: 4px; }
 .bi > .full { grid-column: 1 / -1; }
 .bi:hover { background: var(--hover); }
-.bi .tr { font-family: "Yu Mincho", "YuMincho", "Noto Serif JP", serif; line-height: 1.85; }
+.bi .tr { font-family: var(--font-ja); line-height: 1.85; }
 /* Justifying Japanese with long Latin words stretches the gaps between characters. */
 .bi .tr p { text-indent: 1em; text-align: left; } .bi .tr p.fn, .bi .tr p.capt, .bi .tr p.li { text-indent: 0; }
 .bi .tr.pending::before { content: "…"; color: var(--muted); }

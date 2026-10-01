@@ -39,12 +39,14 @@ pub struct Settings {
     pub formula_latex: bool,
     /// Font size of the text view relative to the default.
     pub text_scale: f32,
+    /// Font families of the text view.
+    pub text_fonts: crate::text_font::TextFonts,
     pub translate: crate::translate_ui::TranslateSettings,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true, text_scale: 1.0, translate: Default::default() }
+        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true, text_scale: 1.0, text_fonts: Default::default(), translate: Default::default() }
     }
 }
 
@@ -662,6 +664,7 @@ struct Viewer<'a> {
     ocr: &'a mut crate::ocr_ui::OcrManager,
     latex: bool,
     text_scale: &'a mut f32,
+    text_fonts: &'a mut crate::text_font::TextFonts,
     translate: &'a mut crate::translate_ui::TranslateManager,
 }
 
@@ -690,6 +693,7 @@ impl TabViewer for Viewer<'_> {
             ocr: &mut *self.ocr,
             latex: self.latex,
             text_scale: &mut *self.text_scale,
+            text_fonts: &mut *self.text_fonts,
             translate: &mut *self.translate,
         };
         tab.ui(ui, &mut svc);
@@ -843,6 +847,7 @@ impl eframe::App for StrataApp {
                 ocr: &mut self.ocr,
                 latex: self.settings.formula_latex,
                 text_scale: &mut self.settings.text_scale,
+                text_fonts: &mut self.settings.text_fonts,
                 translate: &mut self.translate,
             };
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {

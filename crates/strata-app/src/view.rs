@@ -80,6 +80,8 @@ pub struct Services<'a> {
     pub latex: bool,
     /// Font size of the text view (shared by all tabs, saved in the settings).
     pub text_scale: &'a mut f32,
+    /// Font families of the text view (shared by all tabs, saved in the settings).
+    pub text_fonts: &'a mut crate::text_font::TextFonts,
     pub translate: &'a mut crate::translate_ui::TranslateManager,
 }
 
@@ -844,7 +846,7 @@ impl DocView {
                 pane.hide();
                 ui.painter().rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
             } else {
-                pane.ui(ui, rect, svc.window, svc.web.as_deref_mut(), svc.theme, *svc.text_scale, svc.focused);
+                pane.ui(ui, rect, svc.window, svc.web.as_deref_mut(), svc.theme, *svc.text_scale, svc.text_fonts, svc.focused);
             }
         });
         let msgs = self.reflow.as_mut().map(|r| r.messages()).unwrap_or_default();
@@ -1071,6 +1073,13 @@ impl DocView {
                 if ui.button("A＋").on_hover_text("文字を大きく (Ctrl++ / Ctrl+ホイール)").clicked() {
                     step_text_scale(text_scale, 1);
                 }
+                let fonts = &mut *svc.text_fonts;
+                let tip = fonts.summary();
+                ui.menu_button("フォント", |ui| {
+                    fonts.menu(ui);
+                })
+                .response
+                .on_hover_text(tip);
                 ui.separator();
                 let ready = self.reflow.as_ref().is_some_and(|r| r.is_ready());
                 let stem = self.doc.info().path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1080,7 +1089,7 @@ impl DocView {
                 if ui.add_enabled(ready, egui::Button::new("HTML で保存…")).on_hover_text("画像を埋め込んだ 1 ファイルの HTML").clicked()
                     && let Some(path) = rfd::FileDialog::new().add_filter("HTML", &["html"]).set_file_name(format!("{stem}.html")).save_file()
                 {
-                    self.status = match self.reflow.as_ref().unwrap().export_html(&path, strata_core::reflow::output::Theme::Auto) {
+                    self.status = match self.reflow.as_ref().unwrap().export_html(&path, strata_core::reflow::output::Theme::Auto, svc.text_fonts) {
                         Ok(()) => format!("保存しました: {}", path.display()),
                         Err(e) => format!("保存に失敗しました: {e}"),
                     };

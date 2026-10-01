@@ -6,6 +6,7 @@ mod layout;
 mod ocr_ui;
 mod print;
 mod reflow_view;
+mod text_font;
 mod tiles;
 mod translate_ui;
 mod view;
