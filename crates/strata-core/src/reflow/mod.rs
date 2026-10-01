@@ -23,6 +23,7 @@ mod hyphen;
 mod order;
 pub mod output;
 mod refs;
+mod tate;
 mod toc;
 
 use std::collections::HashMap;

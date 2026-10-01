@@ -58,9 +58,14 @@ fn strip_marker(spans: &[Span]) -> Vec<Span> {
 }
 
 pub fn spans_html(spans: &[Span]) -> String {
+    spans_html_in(spans, false)
+}
+
+/// `vertical`: half-width letters, digits and symbols marked up for vertical writing.
+fn spans_html_in(spans: &[Span], vertical: bool) -> String {
     let mut o = String::new();
     for s in spans {
-        let mut t = esc_html(&s.text);
+        let mut t = if vertical { super::tate::vertical_html(&s.text) } else { esc_html(&s.text) };
         if s.style.mono {
             t = format!("<code>{t}</code>");
         }
@@ -216,6 +221,9 @@ ul { padding-left: 1.4em; } li { margin: .2em 0; }
 body.vertical { overflow-x: auto; overflow-y: hidden; }
 body.vertical main { writing-mode: vertical-rl; max-width: none; height: calc(100vh - 5em); margin: 0; padding: 2.5em 3em; font-family: var(--font-ja); line-height: 1.9; }
 body.vertical p { text-align: justify; margin: 0; }
+/* Half-width characters by kind (see tate.rs): one em box, or upright and stacked. */
+body.vertical .tcy { text-combine-upright: all; }
+body.vertical .up { text-orientation: upright; }
 html:lang(ja) p { text-indent: 1em; }
 html:lang(ja) p.fn { text-indent: 0; }
 body.vertical .pm { position: static; display: inline-block; writing-mode: horizontal-tb; margin: 0 .3em; }
@@ -286,6 +294,7 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
         if o.bilingual.is_some() { " class=\"bi-main\"" } else { "" }
     ));
     let mut in_list = false;
+    let spans_html = |s: &[Span]| spans_html_in(s, vertical);
     for (ni, n) in doc.nodes.iter().enumerate() {
         let a = doc.anchors.get(ni).map(|(p, y)| format!(" data-p=\"{}\" data-y=\"{:.0}\"", p + 1, y)).unwrap_or_default();
         if let Some(set) = o.bilingual
