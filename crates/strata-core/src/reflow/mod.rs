@@ -356,7 +356,10 @@ fn attach_accents(chars: &[crate::rich::RichChar]) -> Vec<crate::rich::RichChar>
         let after = (i + 1..=i + 2).find(|&k| chars.get(k).is_some_and(|c| !c.c.is_whitespace()));
         let cands: Vec<usize> = [before, after].into_iter().flatten().filter(|&k| letter(k)).collect();
         // On a tie (a spacing accent between two letters), the letter before it.
-        base[i] = cands.into_iter().rev().max_by(|&a, &b| overlap(a).total_cmp(&overlap(b)));
+        let best = cands.into_iter().rev().max_by(|&a, &b| overlap(a).total_cmp(&overlap(b)));
+        // "`" is also the backquote of code and quotes ("`inline`"), set beside the
+        // letters; as a grave accent it is drawn over its letter.
+        base[i] = best.filter(|&k| c.c != '`' || overlap(k) > (c.bbox.x1 - c.bbox.x0) * 0.25);
     }
     let mut out = Vec::with_capacity(chars.len());
     for (k, c) in chars.iter().enumerate() {
@@ -377,7 +380,8 @@ fn attach_accents(chars: &[crate::rich::RichChar]) -> Vec<crate::rich::RichChar>
 }
 
 /// Precompose spacing accents that PDFs place before the base letter
-/// ("Universit´e" -> "Université").
+/// ("Universit´e" -> "Université"). Not "`": a grave accent has been attached
+/// by its position already ([`attach_accents`]); one left over is a backquote.
 fn fix_accents(s: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     if !s.chars().any(|c| combining(c).is_some()) {
@@ -388,7 +392,7 @@ fn fix_accents(s: &str) -> String {
     let mut i = 0;
     while i < v.len() {
         match (combining(v[i]), v.get(i + 1)) {
-            (Some(m), Some(&n)) if n.is_alphabetic() => {
+            (Some(m), Some(&n)) if n.is_alphabetic() && v[i] != '`' => {
                 out.push(n);
                 out.push(m);
                 i += 2;
@@ -2056,7 +2060,7 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
     let mut i = 0;
     while i + 1 < spans.len() {
         let t = spans[i].text.as_str();
-        if t.chars().count() == 1 && matches!(t, "\u{00B4}" | "`" | "\u{00A8}" | "\u{02C6}" | "\u{02DC}" | "\u{02C7}" | "\u{00B8}" | "\u{02DA}") {
+        if t.chars().count() == 1 && matches!(t, "\u{00B4}" | "\u{00A8}" | "\u{02C6}" | "\u{02DC}" | "\u{02C7}" | "\u{00B8}" | "\u{02DA}") {
             let acc = spans.remove(i).text;
             spans[i].text.insert_str(0, &acc);
         } else {
@@ -3490,6 +3494,34 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rc(c: char, x0: f32, x1: f32) -> crate::rich::RichChar {
+        crate::rich::RichChar { c, bbox: RectF { x0, y0: 0.0, x1, y1: 10.0 }, size: 10.0, font: 0, bold: false, argb: 0 }
+    }
+
+    fn text(chars: &[crate::rich::RichChar]) -> String {
+        use unicode_normalization::UnicodeNormalization;
+        fix_accents(&attach_accents(chars).iter().map(|c| c.c).collect::<String>()).nfc().collect()
+    }
+
+    #[test]
+    fn a_backquote_beside_a_letter_stays() {
+        // "`in`" in a monospaced font: each glyph in a box of its own.
+        let v = [rc('`', 0.0, 6.0), rc('i', 6.0, 12.0), rc('n', 12.0, 18.0), rc('`', 18.0, 24.0)];
+        assert_eq!(text(&v), "`in`");
+    }
+
+    #[test]
+    fn a_grave_accent_over_its_letter_is_composed() {
+        // TeX's \`a: the accent is drawn over the letter, before or after it in the text.
+        let v = [rc('`', 0.5, 4.5), rc('a', 0.0, 5.0), rc('b', 5.0, 10.0)];
+        assert_eq!(text(&v), "àb");
+        let v = [rc('t', 0.0, 4.0), rc('a', 4.0, 9.0), rc('`', 4.5, 8.5), rc(' ', 9.0, 12.0), rc('d', 12.0, 17.0)];
+        assert_eq!(text(&v), "tà d");
+        // Other spacing accents keep the old rule.
+        let v = [rc('\u{00B4}', 0.0, 4.0), rc('e', 4.0, 9.0)];
+        assert_eq!(text(&v), "é");
+    }
 
     #[test]
     fn numbered_items() {
