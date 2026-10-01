@@ -75,6 +75,7 @@ fn main() {
                     Node::Table { caption, .. } => ("TAB", text(caption)),
                     Node::Formula { text: t, .. } => ("EQ", t.clone()),
                     Node::PageImage { .. } => ("IMG", String::new()),
+                    Node::Html { md, .. } => ("MD", md.clone()),
                 };
                 if pg == dp {
                     let c: Vec<char> = t.chars().collect();

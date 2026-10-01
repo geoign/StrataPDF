@@ -223,6 +223,8 @@ impl DocView {
             Some("TwoPageLeft" | "TwoColumnLeft") => spread = Spread::Double,
             _ => {}
         }
+        // Markdown and text files open in the text view; the page view shows their source.
+        let reflow = strata_core::reflow::markup::kind_of(&info.path).map(|_| ReflowPane::start(&doc, None));
         DocView {
             id: NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed),
             sizes: doc.page_sizes(),
@@ -257,8 +259,8 @@ impl DocView {
             last_page: 0,
             pending_goto: None,
             status: String::new(),
-            mode: ViewMode::Pdf,
-            reflow: None,
+            mode: if reflow.is_some() { ViewMode::Reflow } else { ViewMode::Pdf },
+            reflow,
             requests: Vec::new(),
             ocr_job: None,
             ocr_request: None,

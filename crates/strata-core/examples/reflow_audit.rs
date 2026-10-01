@@ -257,6 +257,7 @@ fn main() {
             Node::Table { caption, rows, .. } => ("TAB", format!("{} ‖ {}", text(caption), rows.join(" | "))),
             Node::Formula { text: t, .. } => ("EQ", t.split_whitespace().collect::<Vec<_>>().join(" ")),
             Node::PageImage { reason, .. } => ("IMG", reason.clone()),
+            Node::Html { md, .. } => ("MD", md.clone()),
         };
         *kinds.entry(k).or_default() += 1;
         dump_lines.push(match n {

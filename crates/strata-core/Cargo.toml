@@ -16,12 +16,14 @@ ttf-parser = "0.25"
 memmap2 = "0.9"
 mupdf-sys = { version = "0.8", default-features = false }
 unicode-normalization = "0.1"
-strata-ocr = { version = "0.2.0", path = "../strata-ocr" }
+strata-ocr = { version = "0.2.1", path = "../strata-ocr" }
 image = { version = "0.25", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6"
 math-core = "0.8"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+encoding_rs = "0.8"
 
 [build-dependencies]
 cc = "1"

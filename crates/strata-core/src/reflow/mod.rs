@@ -20,6 +20,7 @@
 mod chars;
 mod entries;
 mod hyphen;
+pub mod markup;
 mod order;
 pub mod output;
 mod refs;
@@ -67,6 +68,8 @@ pub struct Style {
     pub sup: bool,
     pub sub: bool,
     pub mono: bool,
+    /// LaTeX source of an inline formula (Markdown `$...$`).
+    pub math: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,6 +95,9 @@ pub enum Node {
     PageImage { image: usize, reason: String },
     /// Start of a page's content (0-based page index).
     PageStart { page: u32 },
+    /// A block of a Markdown file as HTML (lists, code, tables, quotes), with its
+    /// Markdown source. Images are `strata-img:<index into images>`.
+    Html { html: String, md: String },
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +170,21 @@ impl Document {
         let waker = self.waker();
         let ocr = self.ocr_store().clone();
         let serial = crate::doc::needs_serial_rendering(&path);
+        if let Some(kind) = markup::kind_of(&path) {
+            let pages = self.info().page_count;
+            std::thread::Builder::new()
+                .name("strata-reflow".into())
+                .spawn(move || {
+                    let ev = match markup::read(&path) {
+                        Ok(text) => ReflowEvent::Done(Arc::new(markup::build(&path, &text, kind, pages))),
+                        Err(e) => ReflowEvent::Error(e.to_string()),
+                    };
+                    let _ = tx.send(ev);
+                    waker();
+                })
+                .ok();
+            return rx;
+        }
         std::thread::Builder::new()
             .name("strata-reflow".into())
             .spawn(move || {
@@ -2011,6 +2032,7 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
                 sup: small && cy < lcy - med * 0.1,
                 sub: small && cy > lcy + med * 0.1,
                 mono: f.is_some_and(|f| f.monospaced),
+                math: false,
             };
             let (cx, ccy) = c.bbox.center();
             let link = links.iter().find(|(r, _)| r.contains(cx, ccy)).map(|(_, u)| u.clone());

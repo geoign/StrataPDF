@@ -250,7 +250,14 @@ impl Deref for Engine {
 
 pub(crate) fn open_engine(path: &Path, password: Option<&str>) -> Result<(Engine, Vec<String>), OpenError> {
     let p = path.to_string_lossy();
-    let mut doc = mupdf::Document::open(p.as_ref()).map_err(|e| OpenError::Failed(e.to_string()))?;
+    let mut doc = if crate::reflow::markup::kind_of(path).is_some() {
+        // Markdown and text files: decoded here (MuPDF reads only UTF-8), laid out as plain text.
+        let text = crate::reflow::markup::read(path).map_err(|e| OpenError::Failed(e.to_string()))?;
+        mupdf::Document::from_bytes(text.as_bytes(), "txt")
+    } else {
+        mupdf::Document::open(p.as_ref())
+    }
+    .map_err(|e| OpenError::Failed(e.to_string()))?;
     if doc.needs_password().unwrap_or(false) {
         match password {
             None => return Err(OpenError::PasswordRequired),
@@ -361,6 +368,11 @@ fn read_info(path: &Path, eng: &Engine) -> DocInfo {
         reflowable: eng.is_reflowable().unwrap_or(false),
         ..Default::default()
     };
+    match crate::reflow::markup::kind_of(path) {
+        Some(crate::reflow::markup::MarkupKind::Markdown) => info.format = "Markdown".into(),
+        Some(crate::reflow::markup::MarkupKind::Text) => info.format = "テキスト".into(),
+        None => {}
+    }
     if let Engine::Pdf(pdf) = eng {
         let name = |o: Option<mupdf::pdf::PdfObject>| {
             o.and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(&n).into_owned())

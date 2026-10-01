@@ -65,6 +65,12 @@ pub fn spans_html(spans: &[Span]) -> String {
 fn spans_html_in(spans: &[Span], vertical: bool) -> String {
     let mut o = String::new();
     for s in spans {
+        if s.style.math
+            && let Some(m) = latex_to_mathml_inline(&s.text)
+        {
+            o.push_str(&m);
+            continue;
+        }
         let mut t = if vertical { super::tate::vertical_html(&s.text) } else { esc_html(&s.text) };
         if s.style.mono {
             t = format!("<code>{t}</code>");
@@ -103,6 +109,10 @@ pub fn spans_md(spans: &[Span]) -> String {
             continue;
         }
         let mut t = esc_md(core);
+        if s.style.math {
+            o.push_str(&format!("{lead}${core}${trail}"));
+            continue;
+        }
         if s.style.mono {
             t = format!("`{}`", core.replace('`', "'"));
         }
@@ -168,6 +178,7 @@ pub fn to_markdown(doc: &ReflowDoc, image_path: &dyn Fn(&ReflowImage) -> String)
                 }
             }
             Node::Footnote { spans } => o.push_str(&format!("<small>{}</small>\n\n", spans_md(spans).trim())),
+            Node::Html { md, .. } => o.push_str(&format!("{}\n\n", md.trim_end())),
             Node::PageImage { image, reason } => {
                 o.push_str(&format!("> [!NOTE]\n> {reason}。OCR するまで画像で表示しています。\n\n![page]({})\n\n", image_path(&doc.images[*image])));
             }
@@ -221,6 +232,15 @@ ul { padding-left: 1.4em; } li { margin: .2em 0; }
 body.vertical { overflow-x: auto; overflow-y: hidden; }
 body.vertical main { writing-mode: vertical-rl; max-width: none; height: calc(100vh - 5em); margin: 0; padding: 2.5em 3em; font-family: var(--font-ja); line-height: 1.9; }
 body.vertical p { text-align: justify; margin: 0; }
+/* Blocks of Markdown files. */
+.md pre { white-space: pre-wrap; background: var(--card); padding: .8em 1em; border-radius: 4px; box-shadow: 0 0 0 1px var(--rule); line-height: 1.5; }
+code { font-family: Consolas, "BIZ UDGothic", monospace; font-size: .9em; }
+.md blockquote { margin: 0 0 .9em; padding: .1em 1em; border-left: 3px solid var(--rule); color: var(--muted); }
+.md table { border-collapse: collapse; margin: 0 0 .9em; }
+.md th, .md td { border: 1px solid var(--rule); padding: .3em .7em; }
+.md img { max-width: 100%; height: auto; }
+.md hr { border: 0; border-top: 1px solid var(--rule); margin: 1.6em 0; }
+html:lang(ja) .md p { text-indent: 0; }
 /* Half-width characters by kind (see tate.rs): one em box, or upright and stacked. */
 body.vertical .tcy { text-combine-upright: all; }
 body.vertical .up { text-orientation: upright; }
@@ -347,6 +367,7 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
                 h.push_str("</figure>\n");
             }
             Node::Footnote { spans } => h.push_str(&format!("<p class=\"fn\">{}</p>\n", spans_html(spans).trim())),
+            Node::Html { html, .. } => h.push_str(&format!("<div class=\"md\"{a}>{}</div>\n", with_images(html, doc, o))),
             Node::PageImage { image, reason } => {
                 let img = &doc.images[*image];
                 h.push_str(&format!(
@@ -379,6 +400,24 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
     h
 }
 
+/// `strata-img:N` in a Markdown block replaced by the image's address.
+fn with_images(html: &str, doc: &ReflowDoc, o: &HtmlOptions) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find("strata-img:") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + "strata-img:".len()..];
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        match tail[..digits].parse::<usize>().ok().and_then(|n| doc.images.get(n)) {
+            Some(img) => out.push_str(&esc_html(&(o.image_src)(img))),
+            None => out.push_str(&rest[i..i + "strata-img:".len() + digits]),
+        }
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A side-by-side row: the original on the left, an empty translation cell on the right.
 fn bilingual_row(doc: &ReflowDoc, ni: usize, n: &Node, a: &str, o: &HtmlOptions) -> Option<String> {
     let (full, src, tag) = match n {
@@ -398,9 +437,19 @@ fn bilingual_row(doc: &ReflowDoc, ni: usize, n: &Node, a: &str, o: &HtmlOptions)
 
 /// LaTeX to MathML Core (rendered natively by Chromium/WebView2).
 pub fn latex_to_mathml(latex: &str) -> Option<String> {
+    mathml(latex, true)
+}
+
+/// LaTeX to MathML set in the line of text (Markdown `$...$`).
+pub fn latex_to_mathml_inline(latex: &str) -> Option<String> {
+    mathml(latex, false)
+}
+
+fn mathml(latex: &str, block: bool) -> Option<String> {
     use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
     thread_local! {
         static CONV: Option<LatexToMathML> = LatexToMathML::new(MathCoreConfig::default()).ok();
     }
-    CONV.with(|c| c.as_ref()?.convert_with_local_state(latex, MathDisplay::Block).ok().map(|r| r.mathml))
+    let display = if block { MathDisplay::Block } else { MathDisplay::Inline };
+    CONV.with(|c| c.as_ref()?.convert_with_local_state(latex, display).ok().map(|r| r.mathml))
 }

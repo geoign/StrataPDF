@@ -222,7 +222,7 @@ impl StrataApp {
 
     fn open_dialog(&mut self) {
         let files = rfd::FileDialog::new()
-            .add_filter("文書", &["pdf", "epub", "xps", "oxps", "cbz", "fb2", "mobi", "svg", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "jxr", "pnm"])
+            .add_filter("文書", &["pdf", "epub", "xps", "oxps", "cbz", "fb2", "mobi", "svg", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "gif", "jxr", "pnm", "md", "markdown", "txt"])
             .add_filter("すべてのファイル", &["*"])
             .pick_files();
         for f in files.into_iter().flatten() {
