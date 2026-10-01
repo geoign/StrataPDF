@@ -183,7 +183,7 @@ const CSS: &str = r#"
 @media (prefers-color-scheme: dark) { :root:not(.light) { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; --hover:rgba(255,255,255,.04); } }
 :root.dark { --bg:#1b1c1f; --fg:#e3e1dc; --muted:#9a988f; --rule:#34353a; --link:#8ab4f8; --card:#26272b; --pm:#5d5e63; --hover:rgba(255,255,255,.04); }
 /* Fonts; the viewer replaces these with the user's choice. */
-:root { --font-body: "Charis SIL", "Cambria", "Georgia", "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "Source Han Serif", "BIZ UDPMincho", "Yu Mincho", serif; --font-ja: "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "Source Han Serif", "BIZ UDPMincho", "Yu Mincho", serif; --font-head: "Segoe UI", "Noto Sans JP", "Noto Sans CJK JP", "Source Han Sans JP", "Source Han Sans", "BIZ UDPGothic", "Yu Gothic", sans-serif; }
+:root { --font-body: "Charis SIL", "Cambria", "Georgia", "StrataPDF Noto Serif JP", "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "BIZ UDPMincho", "Yu Mincho", serif; --font-ja: "StrataPDF Noto Serif JP", "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "BIZ UDPMincho", "Yu Mincho", serif; --font-head: "Segoe UI", "StrataPDF Noto Sans JP", "Noto Sans JP", "Noto Sans CJK JP", "Source Han Sans JP", "BIZ UDPGothic", "Yu Gothic", sans-serif; }
 html { background: var(--bg); color: var(--fg); }
 body { margin: 0; font-family: var(--font-body); font-size: 17px; line-height: 1.7; }
 main { max-width: 46em; margin: 0 auto; padding: 2.5em 1.5em 6em; position: relative; }

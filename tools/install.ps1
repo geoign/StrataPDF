@@ -50,6 +50,8 @@ if ($packaged) {
     $dml = Get-Item "$target\DirectML.dll"
     if ($dml.LinkType) { $dml = Get-Item ($dml.Target | Select-Object -First 1) }
     Copy-Item $dml.FullName "$Dest\DirectML.dll" -Force
+    # テキスト表示に同梱するフォント（取得済みなら再取得しない）。
+    & (Join-Path $PSScriptRoot 'fetch-fonts.ps1') -Dest "$Dest\fonts"
     @"
 StrataPDF（ソースからのビルド）
 

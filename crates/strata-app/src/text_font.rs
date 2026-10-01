@@ -1,7 +1,47 @@
 //! Fonts of the text view: a Japanese face and a Latin face, chosen from presets
 //! or installed families and handed to the page as CSS variables.
+//!
+//! Noto Serif JP, Noto Sans JP and LINE Seed JP ship in `fonts\` next to the
+//! executable (`tools\fetch-fonts.ps1`, SIL OFL 1.1) and are served to the page
+//! under their own family names, so they are there whatever is installed.
+
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// A bundled face: file in the fonts folder, CSS family, weight (range).
+const BUNDLED: &[(&str, &str, &str)] = &[
+    ("NotoSerifJP-VF.ttf", "StrataPDF Noto Serif JP", "200 900"),
+    ("NotoSansJP-VF.ttf", "StrataPDF Noto Sans JP", "100 900"),
+    ("LINESeedJP-Regular.ttf", "StrataPDF LINE Seed JP", "400"),
+    ("LINESeedJP-Bold.ttf", "StrataPDF LINE Seed JP", "700"),
+];
+
+/// Folder of the bundled fonts: `fonts\` beside the executable, or in a debug
+/// build the repository's `assets\fonts`.
+fn fonts_dir() -> Option<PathBuf> {
+    let beside = std::env::current_exe().ok()?.parent()?.join("fonts");
+    if beside.is_dir() || !cfg!(debug_assertions) {
+        return Some(beside);
+    }
+    Some(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts")))
+}
+
+/// Data of a bundled font requested by the page as `/fonts/<file>`.
+pub fn bundled_file(path: &str) -> Option<Vec<u8>> {
+    let name = path.strip_prefix("/fonts/")?;
+    // Only the known files: the name never reaches the file system unchecked.
+    let (file, ..) = BUNDLED.iter().find(|(f, ..)| *f == name)?;
+    std::fs::read(fonts_dir()?.join(file)).ok()
+}
+
+/// `@font-face` rules of the bundled fonts, for the viewer's pages.
+pub fn font_faces() -> String {
+    BUNDLED
+        .iter()
+        .map(|(file, family, weight)| format!("\n@font-face {{ font-family: \"{family}\"; src: url(\"/fonts/{file}\") format(\"truetype\"); font-weight: {weight}; }}"))
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,16 +76,16 @@ struct Preset {
 }
 
 const JA_PRESETS: &[Preset] = &[
-    Preset { key: "noto_serif", label: "Noto Serif JP（源ノ明朝）", stack: &["Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "Source Han Serif"], sans: false, heading: "noto_sans" },
+    Preset { key: "noto_serif", label: "Noto Serif JP（源ノ明朝）", stack: &["StrataPDF Noto Serif JP", "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP"], sans: false, heading: "noto_sans" },
     Preset { key: "biz_mincho", label: "BIZ UD明朝", stack: &["BIZ UDPMincho"], sans: false, heading: "biz_gothic" },
     Preset { key: "yu_mincho", label: "游明朝", stack: &["Yu Mincho", "YuMincho"], sans: false, heading: "yu_gothic" },
     Preset { key: "ms_mincho", label: "MS P明朝", stack: &["MS PMincho"], sans: false, heading: "biz_gothic" },
-    Preset { key: "noto_sans", label: "Noto Sans JP（源ノ角ゴシック）", stack: &["Noto Sans JP", "Noto Sans CJK JP", "Source Han Sans JP", "Source Han Sans"], sans: true, heading: "noto_sans" },
+    Preset { key: "noto_sans", label: "Noto Sans JP（源ノ角ゴシック）", stack: &["StrataPDF Noto Sans JP", "Noto Sans JP", "Noto Sans CJK JP", "Source Han Sans JP"], sans: true, heading: "noto_sans" },
     Preset { key: "biz_gothic", label: "BIZ UDゴシック", stack: &["BIZ UDPGothic"], sans: true, heading: "biz_gothic" },
     // Yu Gothic Regular is too thin on screen.
     Preset { key: "yu_gothic", label: "游ゴシック", stack: &["Yu Gothic Medium", "Yu Gothic", "YuGothic"], sans: true, heading: "yu_gothic" },
-    // Installers register it as "LINE Seed JP_OTF" / "_TTF"; Google Fonts as "LINE Seed JP".
-    Preset { key: "line_seed", label: "LINE Seed JP", stack: &["LINE Seed JP", "LINE Seed JP_OTF", "LINE Seed JP_TTF"], sans: true, heading: "line_seed" },
+    // LINE's installers register it as "LINE Seed JP_OTF" / "_TTF", Google Fonts as "LINE Seed JP".
+    Preset { key: "line_seed", label: "LINE Seed JP", stack: &["StrataPDF LINE Seed JP", "LINE Seed JP", "LINE Seed JP_OTF", "LINE Seed JP_TTF"], sans: true, heading: "line_seed" },
     Preset { key: "meiryo", label: "メイリオ", stack: &["Meiryo"], sans: true, heading: "meiryo" },
     Preset { key: "kyokasho", label: "UD デジタル 教科書体", stack: &["UD Digi Kyokasho NP"], sans: false, heading: "biz_gothic" },
 ];
@@ -159,6 +199,7 @@ impl TextFonts {
         ui.separator();
         if ui.button("既定に戻す").clicked() {
             *self = TextFonts::default();
+            ui.close();
         }
     }
 }
@@ -168,6 +209,8 @@ fn section(ui: &mut egui::Ui, choice: &mut FontChoice, presets: &[Preset], japan
         let sel = matches!(choice, FontChoice::Preset(k) if k == p.key);
         if ui.radio(sel, p.label).clicked() {
             *choice = FontChoice::Preset(p.key.into());
+            // The menu covers the text; close it to show the result.
+            ui.close();
         }
     }
     let families = strata_core::fonts::families();
@@ -182,6 +225,7 @@ fn section(ui: &mut egui::Ui, choice: &mut FontChoice, presets: &[Preset], japan
                 let text = if fam.display != fam.name { format!("{}（{}）", fam.display, fam.name) } else { fam.name.clone() };
                 if ui.selectable_label(sel, text).clicked() {
                     *choice = FontChoice::Family(fam.name.clone());
+                    ui.close();
                 }
             }
         });
@@ -195,8 +239,8 @@ mod tests {
     #[test]
     fn default_vars() {
         let v = TextFonts::default().css_vars();
-        assert_eq!(v[0].1, r#""Charis SIL", "Cambria", "Georgia", "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "Source Han Serif", "BIZ UDPMincho", "Yu Mincho", serif"#);
-        assert_eq!(v[2].1, r#""Segoe UI", "Noto Sans JP", "Noto Sans CJK JP", "Source Han Sans JP", "Source Han Sans", "BIZ UDPGothic", "Yu Gothic", sans-serif"#);
+        assert_eq!(v[0].1, r#""Charis SIL", "Cambria", "Georgia", "StrataPDF Noto Serif JP", "Noto Serif JP", "Noto Serif CJK JP", "Source Han Serif JP", "BIZ UDPMincho", "Yu Mincho", serif"#);
+        assert_eq!(v[2].1, r#""Segoe UI", "StrataPDF Noto Sans JP", "Noto Sans JP", "Noto Sans CJK JP", "Source Han Sans JP", "BIZ UDPGothic", "Yu Gothic", sans-serif"#);
     }
 
     #[test]
@@ -205,6 +249,13 @@ mod tests {
         let v = f.css_vars();
         assert_eq!(v[0].1, r#""Meiryo UI", "BIZ UDPGothic", "Yu Gothic", sans-serif"#);
         assert_eq!(v[2].1, r#""Segoe UI", "Meiryo UI", "BIZ UDPGothic", "Yu Gothic", sans-serif"#);
+    }
+
+    #[test]
+    fn only_bundled_files_are_served() {
+        assert!(bundled_file("/fonts/../../Cargo.toml").is_none());
+        assert!(bundled_file("/fonts/OFL-LINESeedJP.txt").is_none());
+        assert!(bundled_file("/index.html").is_none());
     }
 
     #[test]

@@ -24,6 +24,17 @@ MuPDF includes the following libraries, statically linked into StrataPDF.exe:
   with font exception).
 
 
+Fonts of the text view (fonts\)
+-------------------------------
+Unmodified copies from https://github.com/google/fonts, each licensed under
+the SIL Open Font License, Version 1.1 (texts in fonts\OFL-*.txt):
+
+- Noto Serif JP (NotoSerifJP-VF.ttf). Copyright 2012 Google Inc.
+- Noto Sans JP (NotoSansJP-VF.ttf). Copyright 2014-2021 Adobe, with Reserved
+  Font Name 'Source'.
+- LINE Seed JP (LINESeedJP-Regular.ttf, LINESeedJP-Bold.ttf). (C) LY Corporation.
+
+
 PyMuPDF Layout
 --------------
 Copyright (C) Artifex Software, Inc. Licensed under the GNU Affero General

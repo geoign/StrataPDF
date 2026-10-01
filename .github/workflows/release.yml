@@ -50,6 +50,8 @@ jobs:
           cargo about generate -c tools/about/about.toml -m crates/strata-app/Cargo.toml tools/about/about.hbs -o "$out\THIRD-PARTY-NOTICES.html"
           if ($LASTEXITCODE -ne 0) { throw 'cargo about failed' }
           Copy-Item tools\install.ps1, tools\uninstall.ps1 $out
+          # Fonts of the text view (SIL OFL 1.1), with their licence texts.
+          ./tools/fetch-fonts.ps1 -Dest "$out\fonts"
 
           $readme = @"
           StrataPDF $ver
@@ -61,6 +63,7 @@ jobs:
             powershell -ExecutionPolicy Bypass -File .\uninstall.ps1   （登録の解除）
 
           ライセンス: AGPL-3.0-or-later（LICENSE.txt）。同梱物の表記は THIRD-PARTY-NOTICES.html と NOTICES-NATIVE.txt。
+          fonts\ のフォントは SIL Open Font License 1.1（fonts\OFL-*.txt）。
           ソースコード: https://github.com/geoign/StrataPDF/tree/$ver
           "@
           if ($env:GITHUB_REF_TYPE -ne 'tag') { $readme = $readme -replace '/tree/dev-[0-9a-f]+', "/tree/$env:GITHUB_SHA" }

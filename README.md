@@ -9,7 +9,8 @@ Windows 向けの PDF ビューア。Rust 製で、描画と解析のエンジ�
 - **開ける文書**：PDF（壊れた xref やページツリーの修復、全種類の暗号）、EPUB、XPS、CBZ
 - **テキスト表示（リフロー）**：段組み・図・ページ境界をまたいで段落をつなぎ直し、ヘッダ・フッタを除いた本文を表示する。
   見出し・キャプション・図中の文字・柱の判別には、PyMuPDF Layout のレイアウト解析モデル（CPU で動く小さなグラフニューラルネットワーク）を使う。
-  縦書き、ダークモード、文字サイズの変更、Markdown / HTML への書き出しに対応
+  縦書き、ダークモード、文字サイズとフォントの変更、Markdown / HTML への書き出しに対応。
+  フォントは和文と欧文を別々に選べ、Noto Serif JP・Noto Sans JP・LINE Seed JP は配布版に同梱する
 - **OCR**：国立国会図書館の NDLOCR-Lite を Rust に移植したもの（日本語・縦書き対応）。
   結果は選択・検索・テキスト表示に反映され、検索可能 PDF として書き出せる。表示数式は LaTeX に変換する（Pix2Text MFR）
 - **注釈**：ハイライト・下線・取り消し線・図形・手書き・テキストボックス・付箋。取り消しとやり直し、上書き保存（差分追記）
@@ -67,6 +68,8 @@ OCR と数式のモデルは、初めて使うときに GitHub と Hugging Face 
 cargo build --release -p strata-app
 ```
 
+テキスト表示に同梱するフォントは `pwsh tools\fetch-fonts.ps1` で `assets\fonts` に取得する
+（デバッグビルドはここを読む。`tools\install.ps1` は配置先の `fonts\` に取得する）。
 MuPDF の C ソースは初回だけコンパイルされ、数分かかる。ビルド出力の置き場所などを手元の環境に合わせるには、
 `.cargo/config.toml`（リポジトリには含めない）に書く。例：
 
@@ -112,3 +115,5 @@ StrataPDF は [GNU Affero General Public License v3.0](LICENSE) 以降（AGPL-3.
   特徴量計算（C）とモデル（ONNX）をそのまま組み込み、Python の処理部分を Rust に移植したもの（`vendor/pymupdf_layout`）
 - 配布版の zip には、依存する Rust クレートのライセンス表記（`THIRD-PARTY-NOTICES.html`）と、
   ONNX Runtime の DirectML 実行に使う `DirectML.dll`（Microsoft、再配布可能なランタイム）を同梱する
+- テキスト表示のフォント（`fonts\`）は [google/fonts](https://github.com/google/fonts) から改変せずに取得した
+  Noto Serif JP、Noto Sans JP、LINE Seed JP で、いずれも SIL Open Font License 1.1（`fonts\OFL-*.txt`）

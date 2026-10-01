@@ -3,3 +3,4 @@
 *.pdb
 /.vs
 /.cargo/config.toml
+/assets/fonts/

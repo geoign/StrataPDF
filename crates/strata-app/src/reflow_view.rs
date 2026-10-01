@@ -205,7 +205,7 @@ impl ReflowPane {
             store.insert(format!("/img/{}", im.id), ("image/png", Arc::new(im.png.clone())));
         }
         let src = |im: &ReflowImage| format!("img/{}", im.id);
-        let html = output::to_html(d, &HtmlOptions { theme: Theme::Auto, page_markers: true, image_src: &src, extra_css: "", bilingual: None });
+        let html = output::to_html(d, &HtmlOptions { theme: Theme::Auto, page_markers: true, image_src: &src, extra_css: &crate::text_font::font_faces(), bilingual: None });
         let html = html.replace("</body>", &format!("<script>{JS_BRIDGE}</script></body>"));
         store.insert("/index.html".into(), ("text/html; charset=utf-8", Arc::new(html.into_bytes())));
     }
@@ -224,7 +224,7 @@ impl ReflowPane {
         self.unsent.clear();
         if let (Some(n), Some(d)) = (&nodes, &self.doc) {
             let src = |im: &ReflowImage| format!("img/{}", im.id);
-            let html = output::to_html(d, &HtmlOptions { theme: Theme::Auto, page_markers: true, image_src: &src, extra_css: "", bilingual: Some(n) });
+            let html = output::to_html(d, &HtmlOptions { theme: Theme::Auto, page_markers: true, image_src: &src, extra_css: &crate::text_font::font_faces(), bilingual: Some(n) });
             let html = html.replace("</body>", &format!("<script>{JS_BRIDGE}</script></body>"));
             self.store.write().insert("/bi.html".into(), ("text/html; charset=utf-8", Arc::new(html.into_bytes())));
         }
@@ -313,6 +313,9 @@ impl ReflowPane {
             .with_bounds(to_wry(rect))
             .with_custom_protocol("strata".into(), move |_id, req| {
                 let path = req.uri().path().to_string();
+                if let Some(data) = crate::text_font::bundled_file(&path) {
+                    return wry::http::Response::builder().header("Content-Type", "font/ttf").body(Cow::Owned(data)).unwrap();
+                }
                 let store = store.read();
                 match store.get(&path) {
                     Some((mime, data)) => wry::http::Response::builder()
