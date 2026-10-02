@@ -22,7 +22,7 @@ Remove-ItemProperty 'HKCU:\Software\RegisteredApplications' -Name 'StrataPDF' -E
 Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\StrataPDF.lnk" -Force -ErrorAction SilentlyContinue
 
 if ($RemoveFiles -and $Dest) {
-    Get-Process StrataPDF -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Dest) } | Stop-Process -Force
+    Get-Process StrataPDF, StrataPDF-cli -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Dest) } | Stop-Process -Force
     Remove-Item $Dest -Recurse -Force -ErrorAction SilentlyContinue
 }
 

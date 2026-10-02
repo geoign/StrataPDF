@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod headless;
 mod instance;
 mod layout;
 mod ocr_ui;
@@ -15,9 +16,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn main() -> eframe::Result {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(code) = headless::run(&args) {
+        std::process::exit(code);
+    }
     env_logger::init();
     strata_core::fonts::install();
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let new_window = args.iter().any(|a| a == "--new-window");
     let files: Vec<PathBuf> = args.into_iter().filter(|a| a != "--new-window").map(PathBuf::from).collect();
     if !new_window && instance::forward_to_running(&files) {

@@ -43,6 +43,12 @@
   （Carey 2010 は見出し 9→31、図の軸ラベルや著者名の誤検出がほぼ消えた）
 - 行番号の除去を余白の列に限定（表の数値の列を消していた）。見出し番号だけの行を同じ行の見出しにつなぐ
 
+## コマンドラインでの変換（2026-10-03）
+
+- `StrataPDF-cli.exe convert`：Markdown と HTML（同時出力可）への書き出しをウィンドウなしで行う。
+  OCR（`--ocr`）、数式の LaTeX 化（`--latex`）、ワイルドカード展開、標準出力への出力に対応。
+  `StrataPDF.exe --headless` からも呼べる。説明は `docs/CLI.md`、エージェント向けの要約は `AGENTS.md`
+
 ## 公開（2026-09-29）
 
 - GitHub（geoign/StrataPDF）で AGPL-3.0-or-later として公開。配布版は GitHub Actions でビルドし、

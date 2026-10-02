@@ -15,6 +15,7 @@ Windows 向けの PDF ビューア。Rust 製で、描画と解析のエンジ�
 - **OCR**：国立国会図書館の NDLOCR-Lite を Rust に移植したもの（日本語・縦書き対応）。
   結果は選択・検索・テキスト表示に反映され、検索可能 PDF として書き出せる。表示数式は LaTeX に変換する（Pix2Text MFR）
 - **注釈**：ハイライト・下線・取り消し線・図形・手書き・テキストボックス・付箋。取り消しとやり直し、上書き保存（差分追記）
+- **コマンドラインでの変換**：`StrataPDF-cli.exe` がウィンドウを出さずに Markdown と HTML へ変換する（両形式の同時出力、OCR、LaTeX 化も可）
 - **その他**：表の取り出し（CSV / TSV）、画像の保存、印刷、縦書きテキストのコピー
 - **翻訳（実験的機能）**：テキスト表示の見開き対訳。送信先は Gemini、OpenAI、Anthropic、OpenRouter、
   OpenAI 互換サーバー（ローカルの llama.cpp や LM Studio も可）から選ぶ
@@ -48,6 +49,21 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1   # 登録の解除
 
 OCR と数式のモデルは、初めて使うときに GitHub と Hugging Face から取得する。
 モデル・キャッシュ・設定は `%LOCALAPPDATA%\StrataPDF` に置かれる。
+
+## コマンドラインでの変換
+
+`StrataPDF.exe` と同じフォルダーの `StrataPDF-cli.exe` は、ウィンドウを出さずに文書を Markdown と HTML に変換する。
+変換の中身はテキスト表示の「Markdown で保存」「HTML で保存」と同じである。
+
+```powershell
+.\StrataPDF-cli.exe convert paper.pdf                  # paper.md と paper_files\（画像）
+.\StrataPDF-cli.exe convert paper.pdf --to md,html     # Markdown と HTML を同時に
+.\StrataPDF-cli.exe convert *.pdf --to both -o out     # まとめて変換
+.\StrataPDF-cli.exe convert scan.pdf --ocr needed      # スキャンのページを OCR してから
+```
+
+オプションの一覧は `StrataPDF-cli.exe --help`、詳しい説明は [docs/CLI.md](docs/CLI.md)（配布版では `CLI.md`）にある。
+AI エージェント向けの要約は [AGENTS.md](AGENTS.md) に置いた。
 
 ## 翻訳機能について
 
@@ -97,10 +113,11 @@ pwsh tools\uninstall.ps1         # 登録を解除（-RemoveFiles で配置フ�
 |---|---|
 | `crates/strata-core` | MuPDF のラッパー。文書スレッド、タイル描画プール、構造化テキスト、リフロー、注釈、表の取り出し |
 | `crates/strata-app` | GUI 本体（egui と wgpu、テキスト表示は WebView2）。タブ、分割表示、見開き |
+| `crates/strata-cli` | コマンドラインでの変換（`StrataPDF-cli.exe`）。Markdown / HTML への書き出し |
 | `crates/strata-ocr` | OCR（NDLOCR-Lite の移植）と数式認識（Pix2Text MFR） |
 | `crates/strata-translate` | 翻訳の送信先の実装、キャッシュ |
 | `vendor/mupdf` | `mupdf` クレートのパッチ版。差分は `vendor/PATCHES.md` |
-| `docs/` | 設計（`ARCHITECTURE.md`）、開発計画（`ROADMAP.md`）、翻訳ビューの仕様（`translation-view.md`） |
+| `docs/` | 設計（`ARCHITECTURE.md`）、開発計画（`ROADMAP.md`）、翻訳ビューの仕様（`translation-view.md`）、コマンドラインでの変換（`CLI.md`） |
 
 ## ライセンス
 

@@ -34,18 +34,21 @@ if ($packaged) {
     Push-Location $repo
     try {
         if (-not $NoBuild) {
-            cargo build --release -p strata-app
+            cargo build --release -p strata-app -p strata-cli
             if ($LASTEXITCODE -ne 0) { throw 'cargo build が失敗しました' }
         }
         $target = Join-Path ((cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory) 'release'
     } finally { Pop-Location }
 
     # 配置先で動いている StrataPDF を終了してから上書きする。
-    Get-Process StrataPDF -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Dest) } | Stop-Process -Force
+    Get-Process StrataPDF, StrataPDF-cli -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($Dest) } | Stop-Process -Force
     Start-Sleep -Milliseconds 300
 
     New-Item -ItemType Directory -Force $Dest | Out-Null
     Copy-Item "$target\strata-app.exe" "$Dest\StrataPDF.exe" -Force
+    # ウィンドウを出さない変換（Markdown / HTML）。使い方は CLI.md。
+    Copy-Item "$target\strata-cli.exe" "$Dest\StrataPDF-cli.exe" -Force
+    Copy-Item "$repo\docs\CLI.md" "$Dest\CLI.md" -Force
     # DirectML.dll はビルド出力ではシンボリックリンクなので、実体をコピーする。
     $dml = Get-Item "$target\DirectML.dll"
     if ($dml.LinkType) { $dml = Get-Item ($dml.Target | Select-Object -First 1) }
@@ -57,6 +60,7 @@ StrataPDF（ソースからのビルド）
 
 ライセンス: AGPL-3.0-or-later（描画エンジン MuPDF を含む）
 ソース: https://github.com/geoign/StrataPDF
+ウィンドウを出さない変換（Markdown / HTML）: StrataPDF-cli.exe --help、詳細は CLI.md
 登録の解除: pwsh "$repo\tools\uninstall.ps1"
 "@ | Set-Content -Encoding utf8 "$Dest\README.txt"
 }

@@ -4830,6 +4830,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-cli"
+version = "0.2.1"
+dependencies = [
+ "base64 0.22.1",
+ "strata-core",
+ "strata-ocr",
+]
+
+[[package]]
 name = "strata-core"
 version = "0.2.1"
 dependencies = [

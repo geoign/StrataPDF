@@ -28,7 +28,7 @@ jobs:
           tool: cargo-about
 
       - name: Build
-        run: cargo build --release --locked -p strata-app
+        run: cargo build --release --locked -p strata-app -p strata-cli
 
       - name: Package
         shell: pwsh
@@ -37,6 +37,8 @@ jobs:
           $out = 'dist\StrataPDF'
           New-Item -ItemType Directory -Force $out | Out-Null
           Copy-Item target\release\strata-app.exe "$out\StrataPDF.exe"
+          Copy-Item target\release\strata-cli.exe "$out\StrataPDF-cli.exe"
+          Copy-Item docs\CLI.md "$out\CLI.md"
 
           # DirectML.dll: copied (or symlinked) next to the build output by the ort crate.
           $dml = Get-Item target\release\DirectML.dll -ErrorAction SilentlyContinue
@@ -61,6 +63,10 @@ jobs:
 
             powershell -ExecutionPolicy Bypass -File .\install.ps1
             powershell -ExecutionPolicy Bypass -File .\uninstall.ps1   （登録の解除）
+
+          ウィンドウを出さずに Markdown / HTML へ変換するには StrataPDF-cli.exe を使う（使い方は CLI.md）。
+
+            .\StrataPDF-cli.exe convert paper.pdf --to md,html
 
           ライセンス: AGPL-3.0-or-later（LICENSE.txt）。同梱物の表記は THIRD-PARTY-NOTICES.html と NOTICES-NATIVE.txt。
           fonts\ のフォントは SIL Open Font License 1.1（fonts\OFL-*.txt）。
