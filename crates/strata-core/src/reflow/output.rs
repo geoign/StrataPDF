@@ -308,8 +308,32 @@ fn plain(spans: &[Span]) -> String {
     spans.iter().map(|s| s.text.as_str()).collect::<String>().trim().to_string()
 }
 
+/// Mostly Japanese text: kana in the paragraphs.
+fn japanese(doc: &ReflowDoc) -> bool {
+    doc.nodes.iter().any(|n| match n {
+        Node::Paragraph { spans } => spans.iter().any(|s| s.text.chars().any(|c| matches!(c as u32, 0x3040..=0x30FF))),
+        _ => false,
+    })
+}
+
+/// The note above a page shown as an image, in the document's language.
+fn page_note(reason: &str, ja: bool) -> String {
+    const SIDEWAYS: &str = "横向きに組まれたページ（表・図）";
+    if ja {
+        return if reason == SIDEWAYS { format!("{reason}を回転して画像で表示しています。") } else { format!("{reason}。OCR するまで画像で表示しています。") };
+    }
+    match reason {
+        SIDEWAYS => "This page is set sideways (a table or a figure): shown as an image, turned upright.".to_string(),
+        "テキスト層のないスキャンページ" => "This page is a scan without a text layer: shown as an image until it is OCRed.".to_string(),
+        "文字コードを復元できないフォント（ToUnicode なし）" => "The fonts of this page carry no character codes (no ToUnicode): shown as an image until it is OCRed.".to_string(),
+        "OCR テキスト層の品質が低いページ" => "The OCR text layer of this page reads poorly: shown as an image until it is OCRed again.".to_string(),
+        other => format!("{other}: shown as an image until it is OCRed."),
+    }
+}
+
 pub fn to_markdown(doc: &ReflowDoc, image_path: &dyn Fn(&ReflowImage) -> String) -> String {
     let mut o = String::new();
+    let ja = japanese(doc);
     let mut in_list = false;
     for (ni, n) in doc.nodes.iter().enumerate() {
         let is_item = matches!(n, Node::ListItem { .. });
@@ -363,7 +387,7 @@ pub fn to_markdown(doc: &ReflowDoc, image_path: &dyn Fn(&ReflowImage) -> String)
             Node::Footnote { spans } => o.push_str(&format!("<small>{}</small>\n\n", spans_md(spans).trim())),
             Node::Html { md, .. } => o.push_str(&format!("{}\n\n", md.trim_end())),
             Node::PageImage { image, reason } => {
-                o.push_str(&format!("> [!NOTE]\n> {reason}。OCR するまで画像で表示しています。\n\n![page]({})\n\n", image_path(&doc.images[*image])));
+                o.push_str(&format!("> [!NOTE]\n> {}\n\n![page]({})\n\n", page_note(reason, ja), image_path(&doc.images[*image])));
             }
             Node::Formula { image, text, latex, number } => match latex {
                 Some(l) => match number {
@@ -475,14 +499,8 @@ window.strataGotoPage = p => { const t = document.getElementById('page-' + p); i
 "#;
 
 pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
-    let lang = if doc.nodes.iter().any(|n| match n {
-        Node::Paragraph { spans } => spans.iter().any(|s| s.text.chars().any(|c| matches!(c as u32, 0x3040..=0x30FF))),
-        _ => false,
-    }) {
-        "ja"
-    } else {
-        "en"
-    };
+    let ja = japanese(doc);
+    let lang = if ja { "ja" } else { "en" };
     let root_class = match o.theme {
         Theme::Auto => "",
         Theme::Light => "light",
@@ -592,8 +610,8 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
             Node::PageImage { image, reason } => {
                 let img = &doc.images[*image];
                 h.push_str(&format!(
-                    "<figure class=\"pageimg\"><div class=\"note\">{}。OCR するまで画像で表示しています。</div><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\"></figure>\n",
-                    esc_html(reason),
+                    "<figure class=\"pageimg\"><div class=\"note\">{}</div><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\"></figure>\n",
+                    esc_html(&page_note(reason, ja)),
                     esc_html(&(o.image_src)(img)),
                     img.width
                 ));

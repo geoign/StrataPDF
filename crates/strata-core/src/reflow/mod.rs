@@ -2560,6 +2560,20 @@ fn table_rows(lines: &[&RichLine]) -> Vec<String> {
         .collect()
 }
 
+/// The image of a page set sideways, turned so that its text reads upright: text
+/// running down the page is read after a quarter turn to the left, text running up
+/// it after one to the right.
+fn turn_upright(im: &mut ReflowImage, text_runs_down: bool) {
+    let Ok(img) = image::load_from_memory(&im.png) else { return };
+    let turned = if text_runs_down { img.rotate270() } else { img.rotate90() };
+    let mut buf = std::io::Cursor::new(Vec::new());
+    if turned.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+        im.png = buf.into_inner();
+        im.width = turned.width();
+        im.height = turned.height();
+    }
+}
+
 /// A label of the article's type or access printed above the title.
 fn is_kicker(t: &str) -> bool {
     const KICKERS: [&str; 40] = [
@@ -3033,12 +3047,15 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         // mostly turned by 90 degrees (landscape tables and figures), which the
         // reading order cannot follow.
         let (mut turned, mut upright, mut turned_lines) = (0usize, 0usize, 0usize);
+        // Turned text running down the page (positive) or up it (negative).
+        let mut down = 0i64;
         for b in &p.rich.blocks {
             if let RichBlock::Text { lines, .. } = b {
                 for l in lines {
                     if !l.vertical && l.dir[1].abs() > 0.5 {
                         turned += l.chars.len();
                         turned_lines += 1;
+                        down += if l.dir[1] > 0.0 { l.chars.len() as i64 } else { -(l.chars.len() as i64) };
                     } else {
                         upright += l.chars.len()
                     }
@@ -3047,12 +3064,16 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         }
         // (Lines of text or table rows: labels of an upright map are short.)
         let rotated = (!vertical && turned > 200 && turned > upright * 2 && (turned >= turned_lines * 15 || upright < 50)).then(|| "横向きに組まれたページ（表・図）".to_string());
+        let sideways = rotated.is_some();
         // A text layer over a scan (not ours) too poor to read: mostly garbage from
         // figures or a bad recognition. The page image reads better.
         let poor = (p.scan && !p.ocr && ocr_layer_quality(&p.rich) < 0.4).then(|| "OCR テキスト層の品質が低いページ".to_string());
         if let Some(reason) = needs_ocr(&p.rich).or(rotated).or(poor) {
             let full = RectF { x0: 0.0, y0: 0.0, x1: p.rich.width, y1: p.rich.height };
             if let Some(img) = crop(full, opts.image_scale, &mut doc) {
+                if sideways {
+                    turn_upright(&mut doc.images[img], down > 0);
+                }
                 doc.nodes.push(Node::PageImage { image: img, reason });
             }
             doc.fill_anchors((p.page, 0.0));
