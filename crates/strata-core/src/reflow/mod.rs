@@ -478,8 +478,16 @@ pub fn needs_ocr(p: &RichPage) -> Option<String> {
 /// A publisher's cover sheet ("To cite this article", "Downloaded from", terms of
 /// use), put before or after the article by a journal site or a library: no content.
 fn cover_sheet(p: &RichPage) -> bool {
-    const MARKS: [&str; 29] = [
+    const MARKS: [&str; 37] = [
         "to cite this article",
+        "link to published version",
+        "link to publication record",
+        "general rights",
+        "take down policy",
+        "take-down policy",
+        "citation for published version",
+        "please refer to any applicable terms of use",
+        "publisher's pdf, also known as",
         "cite this article as",
         "article in press",
         "unedited version of this manuscript",
@@ -1391,9 +1399,15 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                     .iter()
                     .map(|l| (l, line_class(&p.layout, l)))
                     .filter(|(l, class)| {
-                        // Running heads and page numbers found by the layout model.
+                        // Running heads and page numbers found by the layout model. (On the
+                        // first page the model takes a title set near the top for a running
+                        // head: a line larger than the body text stays unless it repeats.)
                         if opts.strip_headers && matches!(class, Some((PAGE_HEADER | PAGE_FOOTER, _))) && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
-                            return false;
+                            // (Japanese journals run the title as the head of every page.)
+                            let title_like = p.page == 0 && line_size(l) > body * 1.08;
+                            if !title_like {
+                                return false;
+                            }
                         }
                         if opts.strip_headers && vertical_margin(l) {
                             return false;
@@ -1401,7 +1415,10 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                         if opts.strip_headers && (l.bbox.y1 < h * 0.15 || l.bbox.y0 > h * 0.85) {
                             let t = l.text();
                             let k = digits_key(&t);
-                            if repeated.get(&k).copied().unwrap_or(0) >= threshold && n_pages > 1 && k.chars().filter(|&c| c != '#').count() >= 3 && alone_in_band(&l.bbox) {
+                            // (On the first page, the title itself is what the running
+                            // heads of the other pages repeat: a line larger than the body
+                            // text there stays.)
+                            if repeated.get(&k).copied().unwrap_or(0) >= threshold && n_pages > 1 && k.chars().filter(|&c| c != '#').count() >= 3 && alone_in_band(&l.bbox) && !(p.page == 0 && line_size(l) > body * 1.08) {
                                 return false;
                             }
                             // Lone page numbers in the margins.
@@ -1511,6 +1528,45 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
     let mut texts: Vec<Option<Unit>> = units.into_iter().filter(|u| u.kind == UnitKind::Text).map(Some).collect();
     // A "figure" holding paragraphs of running text is a page decoration (a
     // frame, a coloured box, a background drawing), not a figure.
+    // A stamp of rotated text in the margin ("Accepted Article" down the side of
+    // every page of a manuscript) is a tall strip of turned text, not a figure.
+    let stamp = |f: &RectF| {
+        let turned: usize = p
+            .rich
+            .blocks
+            .iter()
+            .filter_map(|b| if let RichBlock::Text { lines, .. } = b { Some(lines) } else { None })
+            .flatten()
+            .filter(|l| !l.vertical && l.dir[1].abs() > 0.5 && overlap_frac(&l.bbox, f) > 0.8)
+            .map(|l| l.chars.len())
+            .sum();
+        turned >= 12 && f.height() > f.width() * 3.0 && (f.x1 < w * 0.2 || f.x0 > w * 0.8)
+    };
+    // An image that running text is set across (a watermark image under the text,
+    // "Accepted Article" down the margin) lies behind the page, not on it.
+    let watermark = |f: &RectF| {
+        texts
+            .iter()
+            .flatten()
+            .filter(|u| u.lines.len() >= 2 && u.bbox.x0 < f.x1 - 5.0 && u.bbox.x1 > f.x1 + 40.0 && u.bbox.y0 < f.y1 && u.bbox.y1 > f.y0 && overlap_frac(&u.bbox, f) < 0.8)
+            .count()
+            >= 2
+    };
+    // A framed box of text (an article-info or keywords box): several lines of words,
+    // no raster image: text, not a figure.
+    let text_box = |f: &RectF| {
+        let lines: Vec<&RichLine> = p
+            .rich
+            .blocks
+            .iter()
+            .filter_map(|b| if let RichBlock::Text { lines, .. } = b { Some(lines) } else { None })
+            .flatten()
+            .filter(|l| overlap_frac(&l.bbox, f) > 0.8 && l.chars.len() >= 3)
+            .collect();
+        let wordy = lines.iter().filter(|l| l.text().split_whitespace().count() >= 3).count();
+        let image_inside = p.rich.blocks.iter().any(|b| matches!(b, RichBlock::Image { bbox } if overlap_frac(bbox, f) > 0.3));
+        lines.len() >= 4 && wordy * 10 >= lines.len() * 7 && !image_inside
+    };
     figs.retain(|f| {
         let prose: usize = texts
             .iter()
@@ -1518,7 +1574,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             .filter(|u| overlap_frac(&u.bbox, f) > 0.8 && u.lines.len() >= 3 && (u.size() - body).abs() < body * 0.25 && caption_kind(&u.text()).is_none())
             .map(|u| u.chars())
             .sum();
-        prose < 400
+        prose < 400 && !stamp(f) && !watermark(f) && !text_box(f)
     });
     // Labels around a figure (axis ticks, legends, panel letters, a chart title)
     // lie just outside the drawing: take short blocks within a few lines of it
@@ -2228,9 +2284,25 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
     // Soft hyphens (U+00AD) are the typesetter's hyphenation hints, not text: in the
     // reflowed text they doubled hyphens and split words. One space at a join.
     let mut after_space = false;
+    let mut prev_last: Option<char> = None;
     for s in &mut spans {
         if s.text.contains('\u{AD}') {
             s.text = s.text.replace('\u{AD}', "");
+        }
+        // A ring after a digit at text size is a degree sign too ("25◦C").
+        if s.text.contains('◦') {
+            let mut out = String::with_capacity(s.text.len());
+            let mut prev = prev_last;
+            for c in s.text.chars() {
+                out.push(if c == '◦' && prev.is_some_and(|p| p.is_ascii_digit()) { '°' } else { c });
+                prev = Some(c);
+            }
+            s.text = out;
+        }
+        prev_last = s.text.chars().last().or(prev_last);
+        // Spaces inside a web address ("doi .org /10 .1016"): none belong there.
+        if s.link.is_some() || s.text.contains("doi.org") || s.text.contains("http") || s.text.contains("www.") {
+            s.text = unspace_address(&s.text);
         }
         while s.text.contains("  ") {
             s.text = s.text.replace("  ", " ");
@@ -2555,7 +2627,7 @@ fn table_rows(lines: &[&RichLine]) -> Vec<String> {
     rows.into_iter()
         .map(|(_, mut v)| {
             v.sort_by(|a, b| a.bbox.x0.total_cmp(&b.bbox.x0));
-            v.iter().map(|l| l.text().trim().to_string()).collect::<Vec<_>>().join("\t")
+            v.iter().map(|l| l.text().trim().replace('◦', "°")).collect::<Vec<_>>().join("\t")
         })
         .collect()
 }
@@ -2572,6 +2644,32 @@ fn turn_upright(im: &mut ReflowImage, text_runs_down: bool) {
         im.width = turned.width();
         im.height = turned.height();
     }
+}
+
+/// Spaces inside a web address removed: a space next to ".", "/", "-", "_" or ":" in
+/// a run that starts with "http", "www." or "doi.org" (the tiny gaps of a URL set in a
+/// narrow font read as spaces).
+fn unspace_address(t: &str) -> String {
+    let starts = ["http", "www.", "doi.org"];
+    let Some(begin) = starts.iter().filter_map(|s| t.find(s)).min() else { return t.to_string() };
+    let (head, tail) = t.split_at(begin);
+    let chars: Vec<char> = tail.chars().collect();
+    let mut out = String::from(head);
+    let glue = |c: char| matches!(c, '.' | '/' | '-' | '_' | ':' | '=' | '?' | '&' | '#');
+    let mut inside = true;
+    for (k, &c) in chars.iter().enumerate() {
+        if c == ' ' && inside {
+            let before = chars[..k].iter().rev().find(|c| **c != ' ').copied();
+            let after = chars[k + 1..].iter().find(|c| **c != ' ').copied();
+            if before.is_some_and(glue) || after.is_some_and(glue) {
+                continue;
+            }
+            // A space with letters on both sides ends the address.
+            inside = false;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A label of the article's type or access printed above the title.
@@ -3029,6 +3127,23 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         doc.fill_anchors((p.page, 0.0));
         // This page's display list, for crops; dropped with the page.
         let page_dl = eng.load_page(p.page as i32).ok().and_then(|pg| pg.to_display_list(true).ok());
+        // The turned text inside a region: `Some(runs down)` when it outweighs the
+        // upright text, for a landscape figure set sideways on the page.
+        let turned_in = |r: &RectF| -> Option<bool> {
+            let (mut up, mut dn, mut upright) = (0usize, 0usize, 0usize);
+            for b in &p.rich.blocks {
+                if let RichBlock::Text { lines, .. } = b {
+                    for l in lines.iter().filter(|l| overlap_frac(&l.bbox, r) > 0.8) {
+                        if !l.vertical && l.dir[1].abs() > 0.5 {
+                            if l.dir[1] > 0.0 { dn += l.chars.len() } else { up += l.chars.len() }
+                        } else {
+                            upright += l.chars.len();
+                        }
+                    }
+                }
+            }
+            (up + dn >= 40 && up + dn > upright * 3).then_some(dn > up)
+        };
         let crop = |bbox: RectF, scale: f32, doc: &mut ReflowDoc| -> Option<usize> {
             let dl = page_dl.as_ref()?;
             let pad = RectF { x0: bbox.x0 - 2.0, y0: bbox.y0 - 2.0, x1: bbox.x1 + 2.0, y1: bbox.y1 + 2.0 };
@@ -3063,7 +3178,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
         }
         // (Lines of text or table rows: labels of an upright map are short.)
-        let rotated = (!vertical && turned > 200 && turned > upright * 2 && (turned >= turned_lines * 15 || upright < 50)).then(|| "横向きに組まれたページ（表・図）".to_string());
+        let _ = turned_lines;
+        let rotated = (!vertical && turned > 200 && turned > upright * 2).then(|| "横向きに組まれたページ（表・図）".to_string());
         let sideways = rotated.is_some();
         // A text layer over a scan (not ours) too poor to read: mostly garbage from
         // figures or a bad recognition. The page image reads better.
@@ -3112,6 +3228,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         bbox.y1 = next.bbox.y0 - 2.0;
                     }
                     if let Some(img) = crop(bbox, opts.image_scale, &mut doc) {
+                        if let Some(down) = turned_in(&u.bbox) {
+                            turn_upright(&mut doc.images[img], down);
+                        }
                         doc.nodes.push(Node::Figure { image: img, caption });
                         last_caption = Some((doc.nodes.len() - 1, next.size(), next.bbox, p.page));
                     }
@@ -3119,6 +3238,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     continue;
                 }
                 if let Some(img) = crop(u.bbox, opts.image_scale, &mut doc) {
+                    if let Some(down) = turned_in(&u.bbox) {
+                        turn_upright(&mut doc.images[img], down);
+                    }
                     doc.nodes.push(Node::Figure { image: img, caption });
                 }
                 i += 1;
@@ -3208,7 +3330,21 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     let mut j = i + 1;
                     let mut region: Option<RectF> = None;
                     let mut row_lines: Vec<&RichLine> = Vec::new();
+                    let mut caption = caption;
                     while let Some(t) = ordered.get(j) {
+                        // The sentence after a bare "Table 1" label is the rest of the caption.
+                        if j == i + 1
+                            && t.kind == UnitKind::Text
+                            && t.class != Some(strata_ocr::layout::TABLE)
+                            && t.lines.len() <= 3
+                            && text.split_whitespace().count() <= 3
+                            && (t.text().split_whitespace().count() >= 3 || t.text().trim_end().ends_with('.'))
+                        {
+                            caption.push(Span { text: " ".into(), style: Style::default(), link: None });
+                            caption.extend(spans_of(t, &p.rich.fonts, &p.links, vertical, p.scan, &lex));
+                            j += 1;
+                            continue;
+                        }
                         if t.kind == UnitKind::Figure {
                             // A figure with a caption of its own, or well apart from the
                             // table, is the next float, not part of the table.
@@ -3893,6 +4029,18 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         };
         let all = !spans.is_empty() && spans.iter().all(|s| emphasised(s) || s.text.trim().is_empty());
         let numbered = numbered_heading_depth(trimmed);
+        // (The next item of a numbered list is no heading: "4. Depth-integrated…" after "3. …".)
+        let after_item = (0..i).rev().find(|&j| !matches!(doc.nodes[j], Node::PageStart { .. })).is_some_and(|j| match &doc.nodes[j] {
+            Node::ListItem { .. } => true,
+            Node::Paragraph { spans } => {
+                let t = spans_text(spans);
+                let t = t.trim_start();
+                let n = t.chars().take_while(|c| c.is_ascii_digit()).count();
+                n > 0 && n <= 2 && t[n..].starts_with(['.', ')']) && t[n + 1..].starts_with(' ')
+            }
+            _ => false,
+        });
+        let numbered = if after_item { None } else { numbered };
         if all && heading_like(trimmed) && (numbered.is_some() || (body_started && trimmed.chars().count() <= 90 && !trimmed.contains([',', '，']) && trimmed.starts_with(|c: char| c.is_uppercase()) && matches!(doc.nodes.get(i + 1), Some(Node::Paragraph { .. })))) {
             let level = numbered.map_or(4, |d| (d + 1).min(6));
             let spans = spans.iter().cloned().map(|mut s| {
@@ -3937,6 +4085,21 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
         }
         i += 1;
+    }
+    // A page number that got through: a heading of digits, or a paragraph of digits
+    // first or last on its page.
+    for i in 0..doc.nodes.len() {
+        let digits = |spans: &[Span]| {
+            let t = spans_text(spans);
+            let t = t.trim();
+            !t.is_empty() && t.chars().count() <= 4 && t.chars().all(|c| c.is_ascii_digit())
+        };
+        let edge = i == 0 || matches!(doc.nodes[i - 1], Node::PageStart { .. }) || matches!(doc.nodes.get(i + 1), None | Some(Node::PageStart { .. }));
+        match &doc.nodes[i] {
+            Node::Heading { spans, .. } if digits(spans) => doc.nodes[i] = Node::Paragraph { spans: Vec::new() },
+            Node::Paragraph { spans } if edge && digits(spans) => doc.nodes[i] = Node::Paragraph { spans: Vec::new() },
+            _ => {}
+        }
     }
     // Article-type labels and badges set like headings around the title ("OPEN",
     // "RESEARCH ARTICLE") are no headings.

@@ -155,6 +155,16 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
             {
                 continue;
             }
+            // The font change between a digit and a Japanese character read as a
+            // space ("2018 年9 月12 日"): no gap, no space.
+            // (Japanese prose sets no space after a number: "1960 年" is never meant.)
+            if let (Some(a), Some(b)) = (out.last(), chars.get(i + 1))
+                && !scan
+                && ((a.c.is_ascii_digit() && super::is_cjk(b.c))
+                    || (((a.c.is_ascii_alphabetic() && super::is_cjk(b.c)) || (super::is_cjk(a.c) && b.c.is_ascii_alphanumeric())) && b.bbox.x0 - a.bbox.x1 < a.size.max(b.size) * 0.3))
+            {
+                continue;
+            }
             // The overhang of an italic letter before a hyphen ("T -axes", "P -wave"),
             // read as a space although it is far too narrow for one.
             if let (Some(a), Some(b)) = (out.last(), chars.get(i + 1))
@@ -264,6 +274,14 @@ pub(super) fn is_junk(t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_space_between_digit_and_kanji() {
+        let rc = |c: char, x0: f32, x1: f32| RichChar { c, bbox: crate::geom::RectF { x0, y0: 0.0, x1, y1: 8.0 }, size: 8.0, font: 0, bold: false, argb: 0 };
+        let cs = vec![rc('8', 192.3, 196.2), rc(' ', 196.2, 198.2), rc('年', 198.2, 206.2), rc('9', 208.2, 212.2)];
+        let out: String = clean_line(&cs, &[], false, |_| false).iter().map(|c| c.c).collect();
+        assert_eq!(out, "8年9");
+    }
 
     #[test]
     fn symbol() {
