@@ -48,6 +48,8 @@
 - `StrataPDF-cli.exe convert`：Markdown と HTML（同時出力可）への書き出しをウィンドウなしで行う。
   OCR（`--ocr`）、数式の LaTeX 化（`--latex`）、ワイルドカード展開、標準出力への出力に対応。
   `StrataPDF.exe --headless` からも呼べる。説明は `docs/CLI.md`、エージェント向けの要約は `AGENTS.md`
+- v0.2.2 の後：変換を `StrataPDF.exe --headless` に移し、`StrataPDF-cli.exe` は起動して待つだけの窓口にした
+  （61 MB → 約 230 KB。MuPDF・ONNX Runtime・モデルを二重に配らない）
 
 ## 公開（2026-09-29）
 

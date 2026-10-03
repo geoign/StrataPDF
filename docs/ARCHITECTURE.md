@@ -84,10 +84,13 @@ MuPDF の型（`mupdf::*`）を直接使うのは `strata-core` の中だけに�
 ページ番号の目印を押すと PDF 表示の該当ページへ戻る。WebView がキーボードを持っている間も
 主要なショートカットは JS 経由でアプリに届く。
 
-ウィンドウを出さない変換は `crates/strata-cli`（配置名 `StrataPDF-cli.exe`）が担う。
-GUI と同じく `Document::reflow` と `reflow::output` を呼ぶだけで、egui と WebView2 には依存しない。
-GUI の exe は Windows サブシステムで、PowerShell と cmd が終了を待たないため、別のコンソール用 exe にした。
-`StrataPDF.exe --headless` と `--help` は呼び出し元のコンソールに接続してから CLI を起動する（`strata-app/src/headless.rs`）。
+ウィンドウを出さない変換は `strata-app/src/convert.rs` にあり、`StrataPDF.exe --headless` で動く
+（`headless.rs` が egui を起動する前に分岐し、呼び出し元のコンソールに接続する）。GUI と同じく
+`Document::reflow` と `reflow::output` を呼ぶだけである。GUI の exe は Windows サブシステムで、
+PowerShell と cmd が終了を待たない。そこで `crates/strata-cli`（配置名 `StrataPDF-cli.exe`、約 230 KB）を
+コンソール用の窓口にした。これは同じフォルダーの `StrataPDF.exe --headless` を同じ標準入出力で起動し、
+終了を待って終了コードを返す。子は Job オブジェクトに入れ、窓口が終われば一緒に終わる。
+変換を窓口の exe に持たせると、MuPDF・ONNX Runtime・レイアウトモデル（約 60 MB）を二重に配ることになる。
 使い方は `docs/CLI.md`。
 
 ## OCR と数式認識

@@ -113,7 +113,7 @@ pwsh tools\uninstall.ps1         # 登録を解除（-RemoveFiles で配置フ�
 |---|---|
 | `crates/strata-core` | MuPDF のラッパー。文書スレッド、タイル描画プール、構造化テキスト、リフロー、注釈、表の取り出し |
 | `crates/strata-app` | GUI 本体（egui と wgpu、テキスト表示は WebView2）。タブ、分割表示、見開き |
-| `crates/strata-cli` | コマンドラインでの変換（`StrataPDF-cli.exe`）。Markdown / HTML への書き出し |
+| `crates/strata-cli` | `StrataPDF-cli.exe`：変換（`StrataPDF.exe --headless`、本体は `strata-app/src/convert.rs`）をコンソールから呼ぶ窓口 |
 | `crates/strata-ocr` | OCR（NDLOCR-Lite の移植）と数式認識（Pix2Text MFR） |
 | `crates/strata-translate` | 翻訳の送信先の実装、キャッシュ |
 | `vendor/mupdf` | `mupdf` クレートのパッチ版。差分は `vendor/PATCHES.md` |

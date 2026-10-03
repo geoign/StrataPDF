@@ -6,6 +6,8 @@
 
 配布版の zip と `tools\install.ps1` の配置先では、`StrataPDF.exe` と同じフォルダーに置かれる。
 スクリプトやエージェントから使うときは、このファイルを直接呼ぶ。
+変換の処理そのものは `StrataPDF.exe` が持っており、`StrataPDF-cli.exe` は同じフォルダーの
+`StrataPDF.exe` を起動して終了を待つだけの小さなプログラムである。二つは同じフォルダーに置いておくこと。
 
 ```powershell
 StrataPDF-cli.exe convert paper.pdf                    # paper.md と paper_files\
@@ -89,15 +91,19 @@ OCR と `--latex` のモデルは、初めて使うときに GitHub と Hugging 
 ## StrataPDF.exe から呼ぶ場合
 
 `StrataPDF.exe --headless convert ...`、`StrataPDF.exe convert ...`、`StrataPDF.exe --help` は、
-隣の `StrataPDF-cli.exe` に引数を渡して実行する。ただし `StrataPDF.exe` はウィンドウ用のプログラムなので、
-PowerShell と cmd はその終了を待たずに次へ進み、終了コードも受け取れない。
-Git Bash は終了を待つ。スクリプトからは `StrataPDF-cli.exe` を使うこと。
+ウィンドウを開かずにその場で変換やヘルプの表示をする。`StrataPDF-cli.exe` が内部で呼んでいるのもこの形である。
+ただし `StrataPDF.exe` はウィンドウ用のプログラムなので、PowerShell と cmd はその終了を待たずに次へ進み、
+終了コードも受け取れない。Git Bash は終了を待つ。スクリプトからは `StrataPDF-cli.exe` を使うこと。
+
+`StrataPDF-cli.exe` を強制終了すると（Ctrl+C を含む）、変換中の `StrataPDF.exe` も一緒に終わる。
 
 ## ビルド
 
 ```powershell
-cargo build --release -p strata-cli    # target\release\strata-cli.exe
+cargo build --release -p strata-app -p strata-cli
 ```
 
-GPU で OCR するには、同じフォルダーに `DirectML.dll` が要る（ビルド出力には ort が置く）。OCR を使わない変換は exe 単体で動く。
-配置では `strata-cli.exe` を `StrataPDF-cli.exe` に改名する。
+`target\release` に `strata-app.exe` と `strata-cli.exe` ができる。`strata-cli.exe` は同じフォルダーの
+`StrataPDF.exe` か `strata-app.exe` を起動するので、ビルド出力のままでも動く。配置では二つをそれぞれ
+`StrataPDF.exe` と `StrataPDF-cli.exe` に改名する。GPU で OCR するには、同じフォルダーに `DirectML.dll` が要る
+（ビルド出力には ort が置く）。

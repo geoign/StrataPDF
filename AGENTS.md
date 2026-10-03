@@ -13,8 +13,10 @@ Where it is:
 - Installed copy: next to `StrataPDF.exe` (find it from the registry value
   `HKCU\Software\Classes\StrataPDF.Document\shell\open\command`; the default install
   folder is `%LOCALAPPDATA%\Programs\StrataPDF`). `CLI.md` there is the manual.
-- Built from this repository: `cargo build --release -p strata-cli` gives
-  `target\release\strata-cli.exe` (same program, unrenamed).
+- Built from this repository: `cargo build --release -p strata-app -p strata-cli` gives
+  `target\release\strata-cli.exe` (same program, unrenamed). It is a small console
+  front end that runs `StrataPDF.exe --headless` (or `strata-app.exe`) from its own
+  folder, so keep the two together.
 
 ```powershell
 StrataPDF-cli.exe --help                                # full usage
@@ -28,8 +30,8 @@ StrataPDF-cli.exe convert paper.pdf --stdout -q         # Markdown on stdout
 
 Things to know:
 
-- Call `StrataPDF-cli.exe`, not `StrataPDF.exe`. `StrataPDF.exe --headless ...` forwards to
-  the CLI, but it is a GUI program: PowerShell and cmd do not wait for it.
+- Call `StrataPDF-cli.exe`, not `StrataPDF.exe`. `StrataPDF.exe --headless ...` converts
+  too, but it is a GUI program: PowerShell and cmd do not wait for it.
 - Written paths are printed on stdout, one per line; progress and warnings on stderr.
   Exit status: 0 ok, 1 some input failed, 2 usage error.
 - Without `--ocr`, scanned pages stay images and stderr warns how many. OCR and `--latex`
@@ -42,5 +44,7 @@ The full manual (Japanese) is [docs/CLI.md](docs/CLI.md).
 ## Working on the code
 
 See [README.md](README.md) (build, layout of the crates) and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The CLI is `crates/strata-cli`; the
-conversion itself is `strata-core::reflow` (`reflow::output::to_markdown` / `to_html`).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The command line is parsed and run by
+`crates/strata-app/src/convert.rs` (reached via `StrataPDF.exe --headless`);
+`crates/strata-cli` is only the console front end. The conversion itself is
+`strata-core::reflow` (`reflow::output::to_markdown` / `to_html`).
