@@ -448,13 +448,14 @@ impl ReflowPane {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
         let dir_name = format!("{stem}_files");
         let dir = path.with_file_name(&dir_name);
-        if !d.images.is_empty() {
+        let used = d.used_images();
+        if used.iter().any(|u| *u) {
             std::fs::create_dir_all(&dir)?;
-            for im in &d.images {
+            for (im, _) in d.images.iter().zip(&used).filter(|(_, u)| **u) {
                 std::fs::write(dir.join(&im.id), &im.png)?;
             }
         }
-        let md = output::to_markdown(d, &|im| format!("{dir_name}/{}", im.id).replace(' ', "%20"));
+        let md = output::to_markdown(d, &|im| output::image_link(&dir_name, &im.id));
         std::fs::write(path, md)
     }
 

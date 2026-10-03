@@ -431,7 +431,7 @@ fn convert(input: &Path, a: &Args, engines: &mut Engines, written: &mut HashSet<
         None => input.parent().map(Path::to_path_buf).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from(".")),
     };
     let files_name = format!("{stem}_files");
-    let rel = |im: &ReflowImage| format!("{files_name}/{}", im.id).replace(' ', "%20");
+    let rel = |im: &ReflowImage| output::image_link(&files_name, &im.id);
 
     if a.stdout {
         let text = match a.formats[0] {
@@ -456,10 +456,11 @@ fn convert(input: &Path, a: &Args, engines: &mut Engines, written: &mut HashSet<
         targets.push((*f, path));
     }
     let needs_files = targets.iter().any(|(f, _)| *f == Format::Md || !a.html_embed);
-    if needs_files && !d.images.is_empty() {
+    let used = d.used_images();
+    if needs_files && used.iter().any(|u| *u) {
         let images = dir.join(&files_name);
         std::fs::create_dir_all(&images).map_err(|e| format!("{}: {e}", images.display()))?;
-        for im in &d.images {
+        for (im, _) in d.images.iter().zip(&used).filter(|(_, u)| **u) {
             std::fs::write(images.join(&im.id), &im.png).map_err(|e| format!("{}: {e}", images.display()))?;
         }
     }
@@ -474,7 +475,7 @@ fn convert(input: &Path, a: &Args, engines: &mut Engines, written: &mut HashSet<
         let _ = writeln!(stdout, "{}", path.display());
     }
     if !a.quiet {
-        eprintln!("  done in {:.1} s: {} blocks, {} images{}", t.elapsed().as_secs_f32(), d.nodes.len(), d.images.len(), if d.vertical { ", vertical text" } else { "" });
+        eprintln!("  done in {:.1} s: {} blocks, {} images{}", t.elapsed().as_secs_f32(), d.nodes.len(), used.iter().filter(|u| **u).count(), if d.vertical { ", vertical text" } else { "" });
     }
     Ok(())
 }

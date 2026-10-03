@@ -152,6 +152,15 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
             {
                 continue;
             }
+            // The overhang of an italic letter before a hyphen ("T -axes", "P -wave"),
+            // read as a space although it is far too narrow for one.
+            if let (Some(a), Some(b)) = (out.last(), chars.get(i + 1))
+                && a.c.is_alphabetic()
+                && matches!(b.c, '-' | '\u{2010}' | '\u{2011}')
+                && b.bbox.x0 - a.bbox.x1 < a.size.max(b.size) * 0.2
+            {
+                continue;
+            }
             // A space inside a word after a ligature that MuPDF split into letters
             // ("Th e", "fi ssure"): the letters after the first have no width, and the
             // next glyph starts where the ligature glyph ends. (A word ending in a

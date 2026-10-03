@@ -125,6 +125,39 @@ pub struct ReflowDoc {
 }
 
 impl ReflowDoc {
+    /// Which of `images` the nodes still show: figures dropped as decoration and
+    /// formulas turned into LaTeX leave theirs unused, and an export need not write them.
+    pub fn used_images(&self) -> Vec<bool> {
+        let mut used = vec![false; self.images.len()];
+        let mut mark = |i: usize| {
+            if let Some(u) = used.get_mut(i) {
+                *u = true;
+            }
+        };
+        for n in &self.nodes {
+            match n {
+                Node::Figure { image, .. } | Node::Table { image, .. } | Node::PageImage { image, .. } => mark(*image),
+                Node::Formula { image, latex, .. } => {
+                    if latex.is_none() {
+                        mark(*image);
+                    }
+                }
+                Node::Html { html, .. } => {
+                    for (i, _) in html.match_indices("strata-img:") {
+                        let digits: String = html[i + "strata-img:".len()..].chars().take_while(char::is_ascii_digit).collect();
+                        if let Ok(k) = digits.parse::<usize>() {
+                            mark(k);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        used
+    }
+}
+
+impl ReflowDoc {
     fn fill_anchors(&mut self, a: (u32, f32)) {
         while self.anchors.len() < self.nodes.len() {
             self.anchors.push(a);
@@ -1220,6 +1253,17 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             _ => 0,
         })
         .sum();
+    // Page-wide image strips adding up to most of the page height: a scan in bands.
+    let banded = p
+        .rich
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            RichBlock::Image { bbox } if bbox.width() > w * 0.75 => Some(bbox.height()),
+            _ => None,
+        })
+        .sum::<f32>()
+        > h * 0.5;
     // Lines of the margin bands with their text length and whether they repeat.
     let margin_lines: Vec<(RectF, usize, bool)> = p
         .rich
@@ -1346,8 +1390,10 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                 }
             }
             RichBlock::Image { bbox } => {
-                // A page-sized image under a text layer is the scan of an OCRed page.
-                let background = bbox.width() * bbox.height() > page_area * 0.7 && text_chars > 100;
+                // A page-sized image under a text layer is the scan of an OCRed page; so
+                // are page-wide strips that together cover the page (scans stored in
+                // bands): each strip would otherwise become a figure of a few text lines.
+                let background = text_chars > 100 && (bbox.width() * bbox.height() > page_area * 0.7 || (banded && bbox.width() > w * 0.75));
                 if !background && bbox.width() * bbox.height() > page_area * 0.005 {
                     units.push(Unit { kind: UnitKind::Figure, bbox: *bbox, lines: Vec::new(), class: None, group: None, refs: refs::Ref::No });
                 }
@@ -2053,6 +2099,19 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
     for s in &mut spans {
         if s.style.sup || s.style.sub {
             s.text = s.text.trim().to_string();
+        }
+    }
+    // A degree sign typeset as a raised ring (TeX "^\circ": 6◦–10◦) or as a raised "o"
+    // after a digit (25oC) is the degree sign.
+    for i in 0..spans.len() {
+        if !spans[i].style.sup {
+            continue;
+        }
+        let ring = matches!(spans[i].text.as_str(), "◦" | "∘" | "º");
+        let letter = matches!(spans[i].text.as_str(), "o" | "O") && i > 0 && spans[i - 1].text.trim_end().ends_with(|c: char| c.is_ascii_digit());
+        if ring || letter {
+            spans[i].text = "°".into();
+            spans[i].style.sup = false;
         }
     }
     // A spacing accent set in another font forms its own span; move it onto the

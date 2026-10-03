@@ -36,6 +36,21 @@ fn esc_html(s: &str) -> String {
     o
 }
 
+/// The relative address of an exported image for Markdown and HTML: `dir/id` with the
+/// characters that end or break a link destination percent-encoded (a file name with
+/// parentheses, "Krakatau (Indonesia)", cut the link at the first ")").
+pub fn image_link(dir_name: &str, id: &str) -> String {
+    let mut o = String::with_capacity(dir_name.len() + id.len() + 8);
+    for c in format!("{dir_name}/{id}").chars() {
+        match c {
+            ' ' | '(' | ')' | '[' | ']' | '<' | '>' | '#' | '%' | '"' | '`' | '\\' | '?' => o.push_str(&format!("%{:02X}", c as u32)),
+            c if (c as u32) < 0x20 => o.push_str(&format!("%{:02X}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
 fn esc_md(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -128,7 +143,7 @@ pub fn spans_md(spans: &[Span]) -> String {
             t = format!("<sub>{t}</sub>");
         }
         if let Some(l) = &s.link {
-            t = format!("[{t}]({})", l.replace(' ', "%20").replace(')', "%29"));
+            t = format!("[{t}]({})", l.replace(' ', "%20").replace('(', "%28").replace(')', "%29"));
         }
         o.push_str(lead);
         o.push_str(&t);
@@ -452,4 +467,16 @@ fn mathml(latex: &str, block: bool) -> Option<String> {
     }
     let display = if block { MathDisplay::Block } else { MathDisplay::Inline };
     CONV.with(|c| c.as_ref()?.convert_with_local_state(latex, display).ok().map(|r| r.mathml))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_links_survive_parentheses_and_spaces() {
+        assert_eq!(image_link("Deplus 1995 - Krakatau (Indonesia)_files", "p1_1.png"), "Deplus%201995%20-%20Krakatau%20%28Indonesia%29_files/p1_1.png");
+        assert_eq!(image_link("浅間火山_files", "p2_3.png"), "浅間火山_files/p2_3.png");
+        assert_eq!(image_link("a#b%c_files", "x.png"), "a%23b%25c_files/x.png");
+    }
 }
