@@ -2295,11 +2295,13 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
             let mut prev = prev_last;
             for c in s.text.chars() {
                 out.push(if c == '◦' && prev.is_some_and(|p| p.is_ascii_digit()) { '°' } else { c });
-                prev = Some(c);
+                if c != ' ' {
+                    prev = Some(c);
+                }
             }
             s.text = out;
         }
-        prev_last = s.text.chars().last().or(prev_last);
+        prev_last = s.text.chars().rev().find(|c| *c != ' ').or(prev_last);
         // Spaces inside a web address ("doi .org /10 .1016"): none belong there.
         if s.link.is_some() || s.text.contains("doi.org") || s.text.contains("http") || s.text.contains("www.") {
             s.text = unspace_address(&s.text);
@@ -2674,12 +2676,12 @@ fn unspace_address(t: &str) -> String {
 
 /// A label of the article's type or access printed above the title.
 fn is_kicker(t: &str) -> bool {
-    const KICKERS: [&str; 40] = [
+    const KICKERS: [&str; 41] = [
         "open", "open access", "article", "articles", "research article", "research articles", "review article", "original article", "original paper",
         "original research", "research paper", "research papers", "letter", "letters", "review", "reviews", "short communication", "short communications",
         "research letter", "report", "reports", "perspective", "perspectives", "correspondence", "editorial", "brief communication", "rapid communication",
         "full paper", "regular article", "regular paper", "technical note", "discussion", "comment", "reply", "communication", "article in press",
-        "accepted manuscript", "論説", "総説", "短報",
+        "accepted manuscript", "article info", "論説", "総説", "短報",
     ];
     let t = t.trim().trim_end_matches([':', '：']).to_lowercase();
     let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
