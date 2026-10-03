@@ -4105,11 +4105,28 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     }
     // Article-type labels and badges set like headings around the title ("OPEN",
     // "RESEARCH ARTICLE") are no headings.
-    for n in doc.nodes.iter_mut().take(12) {
+    for n in doc.nodes.iter_mut().take(40) {
         if let Node::Heading { spans, .. } = n
             && is_kicker(&spans_text(spans))
         {
             *n = Node::Paragraph { spans: Vec::new() };
+        }
+    }
+    // A heading set in small capitals comes out in lower case ("abstract"): capitalised.
+    for n in &mut doc.nodes {
+        if let Node::Heading { spans, .. } = n
+            && spans_text(spans).chars().all(|c| c.is_ascii_lowercase() || c == ' ')
+            && spans_text(spans).split_whitespace().count() <= 4
+        {
+            for s in spans.iter_mut() {
+                let mut out = String::with_capacity(s.text.len());
+                let mut start = true;
+                for c in s.text.chars() {
+                    out.push(if start { c.to_ascii_uppercase() } else { c });
+                    start = c == ' ';
+                }
+                s.text = out;
+            }
         }
     }
     // Nodes emptied by `pair_figures`.
