@@ -8,5 +8,5 @@ description = "StrataPDF without a window: convert documents to Markdown and HTM
 
 [dependencies]
 base64 = "0.22"
-strata-core = { version = "0.2.1", path = "../strata-core" }
-strata-ocr = { version = "0.2.1", path = "../strata-ocr" }
+strata-core = { version = "0.2.2", path = "../strata-core" }
+strata-ocr = { version = "0.2.2", path = "../strata-ocr" }
