@@ -50,6 +50,9 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1   # 登録の解除
 OCR と数式のモデルは、初めて使うときに GitHub と Hugging Face から取得する。
 モデル・キャッシュ・設定は `%LOCALAPPDATA%\StrataPDF` に置かれる。
 
+起動時に GitHub の Releases を見て、新しい版があれば知らせる（送るのは問い合わせだけで、何も送信しない）。
+「ヘルプ > 起動時に更新を確認する」で止められ、「ヘルプ > 更新を確認」でいつでも確かめられる。
+
 ## コマンドラインでの変換
 
 `StrataPDF.exe` と同じフォルダーの `StrataPDF-cli.exe` は、ウィンドウを出さずに文書を Markdown と HTML に変換する。

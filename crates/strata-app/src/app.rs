@@ -42,11 +42,27 @@ pub struct Settings {
     /// Font families of the text view.
     pub text_fonts: crate::text_font::TextFonts,
     pub translate: crate::translate_ui::TranslateSettings,
+    /// Look for a newer release on GitHub when the program starts.
+    pub check_updates: bool,
+    /// A newer version the user chose not to be told about again.
+    pub skip_version: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), prefs: ViewPrefs::default(), theme: ThemeChoice::System, tile_budget_mb: 1024, ocr_device: strata_core::ocr::Device::Gpu, formula_latex: true, text_scale: 1.0, text_fonts: Default::default(), translate: Default::default() }
+        Settings {
+            recent: Vec::new(),
+            prefs: ViewPrefs::default(),
+            theme: ThemeChoice::System,
+            tile_budget_mb: 1024,
+            ocr_device: strata_core::ocr::Device::Gpu,
+            formula_latex: true,
+            text_scale: 1.0,
+            text_fonts: Default::default(),
+            translate: Default::default(),
+            check_updates: true,
+            skip_version: None,
+        }
     }
 }
 
@@ -88,6 +104,11 @@ pub struct StrataApp {
     actions: Vec<Action>,
     props: Option<Arc<DocInfo>>,
     show_about: bool,
+    /// A running update check, its finding, and a message for a check the user asked for.
+    update_rx: Option<Receiver<crate::update::Outcome>>,
+    update_notice: Option<crate::update::Release>,
+    update_message: Option<String>,
+    update_manual: bool,
     fullscreen: bool,
     title: String,
     waker: Waker,
@@ -123,6 +144,12 @@ impl StrataApp {
         let (ipc_tx, ipc_rx) = unbounded();
         let ictx = ctx.clone();
         crate::instance::serve(ipc_tx, move || ictx.request_repaint());
+        // The update check runs on its own thread while the window comes up.
+        let update_rx = settings.check_updates.then(|| {
+            let (tx, rx) = unbounded();
+            crate::update::spawn(tx, waker.clone());
+            rx
+        });
         let mut app = StrataApp {
             dock: DockState::new(Vec::new()),
             pool: RenderPool::new(threads, waker.clone()),
@@ -140,6 +167,10 @@ impl StrataApp {
             actions: Vec::new(),
             props: None,
             show_about: false,
+            update_rx,
+            update_notice: None,
+            update_message: None,
+            update_manual: false,
             fullscreen: false,
             title: String::new(),
             waker,
@@ -485,6 +516,11 @@ impl StrataApp {
                     if ui.button("キー操作と情報").clicked() {
                         self.show_about = true;
                     }
+                    ui.separator();
+                    if ui.add_enabled(self.update_rx.is_none(), egui::Button::new("更新を確認")).clicked() {
+                        self.check_updates(true);
+                    }
+                    ui.checkbox(&mut self.settings.check_updates, "起動時に更新を確認する");
                 });
                 if !self.opening.is_empty() {
                     ui.separator();
@@ -589,6 +625,7 @@ impl StrataApp {
             }
         }
 
+        self.update_windows(ctx);
         if self.show_about {
             egui::Window::new("StrataPDF について").open(&mut self.show_about).default_width(420.0).show(ctx, |ui| {
                 ui.label(format!("StrataPDF {}", env!("CARGO_PKG_VERSION")));
@@ -786,6 +823,7 @@ impl eframe::App for StrataApp {
             self.tiles.insert(&ctx, t);
         }
         self.poll_opens();
+        self.poll_update();
         while let Ok(m) = self.msg_rx.try_recv() {
             if let Some((_, v)) = self.dock.find_active_focused() {
                 v.status = m;
@@ -833,6 +871,8 @@ impl eframe::App for StrataApp {
                 || self.password.is_some()
                 || self.props.is_some()
                 || self.show_about
+                || self.update_notice.is_some()
+                || self.update_message.is_some()
                 || !self.errors.is_empty();
             let mut viewer = Viewer {
                 pool: &self.pool,
@@ -933,6 +973,84 @@ impl eframe::App for StrataApp {
 }
 
 impl StrataApp {
+    /// Start an update check unless one is running. `manual`: the user asked, so the
+    /// outcome is reported whatever it is.
+    fn check_updates(&mut self, manual: bool) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = unbounded();
+        crate::update::spawn(tx, self.waker.clone());
+        self.update_rx = Some(rx);
+        self.update_manual = manual;
+    }
+
+    fn poll_update(&mut self) {
+        let Some(o) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.update_rx = None;
+        let manual = std::mem::take(&mut self.update_manual);
+        match o {
+            crate::update::Outcome::Newer(r) => {
+                if manual || self.settings.skip_version.as_deref() != Some(r.version.as_str()) {
+                    self.update_notice = Some(r);
+                }
+            }
+            crate::update::Outcome::UpToDate(v) => {
+                if manual {
+                    self.update_message = Some(format!("この版（v{}）が最新です（公開されている最新版は v{v}）。", crate::update::CURRENT));
+                }
+            }
+            crate::update::Outcome::Failed(e) => {
+                log::warn!("update check: {e}");
+                if manual {
+                    self.update_message = Some(format!("更新を確認できませんでした: {e}"));
+                }
+            }
+        }
+    }
+
+    fn update_windows(&mut self, ctx: &egui::Context) {
+        if let Some(r) = self.update_notice.clone() {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new("新しい版があります").collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_TOP, [-12.0, 48.0]).open(&mut open).show(ctx, |ui| {
+                ui.label(format!("StrataPDF v{} が公開されています（この版は v{}）。", r.version, crate::update::CURRENT));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("ダウンロードページを開く").clicked() {
+                        open_link(&r.url);
+                        close = true;
+                    }
+                    if ui.button("この版は通知しない").clicked() {
+                        self.settings.skip_version = Some(r.version.clone());
+                        close = true;
+                    }
+                    if ui.button("後で").clicked() {
+                        close = true;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.settings.check_updates, "起動時に更新を確認する");
+            });
+            if !open || close {
+                self.update_notice = None;
+            }
+        }
+        if let Some(m) = self.update_message.clone() {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new("更新の確認").collapsible(false).resizable(false).anchor(egui::Align2::RIGHT_TOP, [-12.0, 48.0]).open(&mut open).show(ctx, |ui| {
+                ui.label(&m);
+                if ui.button("閉じる").clicked() {
+                    close = true;
+                }
+            });
+            if !open || close {
+                self.update_message = None;
+            }
+        }
+    }
+
     fn unsaved_dialogs(&mut self, ctx: &egui::Context) {
         // Window close with unsaved changes.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit && self.dock.iter_all_tabs().any(|(_, t)| t.dirty()) {

@@ -11,6 +11,7 @@ mod reflow_view;
 mod text_font;
 mod tiles;
 mod translate_ui;
+mod update;
 mod view;
 
 use std::path::PathBuf;

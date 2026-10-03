@@ -4823,6 +4823,7 @@ dependencies = [
  "strata-core",
  "strata-ocr",
  "strata-translate",
+ "ureq",
  "windows",
  "winit",
  "winresource",
