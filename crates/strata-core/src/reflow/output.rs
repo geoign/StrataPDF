@@ -122,6 +122,57 @@ fn alt_text(caption: &[Span], fallback: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// The cells of a table's rows (tab-separated) when the rows agree on a number of
+/// columns; a longer row folds its surplus into the last cell, a shorter one is padded.
+fn table_cells(rows: &[String]) -> Option<Vec<Vec<String>>> {
+    if rows.len() < 2 {
+        return None;
+    }
+    let cells: Vec<Vec<String>> = rows.iter().map(|r| r.replace('\u{AD}', "").split('\t').map(|c| c.trim().to_string()).collect()).collect();
+    let mut counts: Vec<usize> = cells.iter().map(Vec::len).collect();
+    counts.sort_unstable();
+    let cols = counts[counts.len() / 2];
+    if cols < 2 || cols > 12 || cells.iter().filter(|c| c.len() == cols).count() * 10 < cells.len() * 7 {
+        return None;
+    }
+    Some(
+        cells
+            .into_iter()
+            .map(|mut c| {
+                if c.len() > cols {
+                    let tail = c.split_off(cols - 1).join(" ");
+                    c.push(tail);
+                }
+                c.resize(cols, String::new());
+                c
+            })
+            .collect(),
+    )
+}
+
+fn md_table(rows: &[String]) -> Option<String> {
+    let cells = table_cells(rows)?;
+    let mut o = String::new();
+    for (i, r) in cells.iter().enumerate() {
+        o.push('|');
+        for c in r {
+            o.push(' ');
+            o.push_str(&esc_md(c).replace('|', "\\|"));
+            o.push_str(" |");
+        }
+        o.push('\n');
+        if i == 0 {
+            o.push('|');
+            for _ in r {
+                o.push_str(" --- |");
+            }
+            o.push('\n');
+        }
+    }
+    o.push('\n');
+    Some(o)
+}
+
 /// A caption without its own bold and italic, for wrapping in the caption's markers.
 fn unstyled(spans: &[Span]) -> Vec<Span> {
     spans
@@ -296,13 +347,17 @@ pub fn to_markdown(doc: &ReflowDoc, image_path: &dyn Fn(&ReflowImage) -> String)
                     o.push_str(&format!("**{}**\n\n", c.trim()));
                 }
                 o.push_str(&format!("![{}]({})\n\n", alt_text(caption, "table"), image_path(img)));
-                if !rows.is_empty() {
-                    o.push_str("<details><summary>表のテキスト</summary>\n\n```text\n");
-                    for r in rows {
-                        o.push_str(&r.replace('\u{AD}', ""));
-                        o.push('\n');
+                match md_table(rows) {
+                    Some(t) => o.push_str(&t),
+                    None if !rows.is_empty() => {
+                        o.push_str("<details><summary>表のテキスト</summary>\n\n```text\n");
+                        for r in rows {
+                            o.push_str(&r.replace('\u{AD}', "").replace('\t', " | "));
+                            o.push('\n');
+                        }
+                        o.push_str("```\n\n</details>\n\n");
                     }
-                    o.push_str("```\n\n</details>\n\n");
+                    None => {}
                 }
             }
             Node::Footnote { spans } => o.push_str(&format!("<small>{}</small>\n\n", spans_md(spans).trim())),
@@ -344,6 +399,8 @@ figcaption { color: var(--muted); font-size: .9em; text-align: left; margin-top:
 figure.table figcaption { margin: 0 0 .5em; }
 details { text-align: left; font-size: .85em; color: var(--muted); margin-top: .4em; }
 details pre { white-space: pre-wrap; background: var(--card); padding: .8em; border-radius: 4px; }
+details table { border-collapse: collapse; margin: .4em auto; color: var(--fg); }
+details th, details td { border: 1px solid var(--rule); padding: .15em .5em; text-align: left; vertical-align: top; }
 .formula { text-align: center; margin: 1.2em 0; position: relative; overflow-x: auto; }
 .formula math { font-size: 1.1em; }
 .eqno { position: absolute; right: 0; top: 50%; transform: translateY(-50%); color: var(--muted); }
@@ -512,9 +569,20 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
             Node::Table { image, caption, rows } => {
                 let img = &doc.images[*image];
                 h.push_str(&format!("<figure class=\"table\"><figcaption>{}</figcaption><img src=\"{}\" width=\"{}\" alt=\"{}\" loading=\"lazy\">", spans_html(caption), esc_html(&(o.image_src)(img)), img.width, esc_html(&alt_text(caption, ""))));
-                if !rows.is_empty() {
+                if let Some(cells) = table_cells(rows) {
+                    h.push_str("<details><summary>表のテキスト</summary><table>");
+                    for (i, r) in cells.iter().enumerate() {
+                        h.push_str("<tr>");
+                        for c in r {
+                            let tag = if i == 0 { "th" } else { "td" };
+                            h.push_str(&format!("<{tag}>{}</{tag}>", esc_html(c)));
+                        }
+                        h.push_str("</tr>");
+                    }
+                    h.push_str("</table></details>");
+                } else if !rows.is_empty() {
                     h.push_str("<details><summary>表のテキスト</summary><pre>");
-                    h.push_str(&esc_html(&rows.join("\n").replace('\u{AD}', "")));
+                    h.push_str(&esc_html(&rows.join("\n").replace('\u{AD}', "").replace('\t', " | ")));
                     h.push_str("</pre></details>");
                 }
                 h.push_str("</figure>\n");
@@ -629,6 +697,15 @@ mod tests {
         assert_eq!(guard_line("-15 °C"), "-15 °C");
         assert_eq!(guard_line("*Fig. 1.* caption"), "*Fig. 1.* caption");
         assert_eq!(guard_line("---"), "\\---");
+    }
+
+    #[test]
+    fn tables_with_agreeing_rows_become_tables() {
+        let rows: Vec<String> = ["Volcano\tDepth\tH2O", "A\t430\t1.2", "B\t1210\t3.5", "note on the table"].iter().map(|s| s.to_string()).collect();
+        let t = md_table(&rows).unwrap();
+        assert!(t.starts_with("| Volcano | Depth | H2O |\n| --- | --- | --- |\n| A | 430 | 1.2 |\n"));
+        assert!(t.contains("| note on the table |  |  |\n"));
+        assert!(md_table(&["a\tb".to_string(), "c".to_string(), "d".to_string()]).is_none());
     }
 
     #[test]

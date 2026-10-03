@@ -2516,6 +2516,31 @@ fn tidy_latex(l: &str) -> Option<String> {
     (longest < 8).then(|| out.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// The rows of a table from the lines of its units: lines at one height form a row,
+/// their texts (the cells, as MuPDF cuts them) in order from the left, separated by
+/// tabs. A cell wrapped onto a second line becomes a row of its own.
+fn table_rows(lines: &[&RichLine]) -> Vec<String> {
+    let mut lines: Vec<&RichLine> = lines.iter().copied().filter(|l| !l.text().trim().is_empty()).collect();
+    lines.sort_by(|a, b| (a.bbox.y0 + a.bbox.y1).total_cmp(&(b.bbox.y0 + b.bbox.y1)));
+    let mut rows: Vec<(RectF, Vec<&RichLine>)> = Vec::new();
+    for l in lines {
+        let cy = (l.bbox.y0 + l.bbox.y1) * 0.5;
+        match rows.last_mut() {
+            Some((band, v)) if cy > band.y0 && cy < band.y1 && (l.bbox.y1.min(band.y1) - l.bbox.y0.max(band.y0)) > 0.5 * l.bbox.height().min(band.height()) => {
+                *band = band.union(&l.bbox);
+                v.push(l);
+            }
+            _ => rows.push((l.bbox, vec![l])),
+        }
+    }
+    rows.into_iter()
+        .map(|(_, mut v)| {
+            v.sort_by(|a, b| a.bbox.x0.total_cmp(&b.bbox.x0));
+            v.iter().map(|l| l.text().trim().to_string()).collect::<Vec<_>>().join("\t")
+        })
+        .collect()
+}
+
 /// A label of the article's type or access printed above the title.
 fn is_kicker(t: &str) -> bool {
     const KICKERS: [&str; 40] = [
@@ -3041,7 +3066,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     && caption_kind(&next.text()) == Some(false)
                 {
                     caption = spans_of(next, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
-                    if let Some(img) = crop(u.bbox, opts.image_scale, &mut doc) {
+                    // A caption set inside the figure's frame: the crop stops above it.
+                    let mut bbox = u.bbox;
+                    if overlap_frac(&next.bbox, &u.bbox) > 0.8 && next.bbox.y0 > u.bbox.y0 + u.bbox.height() * 0.5 {
+                        bbox.y1 = next.bbox.y0 - 2.0;
+                    }
+                    if let Some(img) = crop(bbox, opts.image_scale, &mut doc) {
                         doc.nodes.push(Node::Figure { image: img, caption });
                         last_caption = Some((doc.nodes.len() - 1, next.size(), next.bbox, p.page));
                     }
@@ -3109,7 +3139,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             if !vertical && u.class == Some(strata_ocr::layout::TABLE) && !prose_like(&text) && caption_kind(&text).is_none() {
                 let mut j = i;
                 let mut region = u.bbox;
-                let mut rows = Vec::new();
+                let mut row_lines: Vec<&RichLine> = Vec::new();
                 while let Some(t) = ordered.get(j) {
                     let table_unit = t.kind == UnitKind::Text && t.class == Some(strata_ocr::layout::TABLE) && !prose_like(&t.text()) && caption_kind(&t.text()).is_none();
                     let figure_inside = t.kind == UnitKind::Figure && overlap_frac(&t.bbox, &region.union(&t.bbox)) > 0.0 && t.bbox.y0 < region.y1 + body * 2.0;
@@ -3117,9 +3147,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         break;
                     }
                     region = region.union(&t.bbox);
-                    rows.extend(t.lines.iter().map(|l| l.text()));
+                    row_lines.extend(t.lines.iter());
                     j += 1;
                 }
+                let rows = table_rows(&row_lines);
                 if let Some(img) = crop(region, opts.image_scale, &mut doc) {
                     doc.nodes.push(Node::Table { image: img, caption: Vec::new(), rows });
                     i = j;
@@ -3136,7 +3167,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     let caption = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
                     let mut j = i + 1;
                     let mut region: Option<RectF> = None;
-                    let mut rows = Vec::new();
+                    let mut row_lines: Vec<&RichLine> = Vec::new();
                     while let Some(t) = ordered.get(j) {
                         if t.kind == UnitKind::Figure {
                             // A figure with a caption of its own, or well apart from the
@@ -3159,9 +3190,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             break;
                         }
                         region = Some(region.map_or(t.bbox, |r| r.union(&t.bbox)));
-                        rows.extend(t.lines.iter().map(|l| l.text()));
+                        row_lines.extend(t.lines.iter());
                         j += 1;
                     }
+                    let rows = table_rows(&row_lines);
                     match region.and_then(|r| crop(r, opts.image_scale, &mut doc)) {
                         Some(img) => {
                             doc.nodes.push(Node::Table { image: img, caption, rows });
@@ -3476,6 +3508,33 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             if level.is_some() {
                 in_refs = is_references_heading(&text);
+            }
+            // Affiliation lines of the front matter ("a Durham University…", "b Laoshan
+            // Laboratory…"), each opening with a raised letter or a digit: one line each,
+            // not one paragraph.
+            if in_front && level.is_none() && !vertical && u.lines.len() >= 2 && u.lines.len() <= 12 {
+                let marked = u
+                    .lines
+                    .iter()
+                    .filter(|l| {
+                        let raised = l.chars.iter().find(|c| !c.c.is_whitespace()).is_some_and(|c| c.size < line_size(l) * 0.8 && c.c.is_alphanumeric());
+                        let t = l.text();
+                        let t = t.trim_start();
+                        raised || (t.len() > 3 && t.starts_with(|c: char| c.is_ascii_digit()) && t[1..].starts_with(' '))
+                    })
+                    .count();
+                if marked * 10 >= u.lines.len() * 6 {
+                    for l in &u.lines {
+                        let one = Unit { kind: UnitKind::Text, bbox: l.bbox, lines: vec![l.clone()], class: u.class, group: u.group, refs: refs::Ref::No };
+                        let spans = spans_of(&one, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
+                        if !spans.is_empty() {
+                            doc.nodes.push(Node::Paragraph { spans });
+                        }
+                    }
+                    last_para = None;
+                    i += 1;
+                    continue;
+                }
             }
             let mut spans = spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex);
             // Run-in heading: "4.1.1. Porous flow bands  Body text..." in one block.
