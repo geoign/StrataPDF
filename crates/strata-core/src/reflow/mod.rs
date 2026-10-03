@@ -137,8 +137,9 @@ impl ReflowDoc {
         for n in &self.nodes {
             match n {
                 Node::Figure { image, .. } | Node::Table { image, .. } | Node::PageImage { image, .. } => mark(*image),
+                // (The HTML falls back to the image when the LaTeX does not render.)
                 Node::Formula { image, latex, .. } => {
-                    if latex.is_none() {
+                    if latex.as_deref().and_then(output::latex_to_mathml).is_none() {
                         mark(*image);
                     }
                 }
@@ -477,8 +478,13 @@ pub fn needs_ocr(p: &RichPage) -> Option<String> {
 /// A publisher's cover sheet ("To cite this article", "Downloaded from", terms of
 /// use), put before or after the article by a journal site or a library: no content.
 fn cover_sheet(p: &RichPage) -> bool {
-    const MARKS: [&str; 24] = [
+    const MARKS: [&str; 29] = [
         "to cite this article",
+        "cite this article as",
+        "article in press",
+        "unedited version of this manuscript",
+        "before final publication",
+        "accepted manuscript",
         "to link to this article",
         "submit your article",
         "view related articles",
@@ -515,7 +521,18 @@ fn cover_sheet(p: &RichPage) -> bool {
     if text.chars().count() > 6000 {
         return false;
     }
-    MARKS.iter().filter(|m| text.contains(*m)).count() >= 2
+    // Banners that run on every page of a manuscript ("Article in Press",
+    // "Accepted manuscript", "Downloaded from") count less than the cover's own lines.
+    const WEAK: [&str; 8] = ["article in press", "accepted manuscript", "downloaded from", "downloaded by", "rights and permissions", "how to cite", "citation details", "stable url"];
+    let (mut strong, mut weak) = (0, 0);
+    for m in MARKS.iter().filter(|m| text.contains(*m)) {
+        if WEAK.contains(m) {
+            weak += 1;
+        } else {
+            strong += 1;
+        }
+    }
+    strong >= 2 || (strong >= 1 && weak >= 2)
 }
 
 /// A link whose URI lost its scheme ("www.nature.com/reprints" resolved against the
@@ -567,7 +584,9 @@ fn drop_invisible_chars(p: &mut RichPage) {
     for b in &mut p.blocks {
         if let RichBlock::Text { lines, .. } = b {
             for l in lines.iter_mut() {
-                l.chars.retain(|c| c.size >= 1.0);
+                // (Control characters too: a BEL after every heading number of one
+                // publisher hid the numbering from the heading rules.)
+                l.chars.retain(|c| c.size >= 1.0 && (!c.c.is_control() || c.c == '\t'));
             }
             lines.retain(|l| !l.chars.is_empty());
         }
@@ -3788,8 +3807,10 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // Unnumbered headings: the level from the rank of their style (size first, then
     // bold, capitals, upright) among the document's heading styles, instead of a flat 3.
     {
-        let key = |s: f32, b: bool, c: bool, i: bool| ((s * 2.0).round() as u32, b, c, !i);
-        let mut keys: Vec<(u32, bool, bool, bool)> = heading_styles.iter().map(|&(_, s, b, c, i)| key(s, b, c, i)).collect();
+        // (Capitals outrank size and bold: sections in capitals are often set a point
+        // smaller than the bold title-case subsections under them.)
+        let key = |s: f32, b: bool, c: bool, i: bool| (c, s.round() as u32, b, !i);
+        let mut keys: Vec<(bool, u32, bool, bool)> = heading_styles.iter().map(|&(_, s, b, c, i)| key(s, b, c, i)).collect();
         keys.sort_by(|a, b| b.cmp(a));
         keys.dedup();
         if keys.len() >= 2 {
@@ -3820,6 +3841,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         {
             *number = Some(inner.to_string());
             doc.nodes[i] = Node::Paragraph { spans: Vec::new() };
+        } else if let Node::ListItem { spans } = &mut doc.nodes[i] {
+            // (A number whose equation came out as text is text too, not a list.)
+            doc.nodes[i] = Node::Paragraph { spans: std::mem::take(spans) };
         }
     }
     // A heading set in bold or italic that the paragraph joining swallowed: at the end

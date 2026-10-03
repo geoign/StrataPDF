@@ -424,6 +424,16 @@ fn convert(input: &Path, a: &Args, engines: &mut Engines, written: &mut HashSet<
     if page_images > 0 && a.ocr.is_none() {
         eprintln!("  warning: {page_images} pages have no usable text layer and are kept as images; add --ocr needed to read them");
     }
+    if let Some(q) = d.ocr_layer.filter(|q| q.poor())
+        && !matches!(a.ocr, Some(OcrScope::Scans | OcrScope::All))
+    {
+        let rate = if q.japanese() { q.ja_rate().map(|r| format!("{:.0}% of the Japanese characters look wrong", r * 100.0)) } else { q.en_rate().map(|r| format!("{:.0}% of the words are not words", r * 100.0)) };
+        eprintln!(
+            "  warning: the text layer of {} scanned pages reads poorly ({}); add --ocr scans to read them with the built-in OCR instead",
+            q.pages,
+            rate.unwrap_or_else(|| "too many misreadings".into())
+        );
+    }
 
     let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
     let dir = match &a.out_dir {

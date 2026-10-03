@@ -193,7 +193,9 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
         } else if !scan
             && let Some(a) = out.last()
             && a.c != ' '
-            && ((RELATIONS.contains(&a.c) && c.c.is_alphanumeric()) || (a.c.is_alphanumeric() && RELATIONS.contains(&c.c)))
+            && ((RELATIONS.contains(&a.c) && c.c.is_alphanumeric())
+                || (a.c.is_alphanumeric() && RELATIONS.contains(&c.c))
+                || (matches!(a.c, '°' | '◦' | '∘') && (c.c.is_alphanumeric() || c.c == '(')))
             && c.bbox.x0 - a.bbox.x1 >= c.size.max(a.size) * 0.12
         {
             // A word space without a space glyph beside a relation sign ("≤depth").
