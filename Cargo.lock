@@ -4802,7 +4802,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strata-app"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4832,14 +4832,14 @@ dependencies = [
 
 [[package]]
 name = "strata-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "strata-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cc",
  "crossbeam-channel",
@@ -4864,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "strata-ocr"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "directories",
  "env_logger",
@@ -4883,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "strata-translate"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "crossbeam-channel",
  "directories",
