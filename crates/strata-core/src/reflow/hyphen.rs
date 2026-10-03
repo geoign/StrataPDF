@@ -11,6 +11,9 @@ pub(super) fn is_hyphen(c: char) -> bool {
     matches!(c, '-' | '\u{2010}' | '\u{2011}' | '\u{00AD}')
 }
 
+/// Units that form compounds with a hyphen ("km-long", "m-thick").
+const UNITS: [&str; 22] = ["km", "m", "cm", "mm", "µm", "kg", "g", "mg", "s", "h", "hr", "yr", "ka", "ma", "ga", "kyr", "myr", "pa", "mpa", "gpa", "hz", "ppm"];
+
 #[derive(Default)]
 pub(super) struct Lexicon {
     words: HashMap<String, u32>,
@@ -71,6 +74,11 @@ impl Lexicon {
     /// Whether "a-" at a line end and "b" at the start of the next line form a
     /// hyphenated compound (keep the hyphen) rather than one word broken in two.
     pub(super) fn keep_hyphen(&self, a: &str, b: &str) -> bool {
+        // Capitals and digits before the hyphen ("NE–SW-", "3D-", "pre-Miocene" after
+        // "Mid-"), a unit ("km-long") or a capital after it: a compound, not a break.
+        let capitals = a.chars().all(|c| c.is_uppercase() || c.is_ascii_digit());
+        let unit = UNITS.contains(&a.to_lowercase().as_str());
+        let capitalised = b.chars().next().is_some_and(char::is_uppercase);
         let a = a.to_lowercase();
         let b = b.to_lowercase();
         if a.is_empty() || b.is_empty() {
@@ -81,6 +89,9 @@ impl Lexicon {
         }
         if self.has_form(&format!("{a}{b}")) {
             return false;
+        }
+        if capitals || unit || capitalised {
+            return true;
         }
         // Both halves are words of three letters or more ("time-scale"), not
         // syllables ("infor-mation", "be-cause").
@@ -131,6 +142,10 @@ mod tests {
         assert!(!l.keep_hyphen("be", "cause"));
         let l = lex(&["time", "scale"]);
         assert!(l.keep_hyphen("time", "scale"));
+        assert!(l.keep_hyphen("km", "long"));
+        assert!(l.keep_hyphen("SW", "trending"));
+        assert!(l.keep_hyphen("pre", "Miocene"));
+        assert!(!lex(&["volcanic"]).keep_hyphen("Volca", "nic"));
         assert_eq!(word_before_hyphen("the volca- "), Some("volca"));
         assert_eq!(word_before_hyphen("pre-"), Some("pre"));
         assert_eq!(word_before_hyphen("1980-"), None);

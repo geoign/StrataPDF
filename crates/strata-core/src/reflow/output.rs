@@ -51,15 +51,104 @@ pub fn image_link(dir_name: &str, id: &str) -> String {
     o
 }
 
+/// Markdown's own characters escaped. `#`, `>`, `|` and list markers matter only at
+/// the start of a line, where [`guard_line`] takes care of them; brackets only when
+/// they could form a link; `<` only where a tag could start.
 fn esc_md(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '\\' | '*' | '_' | '[' | ']' | '`' | '<' | '>' | '#' | '|') {
-            o.push('\\');
+    let linkish = s.contains("](");
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' | '*' | '_' | '`' => {
+                o.push('\\');
+                o.push(c);
+            }
+            '<' if it.peek().is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?')) => o.push_str("\\<"),
+            '[' | ']' if linkish => {
+                o.push('\\');
+                o.push(c);
+            }
+            _ => o.push(c),
         }
-        o.push(c);
     }
     o
+}
+
+/// A paragraph that a Markdown reader would take for a heading, a list item, a
+/// quotation, a table row or a rule gets its first character escaped.
+fn guard_line(s: &str) -> String {
+    let t = s.trim_start();
+    let Some(first) = t.chars().next() else { return s.to_string() };
+    let rest: String = t.chars().skip(1).collect();
+    let guard = match first {
+        '#' | '>' | '|' => true,
+        '-' | '+' | '*' | '=' | '~' => rest.is_empty() || rest.starts_with(char::is_whitespace) || t.chars().all(|c| c == first || c.is_whitespace()),
+        c if c.is_ascii_digit() => {
+            let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+            digits <= 9 && t[digits..].starts_with(['.', ')']) && t[digits + 1..].starts_with(char::is_whitespace)
+        }
+        _ => false,
+    };
+    if !guard {
+        return s.to_string();
+    }
+    if first.is_ascii_digit() {
+        let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        format!("{}\\{}", &t[..digits], &t[digits..])
+    } else {
+        format!("\\{t}")
+    }
+}
+
+/// Alt text of an image: the caption's words, cut at a word before 100 characters.
+fn alt_text(caption: &[Span], fallback: &str) -> String {
+    let p = plain(caption).replace(['[', ']', '"', '\n'], " ");
+    let p = p.split_whitespace().collect::<Vec<_>>().join(" ");
+    if p.is_empty() {
+        return fallback.to_string();
+    }
+    if p.chars().count() <= 100 {
+        return p;
+    }
+    let mut cut = String::new();
+    for w in p.split(' ') {
+        if cut.chars().count() + w.chars().count() > 96 {
+            break;
+        }
+        cut.push_str(w);
+        cut.push(' ');
+    }
+    format!("{}…", cut.trim_end())
+}
+
+/// A caption without its own bold and italic, for wrapping in the caption's markers.
+fn unstyled(spans: &[Span]) -> Vec<Span> {
+    spans
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.style.bold = false;
+            s.style.italic = false;
+            s
+        })
+        .collect()
+}
+
+/// The number a list item opens with ("3. ", "3) ", "(3) ") and the text after it.
+fn list_number(t: &str) -> Option<(String, &str)> {
+    let t = t.trim_start();
+    let (num, rest) = if let Some(r) = t.strip_prefix('(') {
+        let n = r.chars().take_while(|c| c.is_ascii_digit()).count();
+        (&r[..n], r[n..].strip_prefix(')')?)
+    } else {
+        let n = t.chars().take_while(|c| c.is_ascii_digit()).count();
+        (&t[..n], t[n..].strip_prefix(['.', ')'])?)
+    };
+    if num.is_empty() || num.len() > 3 || !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some((num.to_string(), rest.trim_start()))
 }
 
 fn strip_marker(spans: &[Span]) -> Vec<Span> {
@@ -123,29 +212,40 @@ pub fn spans_md(spans: &[Span]) -> String {
             o.push_str(&s.text);
             continue;
         }
-        let mut t = esc_md(core);
         if s.style.math {
             o.push_str(&format!("{lead}${core}${trail}"));
             continue;
         }
-        if s.style.mono {
-            t = format!("`{}`", core.replace('`', "'"));
-        }
-        if s.style.italic {
-            t = format!("*{t}*");
-        }
-        if s.style.bold {
-            t = format!("**{t}**");
+        // Punctuation opening an emphasised run stays outside the markers: "*,*",
+        // "**, Name**" and "*. Journal*" are no emphasis to a Markdown reader.
+        let emphasised = (s.style.bold || s.style.italic || s.style.mono) && core.chars().any(char::is_alphanumeric);
+        let start = if emphasised { core.find(|c: char| !(matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '*' | '†' | '‡' | '§') || c.is_whitespace())).unwrap_or(core.len()) } else { 0 };
+        let (open, inner) = core.split_at(start);
+        let mut t = esc_md(inner);
+        if !inner.is_empty() && emphasised {
+            if s.style.mono {
+                t = format!("`{}`", inner.replace('`', "'"));
+            }
+            if s.style.italic {
+                t = format!("*{t}*");
+            }
+            if s.style.bold {
+                t = format!("**{t}**");
+            }
         }
         if s.style.sup {
             t = format!("<sup>{t}</sup>");
         } else if s.style.sub {
             t = format!("<sub>{t}</sub>");
         }
-        if let Some(l) = &s.link {
+        // Links to pages of the PDF mean nothing outside it.
+        if let Some(l) = &s.link
+            && !l.starts_with('#')
+        {
             t = format!("[{t}]({})", l.replace(' ', "%20").replace('(', "%28").replace(')', "%29"));
         }
         o.push_str(lead);
+        o.push_str(&esc_md(open));
         o.push_str(&t);
         o.push_str(trail);
     }
@@ -160,33 +260,46 @@ fn plain(spans: &[Span]) -> String {
 pub fn to_markdown(doc: &ReflowDoc, image_path: &dyn Fn(&ReflowImage) -> String) -> String {
     let mut o = String::new();
     let mut in_list = false;
-    for n in &doc.nodes {
+    for (ni, n) in doc.nodes.iter().enumerate() {
         let is_item = matches!(n, Node::ListItem { .. });
-        if in_list && !is_item {
+        // (A page starting inside a list keeps the list together: the marker goes
+        // into the item, indented.)
+        let page_in_list = in_list && matches!(n, Node::PageStart { .. }) && matches!(doc.nodes.get(ni + 1), Some(Node::ListItem { .. }));
+        if in_list && !is_item && !page_in_list {
             o.push('\n');
         }
-        in_list = is_item;
+        in_list = is_item || page_in_list;
         match n {
+            Node::PageStart { page } if page_in_list => o.push_str(&format!("  <!-- page {} -->\n", page + 1)),
             Node::PageStart { page } => o.push_str(&format!("<!-- page {} -->\n\n", page + 1)),
             Node::Heading { level, spans } => o.push_str(&format!("{} {}\n\n", "#".repeat(*level as usize), spans_md(spans).trim())),
-            Node::Paragraph { spans } => o.push_str(&format!("{}\n\n", spans_md(spans).trim())),
-            Node::ListItem { spans } => o.push_str(&format!("- {}\n", spans_md(&strip_marker(spans)).trim())),
+            Node::Paragraph { spans } => o.push_str(&format!("{}\n\n", guard_line(spans_md(spans).trim()))),
+            Node::ListItem { spans } => {
+                let t = spans_md(&strip_marker(spans));
+                match list_number(t.trim()) {
+                    Some((n, rest)) => o.push_str(&format!("{n}. {rest}\n")),
+                    None => o.push_str(&format!("- {}\n", t.trim())),
+                }
+            }
             Node::Figure { image, caption } => {
                 let img = &doc.images[*image];
-                let alt = plain(caption).chars().take(80).collect::<String>().replace(['[', ']'], "");
-                o.push_str(&format!("![{alt}]({})\n\n", image_path(img)));
-                if !caption.is_empty() {
-                    o.push_str(&format!("*{}*\n\n", spans_md(caption).trim()));
+                o.push_str(&format!("![{}]({})\n\n", alt_text(caption, "figure"), image_path(img)));
+                let c = spans_md(&unstyled(caption));
+                if !c.trim().is_empty() {
+                    o.push_str(&format!("*{}*\n\n", c.trim()));
                 }
             }
             Node::Table { image, caption, rows } => {
                 let img = &doc.images[*image];
-                o.push_str(&format!("**{}**\n\n", spans_md(caption).trim()));
-                o.push_str(&format!("![table]({})\n\n", image_path(img)));
+                let c = spans_md(&unstyled(caption));
+                if !c.trim().is_empty() {
+                    o.push_str(&format!("**{}**\n\n", c.trim()));
+                }
+                o.push_str(&format!("![{}]({})\n\n", alt_text(caption, "table"), image_path(img)));
                 if !rows.is_empty() {
                     o.push_str("<details><summary>表のテキスト</summary>\n\n```text\n");
                     for r in rows {
-                        o.push_str(r);
+                        o.push_str(&r.replace('\u{AD}', ""));
                         o.push('\n');
                     }
                     o.push_str("```\n\n</details>\n\n");
@@ -239,7 +352,7 @@ p.fn { font-size: .82em; color: var(--muted); border-top: 1px solid var(--rule);
 .formula img { max-width: 100%; }
 :root.dark .formula img { filter: invert(.88) hue-rotate(180deg); }
 @media (prefers-color-scheme: dark) { :root:not(.light) .formula img { filter: invert(.88) hue-rotate(180deg); } }
-ul { padding-left: 1.4em; } li { margin: .2em 0; }
+ul, ol { padding-left: 1.6em; } li { margin: .2em 0; }
 .pm { position: absolute; left: -2.2em; font: 11px "Segoe UI", sans-serif; color: var(--pm); cursor: pointer; user-select: none; }
 .pm:hover { color: var(--link); }
 .pm-anchor { display: block; height: 0; }
@@ -328,29 +441,40 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
         if vertical { "vertical" } else { "" },
         if o.bilingual.is_some() { " class=\"bi-main\"" } else { "" }
     ));
-    let mut in_list = false;
+    // The open list: `Some(true)` for a numbered one (`<ol>`).
+    let mut list: Option<bool> = None;
     let spans_html = |s: &[Span]| spans_html_in(s, vertical);
+    let close = |h: &mut String, list: &mut Option<bool>| {
+        if let Some(numbered) = list.take() {
+            h.push_str(if numbered { "</ol>\n" } else { "</ul>\n" });
+        }
+    };
     for (ni, n) in doc.nodes.iter().enumerate() {
         let a = doc.anchors.get(ni).map(|(p, y)| format!(" data-p=\"{}\" data-y=\"{:.0}\"", p + 1, y)).unwrap_or_default();
         if let Some(set) = o.bilingual
             && set.contains(&ni)
             && let Some(row) = bilingual_row(doc, ni, n, &a, o)
         {
-            if in_list {
-                h.push_str("</ul>\n");
-                in_list = false;
-            }
+            close(&mut h, &mut list);
             h.push_str(&row);
             continue;
         }
-        let is_item = matches!(n, Node::ListItem { .. });
-        if in_list && !is_item {
-            h.push_str("</ul>\n");
+        if let Node::ListItem { spans } = n {
+            if list.is_none() {
+                match list_number(&plain(&strip_marker(spans))) {
+                    Some((num, _)) => {
+                        h.push_str(&format!("<ol start=\"{num}\">\n"));
+                        list = Some(true);
+                    }
+                    None => {
+                        h.push_str("<ul>\n");
+                        list = Some(false);
+                    }
+                }
+            }
+        } else {
+            close(&mut h, &mut list);
         }
-        if !in_list && is_item {
-            h.push_str("<ul>\n");
-        }
-        in_list = is_item;
         match n {
             Node::PageStart { page } => {
                 let p = page + 1;
@@ -362,10 +486,24 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
             }
             Node::Heading { level, spans } => h.push_str(&format!("<h{level}{a}>{}</h{level}>\n", spans_html(spans).trim())),
             Node::Paragraph { spans } => h.push_str(&format!("<p{a}>{}</p>\n", spans_html(spans).trim())),
-            Node::ListItem { spans } => h.push_str(&format!("<li{a}>{}</li>\n", spans_html(&strip_marker(spans)).trim())),
+            Node::ListItem { spans } => {
+                let spans = strip_marker(spans);
+                let mut spans = spans.as_slice();
+                let mut first = None;
+                // In a numbered list the number is the browser's.
+                if list == Some(true)
+                    && let Some((f, rest)) = spans.split_first()
+                    && let Some((_, text)) = list_number(&f.text)
+                {
+                    first = Some(Span { text: text.to_string(), ..f.clone() });
+                    spans = rest;
+                }
+                let head = first.as_ref().map(|f| spans_html(std::slice::from_ref(f))).unwrap_or_default();
+                h.push_str(&format!("<li{a}>{}{}</li>\n", head, spans_html(spans).trim()));
+            }
             Node::Figure { image, caption } => {
                 let img = &doc.images[*image];
-                h.push_str(&format!("<figure{a}><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\">", esc_html(&(o.image_src)(img)), img.width / 2));
+                h.push_str(&format!("<figure{a}><img src=\"{}\" width=\"{}\" alt=\"{}\" loading=\"lazy\">", esc_html(&(o.image_src)(img)), img.width, esc_html(&alt_text(caption, ""))));
                 if !caption.is_empty() {
                     h.push_str(&format!("<figcaption>{}</figcaption>", spans_html(caption)));
                 }
@@ -373,10 +511,10 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
             }
             Node::Table { image, caption, rows } => {
                 let img = &doc.images[*image];
-                h.push_str(&format!("<figure class=\"table\"><figcaption>{}</figcaption><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\">", spans_html(caption), esc_html(&(o.image_src)(img)), img.width / 2));
+                h.push_str(&format!("<figure class=\"table\"><figcaption>{}</figcaption><img src=\"{}\" width=\"{}\" alt=\"{}\" loading=\"lazy\">", spans_html(caption), esc_html(&(o.image_src)(img)), img.width, esc_html(&alt_text(caption, ""))));
                 if !rows.is_empty() {
                     h.push_str("<details><summary>表のテキスト</summary><pre>");
-                    h.push_str(&esc_html(&rows.join("\n")));
+                    h.push_str(&esc_html(&rows.join("\n").replace('\u{AD}', "")));
                     h.push_str("</pre></details>");
                 }
                 h.push_str("</figure>\n");
@@ -389,7 +527,7 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
                     "<figure class=\"pageimg\"><div class=\"note\">{}。OCR するまで画像で表示しています。</div><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\"></figure>\n",
                     esc_html(reason),
                     esc_html(&(o.image_src)(img)),
-                    img.width / 2
+                    img.width
                 ));
             }
             Node::Formula { image, text, latex, number } => {
@@ -401,14 +539,12 @@ pub fn to_html(doc: &ReflowDoc, o: &HtmlOptions) -> String {
                         esc_html(l),
                         esc_html(l)
                     )),
-                    None => h.push_str(&format!("<div class=\"formula\"><img src=\"{}\" width=\"{}\" alt=\"{}\"></div>\n", esc_html(&(o.image_src)(img)), img.width / 3, esc_html(text))),
+                    None => h.push_str(&format!("<div class=\"formula\"><img src=\"{}\" width=\"{}\" alt=\"{}\"></div>\n", esc_html(&(o.image_src)(img)), img.width * 2 / 3, esc_html(text))),
                 }
             }
         }
     }
-    if in_list {
-        h.push_str("</ul>\n");
-    }
+    close(&mut h, &mut list);
     h.push_str("</main>\n<script>");
     h.push_str(SCRIPT);
     h.push_str("</script>\n</body>\n</html>\n");
@@ -442,7 +578,7 @@ fn bilingual_row(doc: &ReflowDoc, ni: usize, n: &Node, a: &str, o: &HtmlOptions)
         Node::Footnote { spans } => (String::new(), format!("<p class=\"fn\">{}</p>", spans_html(spans).trim()), "p.fn".into()),
         Node::Figure { image, caption } | Node::Table { image, caption, .. } if !caption.is_empty() => {
             let img = &doc.images[*image];
-            let full = format!("<figure class=\"full\"><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\"></figure>", esc_html(&(o.image_src)(img)), img.width / 2);
+            let full = format!("<figure class=\"full\"><img src=\"{}\" width=\"{}\" alt=\"\" loading=\"lazy\"></figure>", esc_html(&(o.image_src)(img)), img.width);
             (full, format!("<p class=\"capt\">{}</p>", spans_html(caption).trim()), "p.capt".into())
         }
         _ => return None,
@@ -472,6 +608,42 @@ fn mathml(latex: &str, block: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sp(text: &str, bold: bool, italic: bool) -> Span {
+        Span { text: text.into(), style: super::super::Style { bold, italic, ..Default::default() }, link: None }
+    }
+
+    #[test]
+    fn punctuation_stays_outside_emphasis() {
+        assert_eq!(spans_md(&[sp("(E57", false, false), sp(",", false, true), sp(")", false, false)]), "(E57,)");
+        assert_eq!(spans_md(&[sp("Name", true, false), sp(", Manon Bickert", true, false)]), "**Name**, **Manon Bickert**".replace("****", ""));
+        assert_eq!(spans_md(&[sp("ridges", false, false), sp(". Journal of Geology", false, true), sp(" 84", false, false)]), "ridges. *Journal of Geology* 84");
+    }
+
+    #[test]
+    fn line_starts_are_guarded() {
+        assert_eq!(guard_line("# not a heading"), "\\# not a heading");
+        assert_eq!(guard_line("1. not a list"), "1\\. not a list");
+        assert_eq!(guard_line("1.5 km"), "1.5 km");
+        assert_eq!(guard_line("- not a list"), "\\- not a list");
+        assert_eq!(guard_line("-15 °C"), "-15 °C");
+        assert_eq!(guard_line("*Fig. 1.* caption"), "*Fig. 1.* caption");
+        assert_eq!(guard_line("---"), "\\---");
+    }
+
+    #[test]
+    fn list_numbers_are_read() {
+        assert_eq!(list_number("3. Internal velocity"), Some(("3".into(), "Internal velocity")));
+        assert_eq!(list_number("(12) item"), Some(("12".into(), "item")));
+        assert_eq!(list_number("1.5 km"), None);
+        assert_eq!(list_number("item"), None);
+    }
+
+    #[test]
+    fn escapes_are_sparse() {
+        assert_eq!(esc_md("Mg# of 49 and <2 kbar [3]"), "Mg# of 49 and <2 kbar [3]");
+        assert_eq!(esc_md("<b>x</b> a_b *c*"), "\\<b>x\\</b> a\\_b \\*c\\*");
+    }
 
     #[test]
     fn image_links_survive_parentheses_and_spaces() {

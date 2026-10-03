@@ -59,6 +59,9 @@ fn unspace_letters(chars: &[RichChar]) -> Option<Vec<RichChar>> {
 }
 
 /// Clean the characters of one line (horizontal text).
+/// Signs that take a word space on both sides in prose.
+const RELATIONS: [char; 9] = ['≤', '≥', '<', '>', '=', '±', '×', '→', '≈'];
+
 pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, math_font: impl Fn(&str) -> bool) -> Vec<RichChar> {
     let unspaced = unspace_letters(chars);
     // (A letter-spaced line keeps its wide letter gaps: no spaces are added back.)
@@ -182,6 +185,18 @@ pub(super) fn clean_line(chars: &[RichChar], fonts: &[FontInfo], scan: bool, mat
             && c.bbox.x0 - a.bbox.x1 > lg + c.size.max(a.size) * 0.08
             && !math_font(font_name(&c))
         {
+            let mut sp = c;
+            sp.c = ' ';
+            sp.bbox.x0 = a.bbox.x1;
+            sp.bbox.x1 = c.bbox.x0;
+            out.push(sp);
+        } else if !scan
+            && let Some(a) = out.last()
+            && a.c != ' '
+            && ((RELATIONS.contains(&a.c) && c.c.is_alphanumeric()) || (a.c.is_alphanumeric() && RELATIONS.contains(&c.c)))
+            && c.bbox.x0 - a.bbox.x1 >= c.size.max(a.size) * 0.12
+        {
+            // A word space without a space glyph beside a relation sign ("≤depth").
             let mut sp = c;
             sp.c = ' ';
             sp.bbox.x0 = a.bbox.x1;

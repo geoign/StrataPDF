@@ -474,6 +474,60 @@ pub fn needs_ocr(p: &RichPage) -> Option<String> {
     }
 }
 
+/// A publisher's cover sheet ("To cite this article", "Downloaded from", terms of
+/// use), put before or after the article by a journal site or a library: no content.
+fn cover_sheet(p: &RichPage) -> bool {
+    const MARKS: [&str; 24] = [
+        "to cite this article",
+        "to link to this article",
+        "submit your article",
+        "view related articles",
+        "view crossmark data",
+        "article views:",
+        "full terms & conditions",
+        "full terms and conditions",
+        "terms and conditions of access and use",
+        "downloaded from",
+        "downloaded by",
+        "this content downloaded",
+        "use of this article is subject to",
+        "view the article online",
+        "your use of the jstor archive",
+        "jstor is a not-for-profit",
+        "stable url",
+        "please scroll down for article",
+        "citation details",
+        "how to cite",
+        "rights and permissions",
+        "copyright and permissions",
+        "the following article is",
+        "this article may be used for",
+    ];
+    let mut text = String::new();
+    for b in &p.blocks {
+        if let RichBlock::Text { lines, .. } = b {
+            for l in lines {
+                text.push_str(&l.text().to_lowercase());
+                text.push(' ');
+            }
+        }
+    }
+    if text.chars().count() > 6000 {
+        return false;
+    }
+    MARKS.iter().filter(|m| text.contains(*m)).count() >= 2
+}
+
+/// A link whose URI lost its scheme ("www.nature.com/reprints" resolved against the
+/// file) is a web address again.
+fn web_uri(uri: String) -> String {
+    let rest = uri.strip_prefix("file://").or_else(|| uri.strip_prefix("file:")).unwrap_or("");
+    let rest = rest.trim_start_matches('/');
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let web = host.starts_with("www.") || (host.contains('.') && !host.contains(':') && host.rsplit('.').next().is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic())));
+    if !rest.is_empty() && web { format!("https://{rest}") } else { uri }
+}
+
 /// A scanned page with a text layer over the image (another program's OCR).
 pub(crate) fn scanned_with_text(p: &RichPage) -> bool {
     let area = p.width * p.height;
@@ -1253,17 +1307,20 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
             _ => 0,
         })
         .sum();
-    // Page-wide image strips adding up to most of the page height: a scan in bands.
-    let banded = p
-        .rich
-        .blocks
-        .iter()
-        .filter_map(|b| match b {
-            RichBlock::Image { bbox } if bbox.width() > w * 0.75 => Some(bbox.height()),
-            _ => None,
-        })
-        .sum::<f32>()
-        > h * 0.5;
+    // Page-wide image strips, several of them, adding up to most of the page height:
+    // a scan in bands. (One large image is a figure.)
+    let banded = {
+        let strips: Vec<f32> = p
+            .rich
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                RichBlock::Image { bbox } if bbox.width() > w * 0.75 => Some(bbox.height()),
+                _ => None,
+            })
+            .collect();
+        strips.len() >= 3 && strips.iter().sum::<f32>() > h * 0.5
+    };
     // Lines of the margin bands with their text length and whether they repeat.
     let margin_lines: Vec<(RectF, usize, bool)> = p
         .rich
@@ -1439,7 +1496,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         let prose: usize = texts
             .iter()
             .flatten()
-            .filter(|u| overlap_frac(&u.bbox, f) > 0.8 && u.lines.len() >= 3 && (u.size() - body).abs() < body * 0.1)
+            .filter(|u| overlap_frac(&u.bbox, f) > 0.8 && u.lines.len() >= 3 && (u.size() - body).abs() < body * 0.25 && caption_kind(&u.text()).is_none())
             .map(|u| u.chars())
             .sum();
         prose < 400
@@ -1558,12 +1615,15 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         if near_figure {
             continue;
         }
+        // (The running head is drawn on the page whether or not it is text here:
+        // the figure starts below it.)
+        let head_floor = margin_lines.iter().filter(|(b, _, rep)| *rep && b.y1 < h * 0.15 && b.y1 < cb.y0).map(|(b, _, _)| b.y1 + 2.0).fold(h * 0.06, f32::max);
         let top = texts
             .iter()
             .flatten()
             .filter(|u| u.bbox.y1 <= cb.y0 + 1.0 && u.bbox.x0 < cb.x1 && u.bbox.x1 > cb.x0 && (prose_block(u) || heading_block(u) || caption_kind(&u.text()).is_some()))
             .map(|u| u.bbox.y1)
-            .fold(h * 0.06, f32::max);
+            .fold(head_floor, f32::max);
         let region = RectF { x0: cb.x0, y0: top + 2.0, x1: cb.x1, y1: cb.y0 - 2.0 };
         if region.height() < (body * 4.0).max(40.0) {
             continue;
@@ -2055,7 +2115,13 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
                 s.text.pop();
             }
         } else if li > 0 {
-            let join_tight = vertical || matches!((prev_last, first), (Some(a), Some(b)) if is_cjk(a) || is_cjk(b));
+            let before = spans.last().and_then(|s| s.text.trim_end().chars().last());
+            let join_tight = vertical
+                || matches!((prev_last, first), (Some(a), Some(b)) if is_cjk(a) || is_cjk(b))
+                // A dash, a slash, an opening bracket or a soft hyphen at the line end
+                // continues without a space ("98–" / "85 Ma", "(U–Th)/" / "He").
+                || matches!(before, Some('–' | '—' | '/' | '(' | '[' | '\u{AD}'))
+                || first == Some(' ');
             if !join_tight
                 && let Some(s) = spans.last_mut()
                 && !s.text.ends_with(' ')
@@ -2074,11 +2140,12 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
             let f = fonts.get(c.font as usize);
             // (On a scan the boxes of punctuation and brackets are small and low or high
             // whatever the type: only Latin and Greek letters and digits are raised or lowered.)
-            let small = c.size < med * 0.8 && !vertical && (!scan || (c.c.is_alphanumeric() && !is_cjk(c.c)));
+            let small = c.size < med * 0.8 && !vertical && !c.c.is_whitespace() && (!scan || (c.c.is_alphanumeric() && !is_cjk(c.c)));
             let cy = (c.bbox.y0 + c.bbox.y1) * 0.5;
+            // (The fonts of an OCR layer carry no weight or slant worth marking up.)
             let style = Style {
-                bold: c.bold || f.is_some_and(font_bold),
-                italic: f.is_some_and(font_italic),
+                bold: !scan && (c.bold || f.is_some_and(font_bold)),
+                italic: !scan && f.is_some_and(font_italic),
                 sup: small && cy < lcy - med * 0.1,
                 sub: small && cy > lcy + med * 0.1,
                 mono: f.is_some_and(|f| f.monospaced),
@@ -2128,7 +2195,48 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
     }
     for s in &mut spans {
         use unicode_normalization::UnicodeNormalization;
-        s.text = fix_accents(&s.text).nfc().collect();
+        // (Control characters, BEL in the headings of one publisher, are no text.)
+        s.text = fix_accents(&s.text).nfc().filter(|c| !c.is_control() || *c == '\t').collect();
+    }
+    let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
+    for s in spans {
+        match merged.last_mut() {
+            Some(m) if m.style == s.style && m.link == s.link => m.text.push_str(&s.text),
+            _ => merged.push(s),
+        }
+    }
+    let mut spans = merged;
+    // Soft hyphens (U+00AD) are the typesetter's hyphenation hints, not text: in the
+    // reflowed text they doubled hyphens and split words. One space at a join.
+    let mut after_space = false;
+    for s in &mut spans {
+        if s.text.contains('\u{AD}') {
+            s.text = s.text.replace('\u{AD}', "");
+        }
+        while s.text.contains("  ") {
+            s.text = s.text.replace("  ", " ");
+        }
+        if after_space && s.text.starts_with(' ') {
+            s.text.remove(0);
+        }
+        after_space = s.text.ends_with(' ');
+    }
+    // A letter from another font inside an emphasised word ("Tkal" "č" "ić") takes
+    // the word's emphasis; as its own span it broke the markers in two.
+    for i in 1..spans.len().saturating_sub(1) {
+        let (a, b, s) = (spans[i - 1].style, spans[i + 1].style, spans[i].style);
+        if a == b
+            && a != s
+            && (Style { bold: a.bold, italic: a.italic, ..s } == a)
+            && spans[i].text.chars().count() <= 2
+            && spans[i].text.chars().all(char::is_alphabetic)
+            && !spans[i - 1].text.ends_with(char::is_whitespace)
+            && !spans[i + 1].text.starts_with(char::is_whitespace)
+            && spans[i - 1].link == spans[i].link
+            && spans[i + 1].link == spans[i].link
+        {
+            spans[i].style = a;
+        }
     }
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
     for s in spans {
@@ -2379,6 +2487,49 @@ fn math_fraction(u: &Unit, fonts: &[FontInfo]) -> f32 {
     u.frac(|c| (is_math_char(c.c) || fonts.get(c.font as usize).is_some_and(|f| is_math_font(&f.name))) && c.c != '•')
 }
 
+/// LaTeX from the formula model with runs of spacing commands collapsed to one;
+/// `None` when the model looped on spacing (hundreds of "\qquad" or "~"), where
+/// the crop reads better than the LaTeX.
+fn tidy_latex(l: &str) -> Option<String> {
+    const SPACING: [&str; 7] = ["\\qquad", "\\quad", "\\,", "\\;", "\\!", "\\ ", "~"];
+    let mut out = String::with_capacity(l.len());
+    let mut rest = l;
+    let (mut run, mut longest) = (0usize, 0usize);
+    while !rest.is_empty() {
+        if let Some(s) = SPACING.iter().find(|s| rest.starts_with(*s)) {
+            if run == 0 {
+                out.push_str(s);
+            }
+            run += 1;
+            longest = longest.max(run);
+            rest = &rest[s.len()..];
+        } else if rest.starts_with(' ') {
+            out.push(' ');
+            rest = &rest[1..];
+        } else {
+            run = 0;
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    (longest < 8).then(|| out.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// A label of the article's type or access printed above the title.
+fn is_kicker(t: &str) -> bool {
+    const KICKERS: [&str; 40] = [
+        "open", "open access", "article", "articles", "research article", "research articles", "review article", "original article", "original paper",
+        "original research", "research paper", "research papers", "letter", "letters", "review", "reviews", "short communication", "short communications",
+        "research letter", "report", "reports", "perspective", "perspectives", "correspondence", "editorial", "brief communication", "rapid communication",
+        "full paper", "regular article", "regular paper", "technical note", "discussion", "comment", "reply", "communication", "article in press",
+        "accepted manuscript", "論説", "総説", "短報",
+    ];
+    let t = t.trim().trim_end_matches([':', '：']).to_lowercase();
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    KICKERS.contains(&t.as_str())
+}
+
 /// Ends with an equation number such as "(12)" or "(3a)".
 fn has_equation_number(t: &str) -> bool {
     let t = t.trim_end();
@@ -2578,7 +2729,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 it.filter_map(|l| {
                     let target = match l.dest {
                         Some(d) => format!("#page-{}", d.loc.page_number + 1),
-                        None if !l.uri.is_empty() => l.uri,
+                        None if !l.uri.is_empty() => web_uri(l.uri),
                         None => return None,
                     };
                     Some((RectF::from(l.bounds), target))
@@ -2590,6 +2741,28 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         let scan = ocr || scanned_with_text(&rich);
         if scan {
             trim_line_spaces(&mut rich);
+        }
+        // Code is set in a monospaced font among proportional text. The flag means
+        // nothing on a scan (OCR fonts) or when most of the page is monospaced (a
+        // typescript): every paragraph came out as code.
+        {
+            let mut by_font = vec![0usize; rich.fonts.len()];
+            for b in &rich.blocks {
+                if let RichBlock::Text { lines, .. } = b {
+                    for c in lines.iter().flat_map(|l| l.chars.iter()) {
+                        if let Some(k) = by_font.get_mut(c.font as usize) {
+                            *k += 1;
+                        }
+                    }
+                }
+            }
+            let total: usize = by_font.iter().sum();
+            let mono: usize = rich.fonts.iter().zip(&by_font).filter(|(f, _)| f.monospaced).map(|(_, k)| k).sum();
+            if scan || mono * 2 > total {
+                for f in &mut rich.fonts {
+                    f.monospaced = false;
+                }
+            }
         }
         // Display lists are made when needed and dropped soon: kept for every page,
         // the images they hold fill MuPDF's store, and every later allocation then
@@ -2668,11 +2841,24 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // The reference section (state carried across pages) and the node of its last entry.
     let mut refs = refs::Refs::default();
     let mut ref_node: Option<usize> = None;
+    // Unnumbered headings with their node, size, bold, capitals and italic: the
+    // level of each comes from the rank of its style among them at the end.
+    let mut heading_styles: Vec<(usize, f32, bool, bool, bool)> = Vec::new();
+    let covers: Vec<bool> = (0..pages.len()).map(|i| (i < 2 || i + 2 >= pages.len()) && cover_sheet(&pages[i].rich)).collect();
+    // The article's first page, where its title is: after any cover sheet.
+    let first_page = covers.iter().position(|c| !*c).unwrap_or(0);
     for (pi, p) in pages.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let t_page = std::time::Instant::now();
+        if covers[pi] {
+            doc.fill_anchors((p.page, 0.0));
+            doc.nodes.push(Node::PageStart { page: p.page });
+            doc.fill_anchors((p.page, 0.0));
+            progress(2 * n + pi + 1, total);
+            continue;
+        }
         let (mut units, manuscript) = page_units(p, body, &repeated, pages.len(), opts, vertical);
         let t_units = t_page.elapsed();
         // Double-spaced manuscripts leave a blank line's height between lines.
@@ -2724,7 +2910,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
         }
         // The title of the first page: the most title-like unit in its upper half.
         // What lies above it is the journal's masthead (banners, logos' text).
-        let page_title: Option<usize> = (pi == 0 && !vertical)
+        let page_title: Option<usize> = (pi == first_page && !vertical)
             .then(|| {
                 // The title is followed by its authors; a journal masthead is not.
                 let authors_below = |k: usize| ordered[k + 1..].iter().filter(|o| o.kind == UnitKind::Text).take(2).any(|o| is_byline(&o.text()));
@@ -2816,7 +3002,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
         }
         // (Lines of text or table rows: labels of an upright map are short.)
-        let rotated = (!vertical && turned > 200 && turned > upright * 2 && turned >= turned_lines * 15).then(|| "横向きに組まれたページ（表・図）".to_string());
+        let rotated = (!vertical && turned > 200 && turned > upright * 2 && (turned >= turned_lines * 15 || upright < 50)).then(|| "横向きに組まれたページ（表・図）".to_string());
         // A text layer over a scan (not ours) too poor to read: mostly garbage from
         // figures or a bad recognition. The page image reads better.
         let poor = (p.scan && !p.ocr && ocr_layer_quality(&p.rich) < 0.4).then(|| "OCR テキスト層の品質が低いページ".to_string());
@@ -2905,7 +3091,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 i += 1;
                 continue;
             }
-            let in_front = pi == 0 && !body_started;
+            let in_front = pi == first_page && !body_started;
             // The masthead above the title of the first page, and publisher
             // boilerplate: notes, outside the running text.
             // (Text above the title set larger than it is part of the title, unless
@@ -2953,6 +3139,13 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     let mut rows = Vec::new();
                     while let Some(t) = ordered.get(j) {
                         if t.kind == UnitKind::Figure {
+                            // A figure with a caption of its own, or well apart from the
+                            // table, is the next float, not part of the table.
+                            let own_caption = ordered.get(j + 1).is_some_and(|n| n.kind == UnitKind::Text && caption_kind(&n.text()) == Some(false));
+                            let apart = region.is_some_and(|r: RectF| t.bbox.y0 - r.y1 > body * 2.0 || r.y0 - t.bbox.y1 > body * 2.0);
+                            if own_caption || apart {
+                                break;
+                            }
                             region = Some(region.map_or(t.bbox, |r| r.union(&t.bbox)));
                             j += 1;
                             continue;
@@ -3100,7 +3293,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             match image::load_from_memory(png).map(|i| i.to_rgb8()).ok().and_then(|i| f.to_latex(&i).ok()) {
                                 Some(l) if !l.is_empty() => {
                                     let (body, num) = strata_ocr::formula::split_equation_number(&l);
-                                    (Some(body), num)
+                                    (tidy_latex(&body), num)
                                 }
                                 _ => (None, None),
                             }
@@ -3141,7 +3334,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 if (matches!(c, TITLE | SECTION_HEADER) || large) && (wordy || number) {
                     let level = if c == TITLE || size >= body * 1.4 {
                         let score = size * (text.chars().count().min(150) as f32).sqrt();
-                        if pi == 0 && score > title_size {
+                        if pi == first_page && score > title_size {
                             title_size = score;
                             doc.title = text.trim().to_string();
                         }
@@ -3160,7 +3353,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             } else if short && size >= body * 1.4 {
                 // Prefer the long title over a large journal banner.
                 let score = size * (text.chars().count().min(150) as f32).sqrt();
-                if pi == 0 && score > title_size {
+                if pi == first_page && score > title_size {
                     title_size = score;
                     doc.title = text.trim().to_string();
                 }
@@ -3343,6 +3536,9 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         s
                     });
                     doc.nodes.push(Node::Heading { level: level as u8, spans: spans.collect() });
+                    if level >= 2 && numbered.is_none() {
+                        heading_styles.push((doc.nodes.len() - 1, size, bold > 0.8, caps, italic > 0.8));
+                    }
                     if u.class.is_some() || caps || Some(i) == page_title {
                         last_heading = Some((doc.nodes.len() - 1, p.page, u.bbox, size));
                     }
@@ -3530,6 +3726,123 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     }
     let last = doc.anchors.last().copied().unwrap_or((0, 0.0));
     doc.fill_anchors(last);
+    // Unnumbered headings: the level from the rank of their style (size first, then
+    // bold, capitals, upright) among the document's heading styles, instead of a flat 3.
+    {
+        let key = |s: f32, b: bool, c: bool, i: bool| ((s * 2.0).round() as u32, b, c, !i);
+        let mut keys: Vec<(u32, bool, bool, bool)> = heading_styles.iter().map(|&(_, s, b, c, i)| key(s, b, c, i)).collect();
+        keys.sort_by(|a, b| b.cmp(a));
+        keys.dedup();
+        if keys.len() >= 2 {
+            for &(ix, s, b, c, i) in &heading_styles {
+                let rank = keys.iter().position(|k| *k == key(s, b, c, i)).unwrap_or(0) as u8;
+                if let Some(Node::Heading { level, .. }) = doc.nodes.get_mut(ix)
+                    && *level >= 2
+                {
+                    *level = (2 + rank).min(5);
+                }
+            }
+        }
+    }
+    // An equation number on a line of its own after a formula ("(1)", taken for a list
+    // item or a paragraph) is the formula's number.
+    for i in 1..doc.nodes.len() {
+        let text = match &doc.nodes[i] {
+            Node::Paragraph { spans } | Node::ListItem { spans } => spans_text(spans).trim().to_string(),
+            _ => continue,
+        };
+        let inner = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')).unwrap_or("");
+        if inner.is_empty() || inner.len() > 5 || !inner.starts_with(|c: char| c.is_ascii_digit()) || !inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+            continue;
+        }
+        let Some(j) = (0..i).rev().find(|&j| !matches!(doc.nodes[j], Node::PageStart { .. })) else { continue };
+        if let Node::Formula { number, .. } = &mut doc.nodes[j]
+            && number.is_none()
+        {
+            *number = Some(inner.to_string());
+            doc.nodes[i] = Node::Paragraph { spans: Vec::new() };
+        }
+    }
+    // A heading set in bold or italic that the paragraph joining swallowed: at the end
+    // of a paragraph ("…shown in Figure 2. **2.1.1. The Global CMT Catalog**"), or a
+    // whole short paragraph of its own ("*7.4. The origin of the KIU*").
+    let mut i = 0;
+    // (Unnumbered candidates only once the body has begun: italic affiliation lines
+    // of the front matter look alike.)
+    let mut body_started = false;
+    while i < doc.nodes.len() {
+        if let Node::Heading { level, .. } = &doc.nodes[i]
+            && *level >= 2
+        {
+            body_started = true;
+        }
+        let Node::Paragraph { spans } = &doc.nodes[i] else {
+            i += 1;
+            continue;
+        };
+        let emphasised = |s: &Span| s.style.bold || s.style.italic;
+        let text = spans_text(spans);
+        let trimmed = text.trim();
+        let heading_like = |t: &str| {
+            let n = t.chars().count();
+            n >= 4 && n <= 110 && !t.ends_with(['.', '。', '．', ',', ';', ':', '，']) && caption_kind(t).is_none() && t.split_whitespace().count() >= 2
+        };
+        let all = !spans.is_empty() && spans.iter().all(|s| emphasised(s) || s.text.trim().is_empty());
+        let numbered = numbered_heading_depth(trimmed);
+        if all && heading_like(trimmed) && (numbered.is_some() || (body_started && trimmed.chars().count() <= 90 && !trimmed.contains([',', '，']) && trimmed.starts_with(|c: char| c.is_uppercase()) && matches!(doc.nodes.get(i + 1), Some(Node::Paragraph { .. })))) {
+            let level = numbered.map_or(4, |d| (d + 1).min(6));
+            let spans = spans.iter().cloned().map(|mut s| {
+                s.style.bold = false;
+                s.style.italic = false;
+                s
+            });
+            doc.nodes[i] = Node::Heading { level, spans: spans.collect() };
+            i += 1;
+            continue;
+        }
+        // The trailing emphasised run.
+        let tail = spans.iter().rev().take_while(|s| emphasised(s) || s.text.trim().is_empty()).count();
+        if tail > 0 && tail < spans.len() {
+            let head_text = spans_text(&spans[spans.len() - tail..]);
+            let head_text = head_text.trim();
+            if numbered_heading_depth(head_text).is_some() && heading_like(head_text) && spans_text(&spans[..spans.len() - tail]).trim_end().ends_with(['.', '。', '．', ')', '）']) {
+                let level = numbered_heading_depth(head_text).map_or(3, |d| (d + 1).min(6));
+                let mut rest = spans.clone();
+                let head: Vec<Span> = rest
+                    .split_off(spans.len() - tail)
+                    .into_iter()
+                    .map(|mut s| {
+                        s.style.bold = false;
+                        s.style.italic = false;
+                        s.text = s.text.trim().to_string();
+                        s
+                    })
+                    .filter(|s| !s.text.is_empty())
+                    .collect();
+                if let Some(l) = rest.last_mut() {
+                    l.text = l.text.trim_end().to_string();
+                }
+                doc.nodes[i] = Node::Paragraph { spans: rest };
+                let anchor = doc.anchors.get(i).copied().unwrap_or((0, 0.0));
+                doc.nodes.insert(i + 1, Node::Heading { level, spans: head });
+                if i < doc.anchors.len() {
+                    doc.anchors.insert(i + 1, anchor);
+                }
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // Article-type labels and badges set like headings around the title ("OPEN",
+    // "RESEARCH ARTICLE") are no headings.
+    for n in doc.nodes.iter_mut().take(12) {
+        if let Node::Heading { spans, .. } = n
+            && is_kicker(&spans_text(spans))
+        {
+            *n = Node::Paragraph { spans: Vec::new() };
+        }
+    }
     // Nodes emptied by `pair_figures`.
     let keep: Vec<bool> = doc.nodes.iter().map(|n| !matches!(n, Node::Paragraph { spans } if spans.is_empty())).collect();
     let mut k = 0;
