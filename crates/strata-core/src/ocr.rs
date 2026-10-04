@@ -210,12 +210,12 @@ impl PageOcr {
             (if l.vertical { l.bbox.width() } else { l.bbox.height() }) * if latin { 0.78 } else { 0.85 }
         };
         let mut out: HashMap<*const OcrTextLine, f32> = self.lines.iter().map(|l| (l as *const _, raw(l))).collect();
-        let mut by_block: HashMap<u32, Vec<&OcrTextLine>> = HashMap::new();
+        // (Headings apart from the running text of their block: two lines of one
+        // heading share a size.)
+        let mut by_block: HashMap<(u32, bool), Vec<&OcrTextLine>> = HashMap::new();
         for l in &self.lines {
-            if let Some(b) = l.block
-                && l.kind.as_deref() != Some("Title")
-            {
-                by_block.entry(b).or_default().push(l);
+            if let Some(b) = l.block {
+                by_block.entry((b, l.kind.as_deref() == Some("Title"))).or_default().push(l);
             }
         }
         for ls in by_block.values().filter(|ls| ls.len() >= 2) {

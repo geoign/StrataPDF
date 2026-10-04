@@ -321,6 +321,64 @@ impl NdlOcr {
     }
 }
 
+/// A horizontal line box cut at blank stretches longer than 2.5 times its height
+/// (a word space or a letter-spaced name is far narrower); the pieces are trimmed
+/// to their ink. Other boxes come back as they are.
+fn split_at_gaps(img: &RgbImage, b: [f32; 4]) -> Vec<[f32; 4]> {
+    let (x0, y0) = (b[0].max(0.0) as u32, b[1].max(0.0) as u32);
+    let (x1, y1) = ((b[2] as u32).min(img.width()), (b[3] as u32).min(img.height()));
+    let h = y1.saturating_sub(y0);
+    if x1 <= x0 || h < 4 || x1 - x0 < h * 6 {
+        return vec![b];
+    }
+    let luma = |x: u32, y: u32| {
+        let p = img.get_pixel(x, y);
+        (p[0] as u32 * 3 + p[1] as u32 * 6 + p[2] as u32) / 10
+    };
+    let (mut lo, mut hi) = (255u32, 0u32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let v = luma(x, y);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    if hi < lo + 60 {
+        return vec![b];
+    }
+    let threshold = (lo + hi) / 2;
+    // (The middle rows only: a descender or a rule at the box edge is no ink of the line.)
+    let (r0, r1) = (y0 + h / 6, y1 - h / 6);
+    let ink: Vec<bool> = (x0..x1).map(|x| (r0..r1).any(|y| luma(x, y) < threshold)).collect();
+    let min_gap = (h as f32 * 2.5) as usize;
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut last_ink = 0usize;
+    for (i, &k) in ink.iter().enumerate() {
+        if !k {
+            continue;
+        }
+        match start {
+            None => start = Some(i),
+            Some(s) if i - last_ink > min_gap => {
+                pieces.push((s, last_ink + 1));
+                start = Some(i);
+            }
+            _ => {}
+        }
+        last_ink = i;
+    }
+    if let Some(s) = start {
+        pieces.push((s, last_ink + 1));
+    }
+    // (Too small a piece is a speck, kept with its neighbour by not splitting.)
+    if pieces.len() < 2 || pieces.iter().any(|&(a, e)| (e - a) < h as usize / 2) {
+        return vec![b];
+    }
+    let pad = (h / 6) as usize;
+    pieces.iter().map(|&(a, e)| [(x0 as usize + a.saturating_sub(pad)) as f32, b[1], (x0 as usize + e + pad).min(x1 as usize) as f32, b[3]]).collect()
+}
+
 fn non_space(t: &str) -> usize {
     t.chars().filter(|c| !c.is_whitespace()).count()
 }
@@ -496,7 +554,11 @@ impl OcrEngine for NdlOcr {
                 kept.push(l);
             }
         }
-        let raw_lines = kept;
+        // A detected line can run across the gutter between two columns ("I. はじめに"
+        // beside "II. 海底噴火との遭遇"): read as one, it drops characters (the
+        // numerals) and mixes the columns. It is cut where it holds a blank stretch
+        // several times its height.
+        let raw_lines: Vec<([f32; 4], LineKind, f32, f32)> = kept.into_iter().flat_map(|l| split_at_gaps(img, l.0).into_iter().map(move |b| (b, l.1, l.2, l.3))).collect();
         let vertical_count = raw_lines.iter().filter(|l| l.0[3] - l.0[1] > l.0[2] - l.0[0]).count();
         let vertical = vertical_count * 2 > raw_lines.len();
 

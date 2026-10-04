@@ -1942,7 +1942,7 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
     // Japanese titles follow the number without a space ("1.はじめに", "2.1 伊豆大島"
     // as OCR reads "１．はじめに"); not a year or a quantity ("1986年", "3.5倍").
     let quantity = rest.starts_with(['万', '億', '千', '百', '倍', '年', '月', '日', '時', '分', '秒', '度', '個', '回', '割', '名', '人', '本', '枚', '点', '号', '巻', '頁', '％', '℃']);
-    let cjk_title = (ended_dot || depth >= 2) && first_digits <= 2 && !quantity && rest.chars().next().is_some_and(is_cjk);
+    let cjk_title = (ended_dot || (depth >= 2 && !quantity)) && first_digits <= 2 && rest.chars().next().is_some_and(is_cjk);
     (saw_digit && ((rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())) || cjk_title)).then_some(depth)
 }
 
@@ -1973,11 +1973,37 @@ fn heading_number(t: &str) -> Option<u8> {
         {
             return Some(1);
         }
+        // (Not a note number in running text: "19)である。")
         if let Some(r) = after.strip_prefix(')').or_else(|| after.strip_prefix('）'))
             && title_follows(r.trim_start())
+            && !(digits.chars().count() == 2 && r.trim_start().starts_with(|c: char| ('\u{3041}'..='\u{3096}').contains(&c)))
         {
             return Some(2);
         }
+    }
+    // "2-1地形", "2-1. 琉球列島に…": subsections numbered with a hyphen (not "3-4日後").
+    {
+        let a: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let r = &t[a.len()..];
+        if (1..=2).contains(&a.len())
+            && let Some(r) = r.strip_prefix(['-', '－'])
+        {
+            let b: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let rest = r[b.len()..].trim_start_matches(['.', '．']).trim_start();
+            let quantity = rest.starts_with(['万', '億', '千', '百', '倍', '年', '月', '日', '時', '分', '秒', '度', '個', '回', '割', '名', '人', '本', '枚', '点', '号', '巻', '頁', '％', '℃', '週', 'カ', 'ヶ']);
+            if (1..=2).contains(&b.len()) && !quantity && rest.chars().next().is_some_and(|c| is_cjk(c) || c.is_ascii_uppercase()) {
+                return Some(2);
+            }
+        }
+    }
+    // "a.海嶺中軸部の…", "b) 緑海…": lettered subsections of Japanese papers.
+    let mut it = t.chars();
+    if let (Some(a), Some(b)) = (it.next(), it.next())
+        && a.is_ascii_lowercase()
+        && matches!(b, '.' | ')' | '．' | '）')
+        && it.as_str().trim_start().chars().next().is_some_and(is_cjk)
+    {
+        return Some(2);
     }
     // "(1) A火口とその噴出物", "（2）": a subsection of Japanese papers.
     if let Some(r) = t.strip_prefix('(').or_else(|| t.strip_prefix('（')) {
@@ -2131,6 +2157,23 @@ fn note_opening(t: &str) -> bool {
     ];
     // (Not "§", which numbers sections as often as notes.)
     STARTS.iter().any(|s| l.starts_with(s)) || t.starts_with(['*', '†', '‡', '©', '∗'])
+}
+
+/// Only the labels of a figure's panels: "(a) (b) (c)", "(2)", "A'", "a b".
+fn panel_labels(t: &str) -> bool {
+    let words: Vec<&str> = t.split_whitespace().collect();
+    !words.is_empty()
+        && words.iter().all(|w| {
+            let core: String = w.chars().filter(|c| !matches!(c, '(' | ')' | '（' | '）' | '\'' | '’' | '.' | ',')).collect();
+            (1..=2).contains(&core.chars().count()) && core.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+}
+
+/// The dates of a paper's receipt and acceptance ("(1988年1月5日受付,1988年3月18日受理)",
+/// "(Received July 13, 1992; Revised …)").
+fn dates_line(t: &str) -> bool {
+    let l = t.trim().trim_start_matches(['(', '（']).to_lowercase();
+    t.chars().count() <= 120 && t.chars().any(|c| c.is_ascii_digit()) && (t.contains("受付") || t.contains("受理") || l.starts_with("received") || l.starts_with("manuscript received"))
 }
 
 /// "References", "Literature Cited", "参考文献"...
@@ -3518,6 +3561,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     let mut region: Option<RectF> = None;
                     let mut row_lines: Vec<&RichLine> = Vec::new();
                     let mut caption = caption;
+                    // (Whether the table's region from the OCR engine is in.)
+                    let mut ocr_region = false;
                     while let Some(t) = ordered.get(j) {
                         // The sentence after a bare "Table 1" label is the rest of the caption.
                         if j == i + 1
@@ -3541,6 +3586,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                                 break;
                             }
                             region = Some(region.map_or(t.bbox, |r| r.union(&t.bbox)));
+                            ocr_region = true;
                             j += 1;
                             continue;
                         }
@@ -3549,6 +3595,23 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         let s = t.size();
                         let tt = t.text();
                         let running = t.class != Some(strata_ocr::layout::TABLE) && s >= body * 0.97 && t.lines.len() >= 2 && prose_like(&tt);
+                        // (OCR sizes are estimates: on an OCR page a paragraph of running
+                        // text outside every region the engine found is past the table, once
+                        // the table's region is in. A table of text alone has none.)
+                        let running = running
+                            || (p.ocr
+                                && ocr_region
+                                && t.class == Some(strata_ocr::layout::TEXT)
+                                && t.lines.len() >= 2
+                                && !ordered.iter().any(|f| f.kind == UnitKind::Figure && overlap_frac(&t.bbox, &f.bbox) > 0.5))
+                            // (A table of text alone, set in columns: a paragraph whose lines
+                            // run far wider than the table's rows is the running text below it.)
+                            || (p.ocr && t.class == Some(strata_ocr::layout::TEXT) && t.lines.len() >= 2 && row_lines.len() >= 5 && {
+                                let widest = row_lines.iter().map(|l| l.bbox.width()).fold(0.0f32, f32::max);
+                                let mut w: Vec<f32> = t.lines.iter().map(|l| l.bbox.width()).collect();
+                                w.sort_by(f32::total_cmp);
+                                w[w.len() / 2] > widest * 1.5
+                            });
                         if running || caption_kind(&tt).is_some() || (numbered_heading_depth(&tt).is_some() && s >= body * 0.97) {
                             break;
                         }
@@ -3578,6 +3641,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     } else {
                         doc.nodes.push(Node::Paragraph { spans });
                     }
+                    i += 1;
+                    continue;
+                }
+                // Panel labels inside a figure that OCR read as captions ("(a) (b) (c)",
+                // "(2)", "A'"): the figure shows them.
+                None if u.class == Some(CAPTION) && p.ocr && panel_labels(&text) => {
                     i += 1;
                     continue;
                 }
@@ -3725,9 +3794,14 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             && (n.bbox.y0 - u.bbox.y0).abs() < size * 2.0
                     });
                 // Large type the model took for running text is still a title.
-                let large = c == strata_ocr::layout::TEXT && size >= body * 1.4 && u.lines.len() <= 5 && text.chars().count() < 300;
+                // (On a scan only on the first page: elsewhere a tall OCR box is a formula's.)
+                let large = c == strata_ocr::layout::TEXT && size >= body * 1.4 && u.lines.len() <= 5 && text.chars().count() < 300 && (!p.ocr || pi == first_page);
+                // (On a scan the numbering is surer than the estimated type size.)
+                let scan_number = if p.ocr && Some(i) != page_title { heading_number(&text) } else { None };
                 if (matches!(c, TITLE | SECTION_HEADER) || large) && (wordy || number) {
-                    let level = if c == TITLE || size >= body * 1.4 {
+                    let level = if let Some(d) = scan_number {
+                        (d + 1).min(6)
+                    } else if c == TITLE || size >= body * 1.4 {
                         let score = size * (text.chars().count().min(150) as f32).sqrt();
                         if pi == first_page && score > title_size {
                             title_size = score;
@@ -3776,6 +3850,18 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             // with a comma after a kana.
             if p.scan && level.is_some() && Some(i) != page_title && text.chars().zip(text.chars().skip(1)).any(|(a, b)| ('\u{3041}'..='\u{3096}').contains(&a) && matches!(b, '、' | '，' | ',')) {
                 level = None;
+            }
+            // Nor a line that ends a Japanese sentence, or that starts in hiragana (the
+            // rest of a sentence at the top of a column: "19)である。"), but for the
+            // headings that do ("はじめに", "おわりに").
+            if p.scan && level.is_some() && Some(i) != page_title {
+                let t = text.trim();
+                let body_text = t.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '(' | '）' | '（' | '．' | ' '));
+                const KANA_HEADINGS: [&str; 7] = ["はじめに", "おわりに", "まえがき", "あとがき", "むすび", "まとめ", "おわり"];
+                let kana_start = body_text.starts_with(|c: char| ('\u{3041}'..='\u{3096}').contains(&c)) && !KANA_HEADINGS.iter().any(|h| body_text.starts_with(h));
+                if t.ends_with('。') || (kana_start && heading_number(t).is_none()) {
+                    level = None;
+                }
             }
             // A column of vertical text running down most of the text area is running
             // text, whatever size an OCR estimated for it: headings are short columns.
@@ -3848,7 +3934,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             };
             // (A bare label such as "Supplementary Information" stays a heading; a
             // label with a colon, "Citation:", is a sidebar's.)
-            let noted = note_opening(&text) && (text.trim().chars().count() > 30 || text.trim_end().ends_with(':'));
+            let noted = (note_opening(&text) && (text.trim().chars().count() > 30 || text.trim_end().ends_with(':'))) || dates_line(&text);
             if level.is_some() && Some(i) != page_title && !is_front_heading(&text) && (noted || is_boilerplate(&text) || doi) {
                 doc.nodes.push(Node::Footnote { spans: spans_of(u, &p.rich.fonts, &p.links, vertical, p.scan, &lex) });
                 i += 1;
@@ -3946,7 +4032,14 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     && pg == p.page
                     && (size - hsize).abs() <= hsize * size_tolerance
                     && numbered.is_none()
-                    && ((u.bbox.y0 >= bbox.y1 - 2.0 && u.bbox.y0 - bbox.y1 < size * if level == 1 { 1.3 } else { 0.8 } && u.bbox.x0 < bbox.x1 && u.bbox.x1 > bbox.x0)
+                    // (On a scan, where boxes and sizes are rough, only a heading that ran
+                    // to the right edge of its column, or a line that cannot start one
+                    // (in hiragana): not a subheading right under its section's heading.)
+                    && (!p.ocr || level == 1 || text.trim_start().starts_with(|c: char| ('\u{3041}'..='\u{3096}').contains(&c)) || {
+                        let right = ordered.iter().filter(|o| o.kind == UnitKind::Text && o.lines.len() >= 2 && o.bbox.x0 < bbox.x1 && o.bbox.x1 > bbox.x0).map(|o| o.bbox.x1).fold(f32::MIN, f32::max);
+                        right > f32::MIN && bbox.x1 >= right - hsize * 2.0
+                    })
+                    && ((u.bbox.y0 >= bbox.y1 - 2.0 && u.bbox.y0 - bbox.y1 < size * if level == 1 { 1.3 } else if p.ocr { 1.2 } else { 0.8 } && u.bbox.x0 < bbox.x1 && u.bbox.x1 > bbox.x0)
                         || ((u.bbox.y0 - bbox.y0).abs() < 2.0 && u.bbox.x0 >= bbox.x1 - 1.0 && u.bbox.x0 - bbox.x1 < size * 1.5))
                 {
                     // The next line, or the rest of the line, of the same heading.
@@ -3970,14 +4063,17 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         s
                     });
                     doc.nodes.push(Node::Heading { level: level as u8, spans: spans.collect() });
-                    if level >= 2 && numbered.is_none() {
+                    if level >= 2 && numbered.is_none() && !(p.ocr && heading_number(&text).is_some()) {
                         heading_styles.push((doc.nodes.len() - 1, size, bold > 0.8, caps, italic > 0.8));
                     }
                     if u.class.is_some() || caps || Some(i) == page_title {
                         last_heading = Some((doc.nodes.len() - 1, p.page, u.bbox, size));
                     }
                 }
-            } else if u.class == Some(FOOTNOTE) || (!vertical && !in_refs && is_note(u, &ordered, i, &text, body)) {
+            } else if u.class == Some(FOOTNOTE)
+                // (On OCR pages the engine's classes tell notes, not the estimated sizes.)
+                || (!vertical && !in_refs && if p.ocr { dates_line(&text) } else { is_note(u, &ordered, i, &text, body) })
+            {
                 doc.nodes.push(Node::Footnote { spans });
             } else if is_list_marker(&text)
                 && !(text.trim_start().starts_with('(')
@@ -4403,9 +4499,21 @@ mod tests {
         assert_eq!(numbered_heading_depth("2.1伊豆大島の地質"), Some(2));
         assert_eq!(numbered_heading_depth("1986年伊豆大島噴火は"), None);
         assert_eq!(numbered_heading_depth("3.5倍に達した"), None);
+        assert_eq!(numbered_heading_depth("4.個々の噴火事件"), Some(1));
         assert_eq!(heading_number("(1)A火口とその噴出物"), Some(2));
         assert_eq!(heading_number("（2）B・C火口列の配列"), Some(2));
         assert_eq!(heading_number("(22)"), None);
+        assert_eq!(heading_number("a.海嶺中軸部の単成火山"), Some(2));
+        assert_eq!(heading_number("a. the first sample"), None);
+        assert_eq!(heading_number("2-1地形"), Some(2));
+        assert_eq!(heading_number("2-1. 琉球列島に漂着した軽石"), Some(2));
+        assert_eq!(heading_number("3-4日後に"), None);
+        assert!(dates_line("(1988年1月5日受付,1988年3月18日受理)"));
+        assert!(panel_labels("(a) (b) (c)"));
+        assert!(panel_labels("A'"));
+        assert!(!panel_labels("(a) Location map"));
+        assert_eq!(heading_number("19)である。"), None);
+        assert!(dates_line("(Received July 13,1992; Revised June 17, 1993)"));
     }
 
     #[test]
