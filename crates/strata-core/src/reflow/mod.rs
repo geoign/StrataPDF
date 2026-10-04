@@ -1936,6 +1936,14 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
         if any == 0 {
             break;
         }
+        // (A year after the number is the title's: "3.1986年噴火の開始まで", as OCR
+        // reads "3. 1986年…" without its space.)
+        if depth >= 1 && ended_dot && any >= 3 && first_digits <= 2 {
+            let year: String = t.chars().take(t.chars().count() - chars.clone().count()).collect();
+            let rest_start: String = year.chars().rev().take(any).collect::<Vec<_>>().into_iter().rev().collect();
+            let after = &t[year.len()..];
+            return after.chars().next().is_some_and(is_cjk).then_some(depth).filter(|_| rest_start.len() == 4);
+        }
         if depth == 0 {
             first_digits = any;
         }
@@ -2002,8 +2010,10 @@ fn heading_number(t: &str) -> Option<u8> {
             return Some(1);
         }
         // (Not a note number in running text: "19)である。")
+        // (A title may open with a year: "1)1986年11～12月の山頂噴火".)
+        let year_title = |s: &str| s.chars().take_while(|c| c.is_ascii_digit()).count() == 4 && s.chars().nth(4).is_some_and(is_cjk);
         if let Some(r) = after.strip_prefix(')').or_else(|| after.strip_prefix('）'))
-            && title_follows(r.trim_start())
+            && (title_follows(r.trim_start()) || year_title(r.trim_start()))
             && !(digits.chars().count() == 2 && r.trim_start().starts_with(|c: char| ('\u{3041}'..='\u{3096}').contains(&c)))
         {
             return Some(2);
@@ -2191,6 +2201,19 @@ fn note_opening(t: &str) -> bool {
     ];
     // (Not "§", which numbers sections as often as notes.)
     STARTS.iter().any(|s| l.starts_with(s)) || t.starts_with(['*', '†', '‡', '©', '∗'])
+}
+
+/// Text that repeats itself: few distinct words among many, or a short run of a
+/// couple of distinct characters ("縫縫").
+fn repetitive(t: &str) -> bool {
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if words.len() >= 6 {
+        let distinct: std::collections::HashSet<&str> = words.iter().copied().collect();
+        return distinct.len() * 10 < words.len() * 6;
+    }
+    let c: Vec<char> = t.chars().filter(|c| !c.is_whitespace()).collect();
+    let distinct: std::collections::HashSet<char> = c.iter().copied().collect();
+    (2..=6).contains(&c.len()) && distinct.len() * 2 <= c.len()
 }
 
 /// Only the labels of a figure's panels: "(a) (b) (c)", "(2)", "A'", "a b".
@@ -3229,6 +3252,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // Unnumbered headings with their node, size, bold, capitals and italic: the
     // level of each comes from the rank of its style among them at the end.
     let mut heading_styles: Vec<(usize, f32, bool, bool, bool)> = Vec::new();
+    // The level of the last numbered heading of a scan, for the unnumbered ones under it.
+    let mut last_numbered: Option<u8> = None;
     // The title and author lines of the first page, for running heads that repeat them.
     let mut front_marks: Vec<(String, bool)> = Vec::new();
     let covers: Vec<bool> = (0..pages.len()).map(|i| (i < 2 || i + 2 >= pages.len()) && cover_sheet(&pages[i].rich)).collect();
@@ -3514,6 +3539,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             let size = u.size();
             // Glyphs of a badge or icon font, all undecodable.
             if chars::is_junk(&text) {
+                i += 1;
+                continue;
+            }
+            // OCR's reading of a figure's lettering: a few lines of the same words over
+            // and over, no Japanese.
+            if p.ocr && u.lines.len() <= 3 && !text.chars().any(is_cjk) && repetitive(&text) {
                 i += 1;
                 continue;
             }
@@ -3877,12 +3908,18 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 && u.lines.len() <= 2
                 && size >= body * 0.7
                 && caps_heading(&text)
+                && !(p.ocr && repetitive(&text))
                 && !matches!(u.class, Some(strata_ocr::layout::TABLE | PICTURE | CAPTION | FOOTNOTE | PAGE_HEADER | PAGE_FOOTER));
             let mut level = level;
             // On a scan, a line of Japanese prose ("この場合も,エネルギーは…") whose OCR box
             // came out tall (fractions, subscripts) is no heading: headings do not pause
             // with a comma after a kana.
             if p.scan && level.is_some() && Some(i) != page_title && text.chars().zip(text.chars().skip(1)).any(|(a, b)| ('\u{3041}'..='\u{3096}').contains(&a) && matches!(b, '、' | '，' | ',')) {
+                level = None;
+            }
+            // Nor OCR garbage from a figure's lettering: words or characters over and
+            // over ("FE PT COFFFERE THE THE FORECE FORECE THON…", "縫縫").
+            if p.ocr && level.is_some() && Some(i) != page_title && repetitive(&text) {
                 level = None;
             }
             // Nor a line that ends a Japanese sentence, or that starts in hiragana (the
@@ -3936,9 +3973,19 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             // On a scan, the standing sections ("文献", "謝辞", "要旨", "Introduction") are
             // sections whatever size OCR estimated for them.
-            let standing = p.ocr && level.is_some() && Some(i) != page_title && u.lines.len() <= 2 && (refs::is_refs_heading(&text) || is_front_heading(&text) || is_closing_heading(&text));
+            let standing = p.ocr && level.is_some() && Some(i) != page_title && ((u.lines.len() <= 2 && (refs::is_refs_heading(&text) || is_front_heading(&text) || is_closing_heading(&text))) || (in_front && pi == first_page && level != Some(1)));
             if standing {
                 level = Some(2);
+            }
+            // An unnumbered heading inside a numbered section of a scan sits one level
+            // under the section's heading (its OCR size says too little).
+            let scan_number = p.ocr && Some(i) != page_title && heading_number(&text).is_some();
+            let under_numbered = p.ocr && level.is_some() && !standing && !scan_number && Some(i) != page_title && body_started && last_numbered.is_some() && !forced_heading[i];
+            if under_numbered && let Some(n) = last_numbered {
+                level = Some((n + 1).min(6));
+            }
+            if scan_number && let Some(l) = level {
+                last_numbered = Some(l);
             }
             if Some(i) == page_title {
                 level = Some(1);
@@ -4103,7 +4150,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         s
                     });
                     doc.nodes.push(Node::Heading { level: level as u8, spans: spans.collect() });
-                    if level >= 2 && numbered.is_none() && !(p.ocr && heading_number(&text).is_some()) && !standing {
+                    if level >= 2 && numbered.is_none() && !(p.ocr && heading_number(&text).is_some()) && !standing && !under_numbered {
                         heading_styles.push((doc.nodes.len() - 1, size, bold > 0.8, caps, italic > 0.8));
                     }
                     if u.class.is_some() || caps || Some(i) == page_title {
@@ -4296,6 +4343,42 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     }
     let last = doc.anchors.last().copied().unwrap_or((0, 0.0));
     doc.fill_anchors(last);
+    // Roman section numerals that OCR dropped ("II.火口と…" read ".火口と…"): the number
+    // between the headings before and after it that kept theirs.
+    {
+        let roman = |t: &str| -> Option<usize> {
+            let r: String = t.trim_start().chars().take_while(|c| matches!(c, 'I' | 'V' | 'X')).collect();
+            const R: [&str; 12] = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
+            let after = t.trim_start()[r.len()..].chars().next();
+            (matches!(after, Some('.' | '．'))).then(|| R.iter().position(|x| *x == r).map(|k| k + 1)).flatten()
+        };
+        let heads: Vec<usize> = (0..doc.nodes.len()).filter(|&k| matches!(doc.nodes[k], Node::Heading { level: 2..=6, .. })).collect();
+        let texts: Vec<String> = heads.iter().map(|&k| if let Node::Heading { spans, .. } = &doc.nodes[k] { spans_text(spans) } else { String::new() }).collect();
+        if texts.iter().filter(|t| roman(t).is_some()).count() >= 2 {
+            let mut last = 0usize;
+            let mut last_level = 2u8;
+            for (j, &k) in heads.iter().enumerate() {
+                let t = texts[j].trim_start();
+                if let Some(n) = roman(t) {
+                    last = n;
+                    if let Node::Heading { level, .. } = &doc.nodes[k] {
+                        last_level = *level;
+                    }
+                } else if last > 0 && t.starts_with(['.', '．']) && t[t.chars().next().unwrap().len_utf8()..].trim_start().chars().next().is_some_and(is_cjk) {
+                    const R: [&str; 12] = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
+                    if let Some(r) = R.get(last)
+                        && let Node::Heading { spans, level } = &mut doc.nodes[k]
+                        && let Some(first) = spans.first_mut()
+                    {
+                        let trimmed = first.text.trim_start().to_string();
+                        first.text = format!("{r}{trimmed}");
+                        *level = last_level;
+                        last += 1;
+                    }
+                }
+            }
+        }
+    }
     // Unnumbered headings: the level from the rank of their style (size first, then
     // bold, capitals, upright) among the document's heading styles, instead of a flat 3.
     {
@@ -4541,6 +4624,7 @@ mod tests {
         assert_eq!(numbered_heading_depth("3.5倍に達した"), None);
         assert_eq!(numbered_heading_depth("4.個々の噴火事件"), Some(1));
         assert_eq!(numbered_heading_depth("2.1A火口噴出物"), Some(2));
+        assert_eq!(numbered_heading_depth("3.1986年噴火の開始まで"), Some(1));
         assert_eq!(numbered_heading_depth("3.5A at 10 V"), None);
         assert_eq!(heading_number("(1)A火口とその噴出物"), Some(2));
         assert_eq!(heading_number("（2）B・C火口列の配列"), Some(2));
@@ -4552,9 +4636,14 @@ mod tests {
         assert_eq!(heading_number("3-4日後に"), None);
         assert!(dates_line("(1988年1月5日受付,1988年3月18日受理)"));
         assert!(panel_labels("(a) (b) (c)"));
+        assert!(repetitive("縫縫"));
+        assert!(repetitive("FE PT COFFFERE THE THE FORECE FORECE THON THON THE THON THON THON"));
+        assert!(!repetitive("溶岩湖の形成と溢流"));
+        assert!(!repetitive("Fall unit and Eruption unit of the 1977 eruption"));
         assert!(panel_labels("A'"));
         assert!(!panel_labels("(a) Location map"));
         assert_eq!(heading_number("19)である。"), None);
+        assert_eq!(heading_number("1)1986年11～12月の山頂噴火"), Some(2));
         assert_eq!(heading_number("I.はじめに"), Some(1));
         assert_eq!(heading_number("IV．考察"), Some(1));
         assert!(dates_line("(Received July 13,1992; Revised June 17, 1993)"));
