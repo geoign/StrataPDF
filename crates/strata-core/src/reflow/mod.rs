@@ -1978,7 +1978,9 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
 
 /// A Japanese title, perhaps opening with a symbol in Latin capitals ("A火口とその噴出物").
 fn japanese_title(t: &str) -> bool {
-    t.chars().next().is_some_and(is_cjk) || (t.starts_with(|c: char| c.is_ascii_uppercase()) && t.chars().take(4).any(is_cjk))
+    // (Or with a year: "1986年11月噴火以後の状況".)
+    let year = t.chars().take_while(|c| c.is_ascii_digit()).count() == 4 && t[4..].trim_start().starts_with('年');
+    t.chars().next().is_some_and(is_cjk) || (t.starts_with(|c: char| c.is_ascii_uppercase()) && t.chars().take(4).any(is_cjk)) || year
 }
 
 /// Section numbering at the start of a heading, with its depth: "2.1 Methods",
@@ -4640,6 +4642,7 @@ mod tests {
         assert_eq!(heading_number("(1)A火口とその噴出物"), Some(2));
         assert_eq!(heading_number("（2）B・C火口列の配列"), Some(2));
         assert_eq!(heading_number("(22)"), None);
+        assert_eq!(heading_number("(5)1986年11月噴火以後の状況"), Some(2));
         assert_eq!(heading_number("(1) Massive (ungraded) sand"), None);
         assert_eq!(heading_number("a.海嶺中軸部の単成火山"), Some(2));
         assert_eq!(heading_number("a. the first sample"), None);
