@@ -192,7 +192,48 @@ impl PageOcr {
             .collect()
     }
 
+    /// Type size of each line, from the thickness of its box. A box is as thick as
+    /// the ink of its line: a line without ascenders or descenders, or of kana, or a
+    /// short one comes out smaller than its neighbours of the same size. Lines of one
+    /// text block share a size (the median), unless one stands well apart; headings
+    /// keep their own. Latin boxes run taller than Japanese ones of the same size.
+    fn line_sizes(&self) -> HashMap<*const OcrTextLine, f32> {
+        let raw = |l: &OcrTextLine| {
+            let latin = {
+                let (mut ascii, mut all) = (0usize, 0usize);
+                for c in l.text.chars().filter(|c| !c.is_whitespace()) {
+                    all += 1;
+                    ascii += c.is_ascii() as usize;
+                }
+                !l.vertical && all >= 4 && ascii * 10 >= all * 7
+            };
+            (if l.vertical { l.bbox.width() } else { l.bbox.height() }) * if latin { 0.78 } else { 0.85 }
+        };
+        let mut out: HashMap<*const OcrTextLine, f32> = self.lines.iter().map(|l| (l as *const _, raw(l))).collect();
+        let mut by_block: HashMap<u32, Vec<&OcrTextLine>> = HashMap::new();
+        for l in &self.lines {
+            if let Some(b) = l.block
+                && l.kind.as_deref() != Some("Title")
+            {
+                by_block.entry(b).or_default().push(l);
+            }
+        }
+        for ls in by_block.values().filter(|ls| ls.len() >= 2) {
+            let mut v: Vec<f32> = ls.iter().map(|l| raw(l)).collect();
+            v.sort_by(f32::total_cmp);
+            let med = v[v.len() / 2];
+            for l in ls {
+                let r = raw(l);
+                if r >= med * 0.7 && r <= med * 1.35 {
+                    out.insert(*l as *const _, med);
+                }
+            }
+        }
+        out
+    }
+
     pub fn to_rich(&self, width: f32, height: f32) -> RichPage {
+        let sizes = self.line_sizes();
         let mut blocks: Vec<RichBlock> = self
             .paragraph_blocks()
             .into_iter()
@@ -202,7 +243,7 @@ impl PageOcr {
                     .iter()
                     .enumerate()
                     .map(|(i, l)| {
-                        let size = if l.vertical { l.bbox.width() } else { l.bbox.height() } * 0.85;
+                        let size = sizes.get(&(*l as *const OcrTextLine)).copied().unwrap_or(l.bbox.height() * 0.85);
                         // Hyphenated line break in Latin text: join like MuPDF's dehyphenation.
                         let next_lower = ls.get(i + 1).and_then(|n| n.text.chars().next()).is_some_and(|c| c.is_lowercase());
                         let joined = i + 1 < n && l.text.ends_with('-') && next_lower;

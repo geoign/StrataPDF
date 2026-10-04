@@ -448,7 +448,9 @@ pub fn needs_ocr(p: &RichPage) -> Option<String> {
     for b in &p.blocks {
         match b {
             RichBlock::Text { lines, .. } => {
-                for l in lines {
+                // (Not the stamp a library or a journal site put in the margin of every
+                // scanned page, "NII-Electronic Library Service".)
+                for l in lines.iter().filter(|l| l.bbox.y0 > p.height * 0.05 && l.bbox.y1 < p.height * 0.95) {
                     for c in &l.chars {
                         if c.c.is_whitespace() {
                             continue;
@@ -743,6 +745,32 @@ fn repeated_margin_lines(pages: &[PageData]) -> HashMap<String, usize> {
         }
     }
     counts
+}
+
+/// Text without spaces, punctuation and marks, for comparing OCR readings.
+fn compact_text(t: &str) -> String {
+    t.chars().filter(|c| c.is_alphanumeric() && !c.is_ascii_digit()).flat_map(char::to_lowercase).collect()
+}
+
+/// A running head giving the article's title or authors (`marks`: compacted title
+/// and author lines of the first page, with whether each is authors), as OCR reads
+/// it: "長岡正利", "曽屋龍典ほか", the title with a character or two wrong. (Not a
+/// heading that a word of the title makes up.)
+fn running_head_of(t: &str, marks: &[(String, bool)]) -> bool {
+    let c = compact_text(t);
+    let c = c.strip_suffix("ほか").or_else(|| c.strip_suffix("他")).or_else(|| c.strip_suffix("etal")).unwrap_or(&c).to_string();
+    if c.chars().count() < 3 {
+        return false;
+    }
+    let g = bigrams(&c);
+    marks.iter().any(|(m, authors)| {
+        if *authors && m.contains(&c) {
+            return true;
+        }
+        let mg = bigrams(m);
+        let (short, long) = (g.len().min(mg.len()), g.len().max(mg.len()));
+        short * 100 >= long * 70 && g.intersection(&mg).count() * 10 >= long * 7
+    })
 }
 
 fn bigrams(s: &str) -> std::collections::HashSet<(char, char)> {
@@ -1878,24 +1906,31 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
     let mut depth = 0u8;
     let mut chars = t.chars().peekable();
     let mut saw_digit = false;
+    let mut first_digits = 0;
+    let mut ended_dot = false;
     loop {
-        let mut any = false;
+        let mut any = 0;
         while let Some(c) = chars.peek() {
             if c.is_ascii_digit() {
                 chars.next();
-                any = true;
+                any += 1;
             } else {
                 break;
             }
         }
-        if !any {
+        if any == 0 {
             break;
+        }
+        if depth == 0 {
+            first_digits = any;
         }
         saw_digit = true;
         depth += 1;
+        ended_dot = false;
         match chars.peek() {
             Some('.') => {
                 chars.next();
+                ended_dot = true;
             }
             _ => break,
         }
@@ -1904,7 +1939,11 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
     // "2.1 | Methods" (Wiley) as well as "2.1 Methods".
     let title = rest.trim_start();
     let title = title.strip_prefix('|').map(str::trim_start).unwrap_or(title);
-    (saw_digit && rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())).then_some(depth)
+    // Japanese titles follow the number without a space ("1.はじめに", "2.1 伊豆大島"
+    // as OCR reads "１．はじめに"); not a year or a quantity ("1986年", "3.5倍").
+    let quantity = rest.starts_with(['万', '億', '千', '百', '倍', '年', '月', '日', '時', '分', '秒', '度', '個', '回', '割', '名', '人', '本', '枚', '点', '号', '巻', '頁', '％', '℃']);
+    let cjk_title = (ended_dot || depth >= 2) && first_digits <= 2 && !quantity && rest.chars().next().is_some_and(is_cjk);
+    (saw_digit && ((rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())) || cjk_title)).then_some(depth)
 }
 
 /// Section numbering at the start of a heading, with its depth: "2.1 Methods",
@@ -1940,6 +1979,18 @@ fn heading_number(t: &str) -> Option<u8> {
             return Some(2);
         }
     }
+    // "(1) A火口とその噴出物", "（2）": a subsection of Japanese papers.
+    if let Some(r) = t.strip_prefix('(').or_else(|| t.strip_prefix('（')) {
+        let digits: String = r.chars().take_while(|c| c.is_ascii_digit() || ('０'..='９').contains(c)).collect();
+        let after = &r[digits.len()..];
+        if !digits.is_empty()
+            && digits.chars().count() <= 2
+            && let Some(title) = after.strip_prefix(')').or_else(|| after.strip_prefix('）'))
+            && title.trim_start().chars().next().is_some_and(|c| is_cjk(c) || c.is_ascii_uppercase())
+        {
+            return Some(2);
+        }
+    }
     None
 }
 
@@ -1968,6 +2019,25 @@ fn is_byline(t: &str) -> bool {
     let compact: String = t.chars().filter(|c| !c.is_whitespace() && !matches!(c, '*' | '＊')).collect();
     if (2..=6).contains(&compact.chars().count()) && compact.chars().all(is_cjk) {
         return true;
+    }
+    // CJK names apart by affiliation marks or "・" ("曽屋龍典*1 阪口圭一*3",
+    // "遠藤邦彦・千葉達朗"); a name's own spaces ("中野 俊") do not part it.
+    if t.chars().filter(|&c| is_cjk(c)).count() >= 4 {
+        let names: Vec<String> = t
+            .split(|c: char| matches!(c, '*' | '＊' | '・' | '，' | ',' | '、' | '†' | '‡' | '}' | ')' | '(' | '）' | '（') || c.is_ascii_digit() || ('０'..='９').contains(&c) || ('¹'..='⁹').contains(&c))
+            .map(|g| g.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+            .filter(|g| !g.is_empty())
+            .collect();
+        // (Names written apart by wide spaces only: "中野 俊  星住英夫".)
+        let names: Vec<String> = if names.len() == 1 {
+            t.replace('　', "  ").split("  ").map(|g| g.chars().filter(|c| !c.is_whitespace()).collect::<String>()).filter(|g| !g.is_empty()).collect()
+        } else {
+            names
+        };
+        let name = |g: &String| (2..=7).contains(&g.chars().count()) && g.chars().all(is_cjk);
+        if names.len() >= 2 && names.iter().filter(|g| name(g)).count() * 10 >= names.len() * 9 {
+            return true;
+        }
     }
     let cleaned: String = t
         .chars()
@@ -2173,6 +2243,74 @@ fn join_hyphenated(prev: &mut Vec<Span>, next: &str, lex: &hyphen::Lexicon) -> b
 }
 
 /// Split a unit's characters into styled spans.
+/// Superscripts that OCR reads on the line (it gives every character one size):
+/// the exponent of a power of ten after a number ("7.9×107 tons", "6 x 104") and
+/// the power of a unit of length after a quantity ("0.053km3", "1000万m3").
+fn ocr_superscripts(s: Span) -> Vec<Span> {
+    if s.style.sup || s.style.sub || s.style.mono {
+        return vec![s];
+    }
+    let c: Vec<char> = s.text.chars().collect();
+    // Character ranges to raise.
+    let mut raise: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        // "×10" / "x10" / "x 10" after a digit, then one or two digits.
+        if matches!(c[i], '×' | 'x' | 'X') {
+            let mut k = i;
+            let before = (0..i).rev().find(|&j| c[j] != ' ').map(|j| c[j]);
+            k += 1;
+            while k < c.len() && c[k] == ' ' {
+                k += 1;
+            }
+            if before.is_some_and(|b| b.is_ascii_digit()) && c.get(k) == Some(&'1') && c.get(k + 1) == Some(&'0') {
+                let e0 = k + 2;
+                let mut e1 = e0;
+                if c.get(e1) == Some(&'-') || c.get(e1) == Some(&'−') {
+                    e1 += 1;
+                }
+                let d0 = e1;
+                while e1 < c.len() && c[e1].is_ascii_digit() {
+                    e1 += 1;
+                }
+                let digits = e1 - d0;
+                if (1..=2).contains(&digits) && c[d0] != '0' && !c.get(e1).is_some_and(|n| n.is_ascii_digit() || *n == '.') {
+                    raise.push((e0, e1));
+                    i = e1;
+                    continue;
+                }
+            }
+        }
+        // "km3", "m2", "cm3" after a quantity, not running into a word.
+        if matches!(c[i], '2' | '3') && i >= 1 && c[i - 1] == 'm' {
+            let unit_start = if i >= 2 && matches!(c[i - 2], 'k' | 'c' | 'm') { i - 2 } else { i - 1 };
+            let before = (0..unit_start).rev().find(|&j| c[j] != ' ').map(|j| c[j]);
+            let quantity = before.is_some_and(|b| b.is_ascii_digit() || matches!(b, '万' | '億' | '千'));
+            let attached = unit_start == 0 || !c[unit_start - 1].is_ascii_alphabetic();
+            if quantity && attached && !c.get(i + 1).is_some_and(|n| n.is_ascii_alphanumeric()) {
+                raise.push((i, i + 1));
+            }
+        }
+        i += 1;
+    }
+    if raise.is_empty() {
+        return vec![s];
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (a, b) in raise {
+        if a > at {
+            out.push(Span { text: c[at..a].iter().collect(), style: s.style, link: s.link.clone() });
+        }
+        out.push(Span { text: c[a..b].iter().collect(), style: Style { sup: true, ..s.style }, link: s.link.clone() });
+        at = b;
+    }
+    if at < c.len() {
+        out.push(Span { text: c[at..].iter().collect(), style: s.style, link: s.link.clone() });
+    }
+    out
+}
+
 fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: bool, scan: bool, lex: &hyphen::Lexicon) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     let mut prev_last: Option<char> = None;
@@ -2242,6 +2380,9 @@ fn spans_of(u: &Unit, fonts: &[FontInfo], links: &[(RectF, String)], vertical: b
         if s.style.sup || s.style.sub {
             s.text = s.text.trim().to_string();
         }
+    }
+    if scan {
+        spans = spans.into_iter().flat_map(ocr_superscripts).collect();
     }
     // A degree sign typeset as a raised ring (TeX "^\circ": 6◦–10◦) or as a raised "o"
     // after a digit (25oC) is the degree sign.
@@ -3003,6 +3144,8 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
     // Unnumbered headings with their node, size, bold, capitals and italic: the
     // level of each comes from the rank of its style among them at the end.
     let mut heading_styles: Vec<(usize, f32, bool, bool, bool)> = Vec::new();
+    // The title and author lines of the first page, for running heads that repeat them.
+    let mut front_marks: Vec<(String, bool)> = Vec::new();
     let covers: Vec<bool> = (0..pages.len()).map(|i| (i < 2 || i + 2 >= pages.len()) && cover_sheet(&pages[i].rich)).collect();
     // The article's first page, where its title is: after any cover sheet.
     let first_page = covers.iter().position(|c| !*c).unwrap_or(0);
@@ -3039,6 +3182,17 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             ordered = split_equation_lines(ordered, &p.rich.fonts);
             ordered = merge_display_math(ordered, &p.rich.fonts, body);
         }
+        // Running heads that OCR read on a few pages only (on the others it found the
+        // head's region but no line in it), too seldom to repeat: a short line at the
+        // top of a later page that gives the article's title or its authors.
+        if p.ocr && pi > first_page && opts.strip_headers && !front_marks.is_empty() {
+            let h = p.rich.height;
+            ordered.retain(|u| {
+                let t = u.text();
+                let head = u.kind == UnitKind::Text && u.lines.len() == 1 && u.bbox.y1 < h * 0.12 && t.chars().count() <= 60 && caption_kind(&t).is_none();
+                !(head && running_head_of(&t, &front_marks))
+            });
+        }
         // A numbered heading that opens a block ("I. はじめに", then the paragraph):
         // a short first line with section numbering becomes a heading of its own.
         let mut forced_heading: Vec<bool> = Vec::with_capacity(ordered.len());
@@ -3073,9 +3227,20 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             .then(|| {
                 // The title is followed by its authors; a journal masthead is not.
                 let authors_below = |k: usize| ordered[k + 1..].iter().filter(|o| o.kind == UnitKind::Text).take(2).any(|o| is_byline(&o.text()));
+                // A scan has no title class: its OCR engine calls every heading a title
+                // (a section header here). Its type sizes are estimates, but the title
+                // stands out by size more surely than by length: size weighs double.
+                // (A CJK character says as much as two Latin ones.)
+                let ocr_title = |u: &Unit| p.ocr && u.class == Some(SECTION_HEADER);
                 let score = |(k, u): (usize, &Unit)| {
-                    let bonus = if u.class == Some(TITLE) { 1.3 } else { 1.0 } * if authors_below(k) { 1.5 } else { 1.0 };
-                    u.size() * (u.text().chars().count().min(150) as f32).sqrt() * bonus
+                    let bonus = if u.class == Some(TITLE) || ocr_title(u) { 1.3 } else { 1.0 } * if authors_below(k) { 1.5 } else { 1.0 };
+                    if p.scan {
+                        let t = u.text();
+                        let weight: usize = t.chars().map(|c| if is_cjk(c) { 2 } else { 1 }).sum();
+                        u.size() * u.size() * (weight.min(150) as f32).sqrt() * bonus
+                    } else {
+                        u.size() * (u.text().chars().count().min(150) as f32).sqrt() * bonus
+                    }
                 };
                 let cands = ordered
                     .iter()
@@ -3088,7 +3253,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                             && ((10..=300).contains(&n) || (cjk >= 4 && n <= 300))
                             && u.lines.len() <= 6
                             && u.bbox.y0 < p.rich.height * 0.5
-                            && (u.class == Some(TITLE) || u.size() >= body * 1.25)
+                            && (u.class == Some(TITLE) || ocr_title(u) || u.size() >= body * 1.25)
                             && (cjk >= 4 || t.split_whitespace().filter(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2).count() >= 2)
                             && caption_kind(&t).is_none()
                             && !is_strong_byline(&t)
@@ -3102,6 +3267,17 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 best.and_then(|(_, max, _, authors)| cands.iter().filter(|c| c.1 >= max * 0.8 && c.3 == authors).min_by(|a, b| a.2.total_cmp(&b.2)).map(|c| c.0))
             })
             .flatten();
+        if pi == first_page {
+            front_marks.extend(page_title.map(|t| (compact_text(&ordered[t].text()), false)));
+            // (Line by line: an author's name can share a block with the dates below it.)
+            for u in ordered.iter().filter(|u| u.kind == UnitKind::Text && u.bbox.y0 < p.rich.height * 0.5) {
+                if is_byline(&u.text()) {
+                    front_marks.push((compact_text(&u.text()), true));
+                } else {
+                    front_marks.extend(u.lines.iter().map(|l| l.text()).filter(|t| is_byline(t)).map(|t| (compact_text(&t), true)));
+                }
+            }
+        }
         let title_top = page_title.map(|t| ordered[t].bbox.y0);
         let title_size_pt = page_title.map_or(0.0, |t| ordered[t].size());
         if std::env::var("STRATA_DEBUG_UNITS").ok().and_then(|v| v.parse::<u32>().ok()) == Some(p.page + 1) {
@@ -3606,13 +3782,16 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             }
             // The next line of a heading set over several lines (a long title), which
             // alone would not pass for one.
+            // (OCR sizes come from the ink of each line: a line of kana or katakana runs
+            // smaller than one of kanji in the same type.)
+            let size_tolerance = if p.ocr { 0.12 } else { 0.05 };
             let heading_below = last_heading.and_then(|(ix, pg, bbox, hsize)| {
                 let Some(Node::Heading { level: hl, .. }) = doc.nodes.get(ix) else { return None };
                 // Display type only: a heading at body size is followed by its paragraph.
                 (ix + 1 == doc.nodes.len()
                     && pg == p.page
                     && hsize >= body * 1.15
-                    && (size - hsize).abs() <= hsize * 0.05
+                    && (size - hsize).abs() <= hsize * size_tolerance
                     && u.lines.len() <= 2
                     && text.chars().count() <= 100
                     && !ends_sentence(&text)
@@ -3757,15 +3936,24 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                     && (u.class.is_some() || caps || level == 1 || heading_below.is_some())
                     && ix + 1 == doc.nodes.len()
                     && pg == p.page
-                    && (size - hsize).abs() <= hsize * 0.05
+                    && (size - hsize).abs() <= hsize * size_tolerance
                     && numbered.is_none()
                     && ((u.bbox.y0 >= bbox.y1 - 2.0 && u.bbox.y0 - bbox.y1 < size * if level == 1 { 1.3 } else { 0.8 } && u.bbox.x0 < bbox.x1 && u.bbox.x1 > bbox.x0)
                         || ((u.bbox.y0 - bbox.y0).abs() < 2.0 && u.bbox.x0 >= bbox.x1 - 1.0 && u.bbox.x0 - bbox.x1 < size * 1.5))
                 {
                     // The next line, or the rest of the line, of the same heading.
-                    if let Node::Heading { spans: ps, .. } = &mut doc.nodes[ix] {
-                        ps.push(Span { text: " ".into(), style: Style::default(), link: None });
+                    if let Node::Heading { spans: ps, level: hl } = &mut doc.nodes[ix] {
+                        let before = spans_text(ps).trim().to_string();
+                        // (Japanese lines join without a space.)
+                        let cjk = before.chars().last().is_some_and(is_cjk) && spans_text(&spans).trim_start().chars().next().is_some_and(is_cjk);
+                        if !cjk {
+                            ps.push(Span { text: " ".into(), style: Style::default(), link: None });
+                        }
                         ps.extend(spans);
+                        // (The title's next line is the title's too.)
+                        if *hl == 1 && !before.is_empty() && doc.title == before {
+                            doc.title = spans_text(ps).trim().to_string();
+                        }
                     }
                     last_heading = Some((ix, p.page, bbox.union(&u.bbox), hsize));
                 } else {
@@ -4202,6 +4390,34 @@ mod tests {
         assert_eq!(numbered_heading_depth("3.1 Thin"), Some(2));
         assert_eq!(numbered_heading_depth("2024 was"), Some(1));
         assert_eq!(numbered_heading_depth("12,3 mm"), None);
+        // Japanese titles right after the number (as OCR reads "１．はじめに").
+        assert_eq!(numbered_heading_depth("1.はじめに"), Some(1));
+        assert_eq!(numbered_heading_depth("2.1伊豆大島の地質"), Some(2));
+        assert_eq!(numbered_heading_depth("1986年伊豆大島噴火は"), None);
+        assert_eq!(numbered_heading_depth("3.5倍に達した"), None);
+        assert_eq!(heading_number("(1)A火口とその噴出物"), Some(2));
+        assert_eq!(heading_number("（2）B・C火口列の配列"), Some(2));
+        assert_eq!(heading_number("(22)"), None);
+    }
+
+    #[test]
+    fn japanese_bylines() {
+        assert!(is_byline("曽屋龍典*1阪口圭一*3宇都浩三*5中野俊*2星住英夫*6"));
+        assert!(is_byline("遠藤邦彦・千葉達朗・宮地直道"));
+        assert!(is_byline("中野 俊*  山元孝広*"));
+        assert!(!is_byline("伊豆大島火山1986年の噴火の経過と噴出物"));
+        assert!(!is_byline("1986年伊豆大島噴火による地形変化と噴出物量の計測"));
+    }
+
+    #[test]
+    fn ocr_powers() {
+        let sp = |t: &str| ocr_superscripts(Span { text: t.into(), style: Style::default(), link: None }).iter().map(|s| if s.style.sup { format!("^{}", s.text) } else { s.text.clone() }).collect::<String>();
+        assert_eq!(sp("about 7.9×107 tons"), "about 7.9×10^7 tons");
+        assert_eq!(sp("about 6 x 104 tons"), "about 6 x 10^4 tons");
+        assert_eq!(sp("0.053km3,7900万t"), "0.053km^3,7900万t");
+        assert_eq!(sp("1000万m3と見積られる"), "1000万m^3と見積られる");
+        assert_eq!(sp("×1000 and 2×105.5"), "×1000 and 2×105.5");
+        assert_eq!(sp("50 m meshes, LBIII, m3a"), "50 m meshes, LBIII, m3a");
     }
 
     #[test]
