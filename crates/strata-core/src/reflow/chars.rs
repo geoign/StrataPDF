@@ -253,6 +253,12 @@ pub(super) fn drop_cjk_spaces(chars: Vec<RichChar>) -> Vec<RichChar> {
             if before.is_some_and(super::is_cjk) && after.is_some_and(super::is_cjk) {
                 continue;
             }
+            // (OCR also spaces numbers from the Japanese around them: "1970 年", "第 3 表";
+            // not a section number from its title, "3.2 有珠山…".)
+            let section_number = chars[..i].iter().all(|c| c.c.is_ascii_digit() || matches!(c.c, '.' | '-' | ' '));
+            if !section_number && ((before.is_some_and(super::is_cjk) && after.is_some_and(|a| a.is_ascii_digit())) || (before.is_some_and(|b| b.is_ascii_digit()) && after.is_some_and(super::is_cjk))) {
+                continue;
+            }
         }
         out.push(*c);
     }

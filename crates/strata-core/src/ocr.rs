@@ -54,6 +54,26 @@ pub struct PageOcr {
     pub regions: Vec<OcrRegionInfo>,
 }
 
+/// The characters of an OCR line with the comma and full stop of Japanese text as
+/// printed: the engine reads "，" and "．" as "," and "." (not after a Latin
+/// letter or a digit: "Fig.1", "3.5", "1.はじめに").
+fn japanese_stops(t: &str) -> Vec<char> {
+    let c: Vec<char> = t.chars().collect();
+    let cjk = |x: char| matches!(x as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xFF01..=0xFF60);
+    (0..c.len())
+        .map(|i| {
+            let before = i.checked_sub(1).map(|k| c[k]);
+            let after = c.get(i + 1).copied();
+            let japanese = before.is_some_and(cjk) || (after.is_some_and(cjk) && !before.is_some_and(|b| b.is_ascii_alphanumeric()));
+            match c[i] {
+                ',' if japanese => '，',
+                '.' if japanese => '．',
+                x => x,
+            }
+        })
+        .collect()
+}
+
 /// Evenly spaced character boxes along an OCR line (the engines report lines only).
 fn char_boxes(l: &OcrTextLine) -> Vec<(char, RectF)> {
     let chars: Vec<char> = l.text.chars().collect();
@@ -252,7 +272,7 @@ impl PageOcr {
                             vertical: l.vertical,
                             dir: if l.vertical { [0.0, 1.0] } else { [1.0, 0.0] },
                             joined,
-                            chars: char_boxes(l).into_iter().map(|(c, bbox)| RichChar { c, bbox, size, font: u16::MAX, bold: false, argb: 0xff000000 }).collect(),
+                            chars: char_boxes(l).into_iter().zip(japanese_stops(&l.text)).map(|((_, bbox), c)| RichChar { c, bbox, size, font: u16::MAX, bold: false, argb: 0xff000000 }).collect(),
                         }
                     })
                     .collect();
