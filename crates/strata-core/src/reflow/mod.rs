@@ -2172,8 +2172,16 @@ fn item_number(t: &str) -> Option<u32> {
     let t = t.trim_start();
     // (Numbered references, "1. R. S. J. Sparks, J. Volcanol. …", are entries of a list of
     // their own kind.)
-    if !t.starts_with(|c: char| c.is_ascii_digit()) || t.chars().filter(|c| c.is_alphabetic()).count() < 3 || refs::lead(t) != refs::Lead::No {
+    if !t.starts_with(|c: char| c.is_ascii_digit()) || t.chars().filter(|c| c.is_alphabetic()).count() < 3 {
         return None;
+    }
+    // (A weak sign of a reference, a capitalised word near a year, means nothing in a
+    // sentence of prose: "1. Distribution of 1986 craters, cinder cones and lava flows were…".)
+    let prose = t.split_whitespace().take(20).filter(|w| w.chars().count() >= 2 && w.trim_end_matches([',', '.', ';']).chars().all(|c| c.is_ascii_lowercase())).count() >= 6;
+    match refs::lead(t) {
+        refs::Lead::No => {}
+        refs::Lead::Weak if prose => {}
+        _ => return None,
     }
     refs::marker(t)
 }
