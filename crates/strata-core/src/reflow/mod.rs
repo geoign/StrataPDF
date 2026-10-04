@@ -2825,7 +2825,8 @@ fn run_layout(model: &strata_ocr::layout::LayoutModel, pages: &mut [PageData], s
             });
         }
     });
-    for (p, r) in pages.iter_mut().zip(results) {
+    // (OCR pages keep the classes their engine gave the lines.)
+    for (p, r) in pages.iter_mut().zip(results).filter(|(p, _)| !p.ocr) {
         p.layout = r.into_inner();
     }
 }
