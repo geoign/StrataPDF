@@ -281,16 +281,20 @@ impl NdlOcr {
         // A model stops at its length in characters, spaces included: a Latin line
         // (many spaces) cut off at 50 has fewer than 45 others ("…on the caldera flo").
         let full = |t: &str, limit: usize| n(t) >= limit - 5 || t.chars().count() >= limit - 2;
+        // A short reading that two models agree on is no dropped stretch (models drop
+        // different stretches): the line is set with wide spacing.
+        let mut rec30: Option<String> = None;
         if class == 3 {
             let t = self.read(&self.rec30, img)?;
             if !full(&t, 30) && !dropped(&t) {
                 return Ok(t);
             }
+            rec30 = Some(t);
         }
         let mut shorter_model: Option<String> = None;
         if class == 3 || class == 2 {
             let t = self.read(&self.rec50, img)?;
-            if !full(&t, 50) && !dropped(&t) {
+            if !full(&t, 50) && (!dropped(&t) || rec30.as_deref() == Some(t.as_str())) {
                 return Ok(t);
             }
             shorter_model = Some(t);
