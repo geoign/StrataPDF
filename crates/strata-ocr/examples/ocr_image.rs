@@ -1,4 +1,4 @@
-//! ocr_image <image> [cpu|gpu]: download models if needed, OCR an image, print lines.
+//! ocr_image <image> [cpu|gpu] [detail image]: download models if needed, OCR an image, print lines.
 use std::sync::atomic::AtomicBool;
 use strata_ocr::{models, ndl::NdlOcr, Device, OcrEngine};
 
@@ -16,9 +16,10 @@ fn main() {
     let ocr = NdlOcr::load(&set, dev).unwrap();
     eprintln!("load {:?} device={:?} charset={}", t.elapsed(), ocr.device_used, 0);
     let img = image::open(&path).unwrap().to_rgb8();
+    let detail = std::env::args().nth(3).map(|p| image::open(p).unwrap().to_rgb8());
     for round in 0..2 {
         let t = std::time::Instant::now();
-        let page = ocr.recognize(&img).unwrap();
+        let page = ocr.recognize_detailed(&img, detail.as_ref()).unwrap();
         eprintln!("round {round}: {:?}, {} lines, vertical={}", t.elapsed(), page.lines.len(), page.vertical);
         if round == 1 { println!("{}", page.text()); }
     }

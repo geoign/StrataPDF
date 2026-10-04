@@ -251,35 +251,52 @@ impl NdlOcr {
         Ok([self.read(&self.rec30, line)?, self.read(&self.rec50, line)?, self.read(&self.rec100, line)?])
     }
 
+    /// The cascade's reading for a length class, for diagnosis.
+    #[doc(hidden)]
+    pub fn read_line_class(&self, img: &RgbImage, class: f32) -> Result<String, OcrError> {
+        self.read_line(img, class)
+    }
+
     /// Cascade: short model first, escalate when the result nearly fills it;
     /// very long horizontal lines are read in two halves.
     fn read_line(&self, img: &RgbImage, class: f32) -> Result<String, OcrError> {
-        let class = class.round() as i32;
         // The line's length in characters (Japanese characters are about square and
-        // take some 80% of the line's thickness). A model for shorter lines given a
-        // longer one may drop a stretch from its middle instead of stopping at its
-        // limit: a result far shorter than that goes on to the next model.
-        // (Characters without the spaces the models put after punctuation.)
-        let n = |t: &str| t.chars().filter(|c| !c.is_whitespace()).count();
+        // take some 80% of the line's thickness, Latin ones about half of it). A model
+        // for shorter lines given a longer one may drop a stretch from its middle
+        // instead of stopping at its limit: a result far shorter than that goes on to
+        // the next model. (Characters without the spaces the models put after punctuation.)
         let (w, h) = img.dimensions();
-        let expected = w.max(h) as f32 / (w.min(h).max(1) as f32 * 0.8);
-        let dropped = |t: &str| (n(t) as f32) < expected * 0.7;
+        let squares = w.max(h) as f32 / (w.min(h).max(1) as f32 * 0.8);
+        let dropped = |t: &str| (non_space(t) as f32) < squares * if latin_text(t) { 1.6 } else { 1.0 } * 0.7;
+        // The detector's length class can call a short line long (a name set with wide
+        // spacing, which the 100-character model read backwards): a line too short for
+        // that class by its shape starts with the model for its length.
+        let mut class = class.round() as i32;
+        if squares < 22.0 {
+            class = 3;
+        } else if squares < 42.0 && class < 2 {
+            class = 2;
+        }
+        let n = non_space;
+        // A model stops at its length in characters, spaces included: a Latin line
+        // (many spaces) cut off at 50 has fewer than 45 others ("…on the caldera flo").
+        let full = |t: &str, limit: usize| n(t) >= limit - 5 || t.chars().count() >= limit - 2;
         if class == 3 {
             let t = self.read(&self.rec30, img)?;
-            if n(&t) < 25 && !dropped(&t) {
+            if !full(&t, 30) && !dropped(&t) {
                 return Ok(t);
             }
         }
         let mut shorter_model: Option<String> = None;
         if class == 3 || class == 2 {
             let t = self.read(&self.rec50, img)?;
-            if n(&t) < 45 && !dropped(&t) {
+            if !full(&t, 50) && !dropped(&t) {
                 return Ok(t);
             }
             shorter_model = Some(t);
         }
         let t = self.read(&self.rec100, img)?;
-        if n(&t) >= 98 && h < w {
+        if (n(&t) >= 98 || t.chars().count() >= 99) && h < w {
             let left = imageops::crop_imm(img, 0, 0, w / 2, h).to_image();
             let right = imageops::crop_imm(img, w / 2, 0, w - w / 2, h).to_image();
             return Ok(self.read(&self.rec100, &left)? + &self.read(&self.rec100, &right)?);
@@ -298,6 +315,95 @@ impl NdlOcr {
         }
         Ok(t)
     }
+}
+
+fn non_space(t: &str) -> usize {
+    t.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// Mostly Latin letters, digits and ASCII punctuation (an English line).
+fn latin_text(t: &str) -> bool {
+    let (mut ascii, mut other, mut letters) = (0usize, 0usize, 0usize);
+    for c in t.chars().filter(|c| !c.is_whitespace()) {
+        if c.is_ascii() {
+            ascii += 1;
+            letters += c.is_ascii_alphabetic() as usize;
+        } else {
+            other += 1;
+        }
+    }
+    letters >= 4 && ascii >= (ascii + other) * 7 / 10
+}
+
+/// A reading in which the recognizer got stuck on one character or word: a run
+/// that print does not have ("16,00000m", "GaK-55555", "路路路路", "The The The").
+/// The model tends to stop early after one, losing the rest of the line.
+pub(crate) fn degenerate(t: &str) -> bool {
+    degeneracy(t) > 0
+}
+
+/// How far a reading is stuck: characters in runs beyond what print has, and
+/// repeated words (0 for a clean reading).
+fn degeneracy(t: &str) -> usize {
+    let mut excess = 0;
+    let chars: Vec<char> = t.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let mut j = i + 1;
+        while j < chars.len() && chars[j] == c {
+            j += 1;
+        }
+        let run = j - i;
+        let limit = match c {
+            // Leaders, rules, dashes, boxes for unreadable characters.
+            '.' | '…' | '‥' | '・' | '-' | '—' | '―' | '─' | '－' | '=' | '_' | '*' | '□' | '■' | 'ー' | '〃' | ' ' | '　' => usize::MAX,
+            // (1:1000000)
+            '0' => 7,
+            c if ('\u{4E00}'..='\u{9FFF}').contains(&c) => 3,
+            c if ('\u{3040}'..='\u{30FF}').contains(&c) => 4,
+            _ => 5,
+        };
+        if run >= limit {
+            excess += run + 1 - limit;
+        }
+        // Thousands are grouped by three digits: "16,0000m" (not "1960,1961").
+        if c == ',' && i > 0 && chars[i - 1].is_ascii_digit() && run == 1 {
+            let digits = chars[j..].iter().take_while(|d| d.is_ascii_digit()).count();
+            if digits >= 4 && chars[j..j + digits].iter().all(|&d| d == '0') {
+                excess += digits - 3;
+            }
+        }
+        i = j;
+    }
+    // One word three times running.
+    let words: Vec<&str> = t.split_whitespace().collect();
+    excess + words.windows(3).filter(|w| w[0] == w[1] && w[1] == w[2] && w[0].chars().filter(|c| c.is_alphabetic()).count() >= 2).count()
+}
+
+/// Of several readings of one line, the least stuck, and among those the one
+/// closest to all the others (a reading that dropped or repeated a stretch
+/// differs from the rest there); ties go to the longer one.
+fn consensus(cands: Vec<String>) -> String {
+    let least = cands.iter().map(|t| degeneracy(t)).min().unwrap_or(0);
+    let cands: Vec<String> = cands.into_iter().filter(|t| degeneracy(t) == least).collect();
+    let chars: Vec<Vec<char>> = cands.iter().map(|t| t.chars().filter(|c| !c.is_whitespace()).collect()).collect();
+    let cost = |i: usize| -> usize { (0..chars.len()).filter(|&j| j != i).map(|j| edit_distance(&chars[i], &chars[j])).sum() };
+    let best = (0..cands.len()).min_by_key(|&i| (cost(i), usize::MAX - chars[i].len())).unwrap_or(0);
+    cands.into_iter().nth(best).unwrap_or_default()
+}
+
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + (ca != cb) as usize).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// Bilinear resize matching OpenCV's `INTER_LINEAR` (half-pixel centres, no
@@ -345,6 +451,10 @@ impl OcrEngine for NdlOcr {
     }
 
     fn recognize(&self, img: &RgbImage) -> Result<OcrPage, OcrError> {
+        self.recognize_detailed(img, None)
+    }
+
+    fn recognize_detailed(&self, img: &RgbImage, detail: Option<&RgbImage>) -> Result<OcrPage, OcrError> {
         let dets = self.detect(img)?;
         let mut regions: Vec<OcrRegion> = Vec::new();
         let mut raw_lines: Vec<([f32; 4], LineKind, f32, f32)> = Vec::new();
@@ -440,12 +550,87 @@ impl OcrEngine for NdlOcr {
                 continue;
             }
             let crop = imageops::crop_imm(img, x0, y0, x1 - x0, y1 - y0).to_image();
-            let text = self.read_line(&crop, count)?;
+            let mut text = self.read_line(&crop, count)?;
+            let vertical_line = bb[3] - bb[1] > bb[2] - bb[0];
+            // The recognizers are unsteady on some lines: a box a pixel or two off reads
+            // differently, dropping or repeating words ("found near the the deposit",
+            // "16,00000m. Scov-"), each time in another place. Such lines are read again
+            // from slightly different crops, and the reading closest to the others stands.
+            // Latin letters are a few pixels high at the page's resolution: their other
+            // crops come from the page at a higher resolution, which reads them better.
+            // (Japanese reads worse from it: its strokes alias when shrunk to the models'
+            // height.)
+            let latin = !vertical_line && latin_text(&text);
+            if latin || degenerate(&text) {
+                let mut cands = vec![std::mem::take(&mut text)];
+                let fine = detail.filter(|_| !vertical_line).map(|d| (d, d.width() as f32 / img.width() as f32));
+                // Crops: from the page or its finer rendering, grown across and along the
+                // line by some pixels of the page.
+                let crops: &[(bool, f32, f32)] = if fine.is_some() {
+                    &[(true, 0.0, 0.0), (true, 2.0, 0.0)]
+                } else {
+                    &[(false, 2.0, 0.0), (false, 3.0, 3.0), (false, 0.0, 2.0)]
+                };
+                for &(use_fine, across, along) in crops {
+                    let (gx, gy) = if vertical_line { (across, along) } else { (along, across) };
+                    let (src, s) = match fine {
+                        Some((d, s)) if use_fine => (d, s),
+                        _ => (img, 1.0),
+                    };
+                    let cx0 = ((bb[0] - gx) * s).max(0.0) as u32;
+                    let cy0 = ((bb[1] - gy) * s).max(0.0) as u32;
+                    let cx1 = (((bb[2] + gx) * s) as u32).min(src.width());
+                    let cy1 = (((bb[3] + gy) * s) as u32).min(src.height());
+                    if cx1 > cx0 && cy1 > cy0 {
+                        cands.push(self.read_line(&imageops::crop_imm(src, cx0, cy0, cx1 - cx0, cy1 - cy0).to_image(), count)?);
+                    }
+                }
+                text = consensus(cands);
+            }
+            // `STRATA_OCR_DEBUG`: each line with its length class and every model's reading.
+            if std::env::var("STRATA_OCR_DEBUG").is_ok() {
+                let each = self.read_with_each(&crop)?;
+                eprintln!("[{x0},{y0},{x1},{y1}] class={count:.0} -> {text}\n   30: {}\n   50: {}\n  100: {}", each[0], each[1], each[2]);
+            }
             if text.is_empty() {
                 continue;
             }
-            lines.push(OcrLine { bbox: bb, text, vertical: bb[3] - bb[1] > bb[2] - bb[0], kind, conf, block: line_block[li] });
+            lines.push(OcrLine { bbox: bb, text, vertical: vertical_line, kind, conf, block: line_block[li] });
         }
         Ok(OcrPage { width: img.width(), height: img.height(), lines, regions, vertical })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stuck_readings() {
+        assert!(degenerate("and TOGASHI, S. (198666666666666 of Izu-Oshima Volcano."));
+        assert!(degenerate("rose up to a height of 16,0000m. Scov-"));
+        assert!(degenerate("屈斜路路路路路路路釧斜路"));
+        assert!(degenerate("and The The The Ball"));
+        assert!(!degenerate("NAKAMURA(1960,1961)らによっ"));
+        assert!(!degenerate("Turbidites……………………………………11"));
+        assert!(!degenerate("1:1000000 の地形図"));
+        assert!(!degenerate("LBI and III lavas"));
+    }
+
+    #[test]
+    fn consensus_prefers_agreement() {
+        let c = consensus(vec![
+            "found near the the deposit.".into(),
+            "found near the top of the deposit.".into(),
+            "found near the top of the deposit".into(),
+        ]);
+        assert_eq!(c, "found near the top of the deposit.");
+        assert_eq!(consensus(vec!["16,00000m. Scov-".into(), "16,000m. Scoriaceous".into()]), "16,000m. Scoriaceous");
+    }
+
+    #[test]
+    fn latin_lines() {
+        assert!(latin_text("Geol. Surv. Japan, vol. 38(11), p. 609-630."));
+        assert!(!latin_text("1986年伊豆大島噴火は,若干の前兆的現象に続いて,"));
     }
 }

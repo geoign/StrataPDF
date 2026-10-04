@@ -335,7 +335,9 @@ pub(crate) fn ocr_page(eng: &Engine, page: u32, ocr: &dyn OcrEngine, dpi: f32) -
     let scale = dpi / 72.0;
     let (w, h, rgb) = render_page_rgb(&dl, scale, false)?;
     let img = image::RgbImage::from_raw(w, h, rgb).ok_or("bad image buffer")?;
-    let res = ocr.recognize(&img).map_err(|e| e.to_string())?;
+    // The page at twice the resolution, for lines of Latin text.
+    let detail = render_page_rgb(&dl, scale * 2.0, false).ok().and_then(|(w, h, rgb)| image::RgbImage::from_raw(w, h, rgb));
+    let res = ocr.recognize_detailed(&img, detail.as_ref()).map_err(|e| e.to_string())?;
     let to_pt = |r: [f32; 4]| RectF { x0: r[0] / scale + b.x0, y0: r[1] / scale + b.y0, x1: r[2] / scale + b.x0, y1: r[3] / scale + b.y0 };
     Ok(PageOcr {
         page,

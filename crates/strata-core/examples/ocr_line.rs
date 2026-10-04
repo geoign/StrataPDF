@@ -21,4 +21,15 @@ fn main() {
     for (name, t) in ["rec30", "rec50", "rec100"].iter().zip(ocr.read_with_each(&crop).unwrap()) {
         println!("{name} ({} chars): {t}", t.chars().count());
     }
+    for class in [1.0f32, 2.0, 3.0] {
+        println!("cascade class {class}: {}", ocr.read_line_class(&crop, class).unwrap());
+    }
+    let (w, h) = crop.dimensions();
+    let left = image::imageops::crop_imm(&crop, 0, 0, w / 2, h).to_image();
+    let right = image::imageops::crop_imm(&crop, w / 2, 0, w - w / 2, h).to_image();
+    for (name, half) in [("left", &left), ("right", &right)] {
+        for (m, t) in ["rec30", "rec50", "rec100"].iter().zip(ocr.read_with_each(half).unwrap()) {
+            println!("{name} {m}: {t}");
+        }
+    }
 }

@@ -112,4 +112,12 @@ impl From<ort::Error> for OcrError {
 pub trait OcrEngine: Send + Sync {
     fn name(&self) -> &str;
     fn recognize(&self, img: &image::RgbImage) -> Result<OcrPage, OcrError>;
+
+    /// Like [`recognize`](Self::recognize), with the same page rendered at a higher
+    /// resolution (`detail`) for lines that read better from it. Boxes are in the
+    /// pixels of `img`.
+    fn recognize_detailed(&self, img: &image::RgbImage, detail: Option<&image::RgbImage>) -> Result<OcrPage, OcrError> {
+        let _ = detail;
+        self.recognize(img)
+    }
 }
