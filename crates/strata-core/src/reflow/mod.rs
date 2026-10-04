@@ -891,7 +891,7 @@ fn majority_class(lines: &[(RichLine, Option<(usize, usize)>)]) -> Option<(usize
 /// and reference entries into a block per line) become one unit, if they share
 /// a column. A reference list taken for one region is split into its entries
 /// again by [`refs::Refs::page`].
-fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
+fn merge_regions(units: Vec<Unit>, ocr: bool) -> Vec<Unit> {
     let mut out: Vec<Unit> = Vec::with_capacity(units.len());
     for u in units {
         // Type of a clearly different size (a section label over a title) stays apart.
@@ -910,7 +910,7 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
                     && o.bbox.union(&u.bbox).width() <= o.bbox.width().max(u.bbox.width()) + size.max(os) * 4.0
                     // Nor far apart down the page (an OCR engine's block can hold a
                     // masthead and the abstract far below it).
-                    && (u.bbox.y0 - o.bbox.y1).max(o.bbox.y0 - u.bbox.y1) <= size.max(os) * 3.0
+                    && (!ocr || (u.bbox.y0 - o.bbox.y1).max(o.bbox.y0 - u.bbox.y1) <= size.max(os) * 3.0)
             })
         {
             o.bbox = o.bbox.union(&u.bbox);
@@ -1546,7 +1546,7 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
         k += 1;
         !numbers.contains(&(k - 1))
     });
-    let mut units = merge_regions(units);
+    let mut units = merge_regions(units, p.ocr);
     if !vertical {
         for u in units.iter_mut().filter(|u| u.kind == UnitKind::Text && u.class != Some(strata_ocr::layout::TABLE)) {
             u.lines = join_rows(std::mem::take(&mut u.lines));
@@ -1971,6 +1971,11 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
     (saw_digit && ((rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())) || cjk_title)).then_some(depth)
 }
 
+/// A Japanese title, perhaps opening with a symbol in Latin capitals ("A火口とその噴出物").
+fn japanese_title(t: &str) -> bool {
+    t.chars().next().is_some_and(is_cjk) || (t.starts_with(|c: char| c.is_ascii_uppercase()) && t.chars().take(4).any(is_cjk))
+}
+
 /// Section numbering at the start of a heading, with its depth: "2.1 Methods",
 /// "IV. Discussion", "1) Setting", "５．結論", "I. はじめに".
 fn heading_number(t: &str) -> Option<u8> {
@@ -2029,7 +2034,7 @@ fn heading_number(t: &str) -> Option<u8> {
             let b: String = r.chars().take_while(|c| c.is_ascii_digit()).collect();
             let rest = r[b.len()..].trim_start_matches(['.', '．']).trim_start();
             let quantity = rest.starts_with(['万', '億', '千', '百', '倍', '年', '月', '日', '時', '分', '秒', '度', '個', '回', '割', '名', '人', '本', '枚', '点', '号', '巻', '頁', '％', '℃', '週', 'カ', 'ヶ']);
-            if (1..=2).contains(&b.len()) && !quantity && rest.chars().next().is_some_and(|c| is_cjk(c) || c.is_ascii_uppercase()) {
+            if (1..=2).contains(&b.len()) && !quantity && japanese_title(rest) {
                 return Some(2);
             }
         }
@@ -2050,7 +2055,7 @@ fn heading_number(t: &str) -> Option<u8> {
         if !digits.is_empty()
             && digits.chars().count() <= 2
             && let Some(title) = after.strip_prefix(')').or_else(|| after.strip_prefix('）'))
-            && title.trim_start().chars().next().is_some_and(|c| is_cjk(c) || c.is_ascii_uppercase())
+            && japanese_title(title.trim_start())
         {
             return Some(2);
         }
@@ -4629,6 +4634,7 @@ mod tests {
         assert_eq!(heading_number("(1)A火口とその噴出物"), Some(2));
         assert_eq!(heading_number("（2）B・C火口列の配列"), Some(2));
         assert_eq!(heading_number("(22)"), None);
+        assert_eq!(heading_number("(1) Massive (ungraded) sand"), None);
         assert_eq!(heading_number("a.海嶺中軸部の単成火山"), Some(2));
         assert_eq!(heading_number("a. the first sample"), None);
         assert_eq!(heading_number("2-1地形"), Some(2));
