@@ -1968,7 +1968,12 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
     // (Also a symbol in Latin capitals that opens a Japanese title: "2.1A火口噴出物".)
     let opens_japanese = rest.chars().next().is_some_and(is_cjk) || (rest.starts_with(|c: char| c.is_ascii_uppercase()) && rest.chars().take(4).any(is_cjk));
     let cjk_title = (ended_dot || (depth >= 2 && !quantity)) && first_digits <= 2 && opens_japanese;
-    (saw_digit && ((rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())) || cjk_title)).then_some(depth)
+    // ("2. 1986 年噴火による…": a year opening a Japanese title.)
+    let year_title = {
+        let y: String = title.chars().take_while(|c| c.is_ascii_digit()).collect();
+        y.len() == 4 && title[4..].trim_start().chars().next().is_some_and(is_cjk)
+    };
+    (saw_digit && ((rest.starts_with(char::is_whitespace) && (title.chars().next().is_some_and(|c| c.is_alphabetic()) || (year_title && first_digits <= 2))) || cjk_title)).then_some(depth)
 }
 
 /// A Japanese title, perhaps opening with a symbol in Latin capitals ("A火口とその噴出物").
@@ -4630,6 +4635,7 @@ mod tests {
         assert_eq!(numbered_heading_depth("4.個々の噴火事件"), Some(1));
         assert_eq!(numbered_heading_depth("2.1A火口噴出物"), Some(2));
         assert_eq!(numbered_heading_depth("3.1986年噴火の開始まで"), Some(1));
+        assert_eq!(numbered_heading_depth("2. 1986 年噴火による火口"), Some(1));
         assert_eq!(numbered_heading_depth("3.5A at 10 V"), None);
         assert_eq!(heading_number("(1)A火口とその噴出物"), Some(2));
         assert_eq!(heading_number("（2）B・C火口列の配列"), Some(2));
