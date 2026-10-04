@@ -160,14 +160,16 @@ impl PageOcr {
             let bb = ls.iter().skip(1).fold(ls[0].bbox, |a, l| a.union(&l.bbox));
             let mut cur: Vec<&OcrTextLine> = Vec::new();
             for l in ls {
-                let (indented, prev_short) = if vertical {
+                // (A wide gap parts paragraphs too: the engine's block can hold a
+                // journal's masthead and an abstract far below it.)
+                let (indented, prev_short, gap) = if vertical {
                     let size = l.bbox.width().max(1.0);
-                    (l.bbox.y0 - bb.y0 > size * 0.6, cur.last().is_some_and(|p| p.bbox.y1 < bb.y1 - size * 1.5))
+                    (l.bbox.y0 - bb.y0 > size * 0.6, cur.last().is_some_and(|p| p.bbox.y1 < bb.y1 - size * 1.5), cur.last().is_some_and(|p| p.bbox.x0 - l.bbox.x1 > size * 1.5))
                 } else {
                     let size = l.bbox.height().max(1.0);
-                    (l.bbox.x0 - bb.x0 > size * 0.7, cur.last().is_some_and(|p| p.bbox.x1 < bb.x1 - size * 1.5))
+                    (l.bbox.x0 - bb.x0 > size * 0.7, cur.last().is_some_and(|p| p.bbox.x1 < bb.x1 - size * 1.5), cur.last().is_some_and(|p| l.bbox.y0 - p.bbox.y1 > size * 1.5))
                 };
-                if !cur.is_empty() && (indented || prev_short) {
+                if !cur.is_empty() && (indented || prev_short || gap) {
                     out.push(std::mem::take(&mut cur));
                 }
                 cur.push(l);

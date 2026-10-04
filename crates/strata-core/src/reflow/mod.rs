@@ -784,6 +784,7 @@ enum UnitKind {
     Figure,
 }
 
+#[derive(Clone)]
 struct Unit {
     kind: UnitKind,
     bbox: RectF,
@@ -907,6 +908,9 @@ fn merge_regions(units: Vec<Unit>) -> Vec<Unit> {
                     // than a few ems (ragged line ends do; a region spanning two columns
                     // would otherwise interleave them).
                     && o.bbox.union(&u.bbox).width() <= o.bbox.width().max(u.bbox.width()) + size.max(os) * 4.0
+                    // Nor far apart down the page (an OCR engine's block can hold a
+                    // masthead and the abstract far below it).
+                    && (u.bbox.y0 - o.bbox.y1).max(o.bbox.y0 - u.bbox.y1) <= size.max(os) * 3.0
             })
         {
             o.bbox = o.bbox.union(&u.bbox);
@@ -1450,10 +1454,21 @@ fn page_units(p: &PageData, body: f32, repeated: &HashMap<String, usize>, n_page
                                 return false;
                             }
                             // Lone page numbers in the margins.
-                            let margin = l.bbox.y1 < h * 0.09 || l.bbox.y0 > h * 0.91;
-                            if margin && t.trim().chars().all(|c| c.is_ascii_digit() || c == '-' || c == '—' || c.is_whitespace()) {
+                            // (Wider bands on a scan, whose margins hold "- 623 -" a little in.)
+                            let band = if p.scan { 0.12 } else { 0.09 };
+                            let margin = l.bbox.y1 < h * band || l.bbox.y0 > h * (1.0 - band);
+                            if margin && t.trim().chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '—' | '－' | '―' | '−' | 'ー' | '–') || c.is_whitespace()) {
                                 return false;
                             }
+                        }
+                        // A page number in the side margin of a scan (a page set sideways).
+                        if opts.strip_headers
+                            && p.scan
+                            && (l.bbox.x1 < w * 0.1 || l.bbox.x0 > w * 0.9)
+                            && l.chars.iter().any(|c| c.c.is_ascii_digit())
+                            && l.text().trim().chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '—' | '－' | '―' | '−' | 'ー' | '–') || c.is_whitespace())
+                        {
+                            return false;
                         }
                         // Rotated text (margin stamps such as arXiv identifiers).
                         if !l.vertical && l.dir[1].abs() > 0.5 {
@@ -1942,7 +1957,9 @@ fn numbered_heading_depth(t: &str) -> Option<u8> {
     // Japanese titles follow the number without a space ("1.はじめに", "2.1 伊豆大島"
     // as OCR reads "１．はじめに"); not a year or a quantity ("1986年", "3.5倍").
     let quantity = rest.starts_with(['万', '億', '千', '百', '倍', '年', '月', '日', '時', '分', '秒', '度', '個', '回', '割', '名', '人', '本', '枚', '点', '号', '巻', '頁', '％', '℃']);
-    let cjk_title = (ended_dot || (depth >= 2 && !quantity)) && first_digits <= 2 && rest.chars().next().is_some_and(is_cjk);
+    // (Also a symbol in Latin capitals that opens a Japanese title: "2.1A火口噴出物".)
+    let opens_japanese = rest.chars().next().is_some_and(is_cjk) || (rest.starts_with(|c: char| c.is_ascii_uppercase()) && rest.chars().take(4).any(is_cjk));
+    let cjk_title = (ended_dot || (depth >= 2 && !quantity)) && first_digits <= 2 && opens_japanese;
     (saw_digit && ((rest.starts_with(char::is_whitespace) && title.chars().next().is_some_and(|c| c.is_alphabetic())) || cjk_title)).then_some(depth)
 }
 
@@ -1956,6 +1973,17 @@ fn heading_number(t: &str) -> Option<u8> {
     let head: String = t.chars().take_while(|c| !c.is_whitespace()).collect();
     let rest = t[head.len()..].trim_start();
     let title_follows = |s: &str| s.chars().next().is_some_and(|c| c.is_alphabetic());
+    // "I.はじめに", "IV．考察": Roman numerals right before a Japanese title.
+    {
+        let r: String = t.chars().take_while(|c| matches!(c, 'I' | 'V' | 'X')).collect();
+        let after = &t[r.len()..];
+        if !r.is_empty()
+            && let Some(rest) = after.strip_prefix(['.', '．'])
+            && rest.trim_start().chars().next().is_some_and(is_cjk)
+        {
+            return Some(1);
+        }
+    }
     // Roman numerals: "IV." (not "I" as a word).
     if let Some(r) = head.strip_suffix('.')
         && !r.is_empty()
@@ -2027,6 +2055,12 @@ fn letter_spaced(t: &str) -> bool {
 }
 
 /// Front-matter headings that are headings even before the body starts.
+/// A heading of the closing matter: acknowledgements, appendices, conclusions.
+fn is_closing_heading(t: &str) -> bool {
+    let l: String = t.trim().trim_end_matches([':', '.']).to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+    ["acknowledgements", "acknowledgments", "acknowledgement", "acknowledgment", "appendix", "conclusions", "conclusion", "謝辞", "付録", "おわりに", "まとめ", "結論", "結語", "あとがき"].contains(&l.as_str())
+}
+
 fn is_front_heading(t: &str) -> bool {
     // Compared without spaces: tracked capitals come with stray ones ("SU MMARY").
     let l: String = t.trim().trim_end_matches([':', '.']).to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
@@ -3900,6 +3934,12 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
             {
                 level = Some(hl);
             }
+            // On a scan, the standing sections ("文献", "謝辞", "要旨", "Introduction") are
+            // sections whatever size OCR estimated for them.
+            let standing = p.ocr && level.is_some() && Some(i) != page_title && u.lines.len() <= 2 && (refs::is_refs_heading(&text) || is_front_heading(&text) || is_closing_heading(&text));
+            if standing {
+                level = Some(2);
+            }
             if Some(i) == page_title {
                 level = Some(1);
                 doc.title = text.trim().to_string();
@@ -4063,7 +4103,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                         s
                     });
                     doc.nodes.push(Node::Heading { level: level as u8, spans: spans.collect() });
-                    if level >= 2 && numbered.is_none() && !(p.ocr && heading_number(&text).is_some()) {
+                    if level >= 2 && numbered.is_none() && !(p.ocr && heading_number(&text).is_some()) && !standing {
                         heading_styles.push((doc.nodes.len() - 1, size, bold > 0.8, caps, italic > 0.8));
                     }
                     if u.class.is_some() || caps || Some(i) == page_title {
@@ -4072,7 +4112,7 @@ fn build(eng: &Engine, opts: &ReflowOptions, progress: &(dyn Fn(usize, usize) + 
                 }
             } else if u.class == Some(FOOTNOTE)
                 // (On OCR pages the engine's classes tell notes, not the estimated sizes.)
-                || (!vertical && !in_refs && if p.ocr { dates_line(&text) } else { is_note(u, &ordered, i, &text, body) })
+                || (!vertical && !in_refs && if p.ocr { dates_line(&text) || (note_opening(&text) && u.bbox.y0 > p.rich.height * 0.75) } else { is_note(u, &ordered, i, &text, body) })
             {
                 doc.nodes.push(Node::Footnote { spans });
             } else if is_list_marker(&text)
@@ -4500,6 +4540,8 @@ mod tests {
         assert_eq!(numbered_heading_depth("1986年伊豆大島噴火は"), None);
         assert_eq!(numbered_heading_depth("3.5倍に達した"), None);
         assert_eq!(numbered_heading_depth("4.個々の噴火事件"), Some(1));
+        assert_eq!(numbered_heading_depth("2.1A火口噴出物"), Some(2));
+        assert_eq!(numbered_heading_depth("3.5A at 10 V"), None);
         assert_eq!(heading_number("(1)A火口とその噴出物"), Some(2));
         assert_eq!(heading_number("（2）B・C火口列の配列"), Some(2));
         assert_eq!(heading_number("(22)"), None);
@@ -4513,6 +4555,8 @@ mod tests {
         assert!(panel_labels("A'"));
         assert!(!panel_labels("(a) Location map"));
         assert_eq!(heading_number("19)である。"), None);
+        assert_eq!(heading_number("I.はじめに"), Some(1));
+        assert_eq!(heading_number("IV．考察"), Some(1));
         assert!(dates_line("(Received July 13,1992; Revised June 17, 1993)"));
     }
 

@@ -829,8 +829,9 @@ impl Refs {
         let mut made: Vec<(usize, Vec<Unit>)> = Vec::new();
         let (mut found, mut at_end) = (false, false);
         for (members, ..) in groups {
-            // Entries have leads or markers: a first look before the work.
-            let hints = members.iter().flat_map(|&i| slots[i].iter().flat_map(|u| u.lines.iter())).filter(|l| marker(&l.text()).is_some() || lead(&l.text()) != Lead::No).count();
+            // Entries have leads: a first look before the work. (Markers alone are no
+            // sign: an abstract's numbered points "1) Summit eruptions…" have them.)
+            let hints = members.iter().flat_map(|&i| slots[i].iter().flat_map(|u| u.lines.iter())).filter(|l| lead(&l.text()) != Lead::No).count();
             if hints < 3 {
                 continue;
             }
@@ -843,7 +844,17 @@ impl Refs {
             }
             let group: Vec<Unit> = members.iter().filter_map(|&i| slots[i].take()).collect();
             let saved = self.clone();
+            // (Without a heading, most entries must open with authors as a reference
+            // list sets them: numbered points of an abstract do not.)
+            let authors = |units: &[Unit]| units.iter().filter(|u| u.lines.first().is_some_and(|l| lead(&l.text()) == Lead::Strong)).count() * 2 >= units.len();
+            let original = group.clone();
             match self.segment(group, cx, true) {
+                Ok((_, rebuilt, _)) if !authors(&rebuilt) => {
+                    *self = saved;
+                    for (&i, u) in members.iter().zip(original) {
+                        slots[i] = Some(u);
+                    }
+                }
                 Ok((before, rebuilt, after)) => {
                     let mut all = before;
                     all.extend(rebuilt);
