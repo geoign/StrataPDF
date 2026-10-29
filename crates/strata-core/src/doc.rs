@@ -648,11 +648,12 @@ fn scan_sizes(sh: Arc<Shared>) {
 }
 
 /// The PDF's own text is unusable: almost no characters, or mostly undecodable ones.
+/// Characters too small to see are not counted (as in [`crate::reflow::needs_ocr`]).
 fn poor_text(t: &PageText) -> bool {
     let (mut n, mut bad) = (0usize, 0usize);
     for (_, _, l) in t.lines() {
         for c in &l.chars {
-            if c.c.is_whitespace() {
+            if c.c.is_whitespace() || c.size < crate::reflow::MIN_VISIBLE_SIZE {
                 continue;
             }
             n += 1;

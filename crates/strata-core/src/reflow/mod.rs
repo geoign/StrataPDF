@@ -442,6 +442,8 @@ fn fix_accents(s: &str) -> String {
 
 /// Why a page's text layer is unusable, if it is: no text on an image-covered
 /// page (scan), or mostly undecodable characters (fonts without ToUnicode).
+/// Characters too small to see do not count: reflow drops them, so the choice of
+/// pages to OCR has to judge without them too.
 pub fn needs_ocr(p: &RichPage) -> Option<String> {
     let (mut total, mut bad) = (0usize, 0usize);
     let mut image_area = 0.0f32;
@@ -452,7 +454,7 @@ pub fn needs_ocr(p: &RichPage) -> Option<String> {
                 // scanned page, "NII-Electronic Library Service".)
                 for l in lines.iter().filter(|l| l.bbox.y0 > p.height * 0.05 && l.bbox.y1 < p.height * 0.95) {
                     for c in &l.chars {
-                        if c.c.is_whitespace() {
+                        if c.c.is_whitespace() || c.size < MIN_VISIBLE_SIZE {
                             continue;
                         }
                         total += 1;
@@ -588,15 +590,20 @@ fn content_bytes(eng: &Engine, page: i32) -> usize {
     n
 }
 
-/// Drop characters too small to see (set at size zero, all on one point: a caption
-/// that a scanned page's text layer hid this way came out a letter per line).
+/// Size in points below which a character is not seen on the page: a text layer set
+/// smaller is not where the print is. (A caption that a scanned page's text layer set
+/// at size zero, all on one point, came out a letter per line; the OCR layer of
+/// 地質ニュース 1987 has every page's text at 0.4 pt in a corner of the page.)
+pub(crate) const MIN_VISIBLE_SIZE: f32 = 1.0;
+
+/// Drop characters too small to see ([`MIN_VISIBLE_SIZE`]).
 fn drop_invisible_chars(p: &mut RichPage) {
     for b in &mut p.blocks {
         if let RichBlock::Text { lines, .. } = b {
             for l in lines.iter_mut() {
                 // (Control characters too: a BEL after every heading number of one
                 // publisher hid the numbering from the heading rules.)
-                l.chars.retain(|c| c.size >= 1.0 && (!c.c.is_control() || c.c == '\t'));
+                l.chars.retain(|c| c.size >= MIN_VISIBLE_SIZE && (!c.c.is_control() || c.c == '\t'));
             }
             lines.retain(|l| !l.chars.is_empty());
         }
