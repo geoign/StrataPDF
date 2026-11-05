@@ -88,5 +88,9 @@ Models (downloaded on first use, not included in this package)
 - NDLOCR-Lite (National Diet Library, Japan), CC BY 4.0:
   https://github.com/ndl-lab/ndlocr-lite
   The OCR pipeline of StrataPDF is a Rust port of its inference code.
+  The backbone of its layout model (deim-s-1024x1024.onnx) is a ViT-Tiny
+  distilled from DINOv3, and the National Diet Library asks users of the model
+  to comply with the DINOv3 License as well (text in DINOv3-LICENSE.md):
+  https://github.com/facebookresearch/dinov3/blob/main/LICENSE.md
 - Pix2Text MFR 1.5 (breezedeus), MIT:
   https://huggingface.co/breezedeus/pix2text-mfr-1.5

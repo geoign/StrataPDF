@@ -49,6 +49,7 @@ jobs:
 
           Copy-Item LICENSE "$out\LICENSE.txt"
           Copy-Item tools\about\NOTICES-NATIVE.txt "$out\NOTICES-NATIVE.txt"
+          Copy-Item tools\about\DINOv3-LICENSE.md "$out\DINOv3-LICENSE.md"
           cargo about generate -c tools/about/about.toml -m crates/strata-app/Cargo.toml tools/about/about.hbs -o "$out\THIRD-PARTY-NOTICES.html"
           if ($LASTEXITCODE -ne 0) { throw 'cargo about failed' }
           Copy-Item tools\install.ps1, tools\uninstall.ps1 $out

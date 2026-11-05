@@ -76,7 +76,7 @@ pub fn builtin_sets() -> Vec<ModelSet> {
     }, ModelSet {
         id: "ndlocr-lite-202604".into(),
         title: "NDLOCR-Lite（国立国会図書館）日本語・縦書き対応".into(),
-        license: "CC BY 4.0".into(),
+        license: "CC BY 4.0（レイアウトモデルは DINOv3 License も遵守）".into(),
         source: "https://github.com/ndl-lab/ndlocr-lite".into(),
         files: vec![
             ndl_file("model/deim-s-1024x1024.onnx", "deim.onnx", "c156ce0c4e704bc3bf7e4016d0a87b949cffa8b3724f4b4cc696b8284c3c7373", 40256763),
