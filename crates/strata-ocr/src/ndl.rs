@@ -258,12 +258,13 @@ impl NdlOcr {
     /// The cascade's reading for a length class, for diagnosis.
     #[doc(hidden)]
     pub fn read_line_class(&self, img: &RgbImage, class: f32) -> Result<String, OcrError> {
-        self.read_line(img, class)
+        self.read_line(img, class, false)
     }
 
     /// Cascade: short model first, escalate when the result nearly fills it;
     /// very long horizontal lines are read in two halves.
-    fn read_line(&self, img: &RgbImage, class: f32) -> Result<String, OcrError> {
+    /// `latin`: the line is known to be Latin text, see below.
+    fn read_line(&self, img: &RgbImage, class: f32, latin: bool) -> Result<String, OcrError> {
         // The line's length in characters (Japanese characters are about square and
         // take some 80% of the line's thickness, Latin ones about half of it). A model
         // for shorter lines given a longer one may drop a stretch from its middle
@@ -274,12 +275,16 @@ impl NdlOcr {
         let dropped = |t: &str| (non_space(t) as f32) < squares * if latin_text(t) { 1.6 } else { 1.0 } * 0.7;
         // The detector's length class can call a short line long (a name set with wide
         // spacing, which the 100-character model read backwards): a line too short for
-        // that class by its shape starts with the model for its length.
+        // that class by its shape starts with the model for its length. Not a Latin line:
+        // its characters are narrow, and one of 60 in the shape of 38 squares lost words
+        // to the 50-character model. The detector's class is right about those.
         let mut class = class.round() as i32;
-        if squares < 22.0 {
-            class = 3;
-        } else if squares < 42.0 && class < 2 {
-            class = 2;
+        if !latin {
+            if squares < 22.0 {
+                class = 3;
+            } else if squares < 42.0 && class < 2 {
+                class = 2;
+            }
         }
         let n = non_space;
         // A model stops at its length in characters, spaces included: a Latin line
@@ -686,7 +691,7 @@ impl OcrEngine for NdlOcr {
                 continue;
             }
             let crop = imageops::crop_imm(img, x0, y0, x1 - x0, y1 - y0).to_image();
-            let mut text = self.read_line(&crop, count)?;
+            let mut text = self.read_line(&crop, count, false)?;
             let vertical_line = bb[3] - bb[1] > bb[2] - bb[0];
             // The recognizers are unsteady on some lines: a box a pixel or two off reads
             // differently, dropping or repeating words ("found near the the deposit",
@@ -718,7 +723,7 @@ impl OcrEngine for NdlOcr {
                     let cx1 = (((bb[2] + gx) * s) as u32).min(src.width());
                     let cy1 = (((bb[3] + gy) * s) as u32).min(src.height());
                     if cx1 > cx0 && cy1 > cy0 {
-                        cands.push(self.read_line(&imageops::crop_imm(src, cx0, cy0, cx1 - cx0, cy1 - cy0).to_image(), count)?);
+                        cands.push(self.read_line(&imageops::crop_imm(src, cx0, cy0, cx1 - cx0, cy1 - cy0).to_image(), count, latin)?);
                     }
                 }
                 text = consensus(cands);
