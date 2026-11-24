@@ -326,8 +326,8 @@ impl NdlOcr {
 }
 
 /// A horizontal line box cut at blank stretches longer than 2.5 times its height
-/// (a word space or a letter-spaced name is far narrower); the pieces are trimmed
-/// to their ink. Other boxes come back as they are.
+/// (a word space is far narrower); the pieces are trimmed to their ink. Other boxes
+/// come back as they are.
 fn split_at_gaps(img: &RgbImage, b: [f32; 4]) -> Vec<[f32; 4]> {
     let (x0, y0) = (b[0].max(0.0) as u32, b[1].max(0.0) as u32);
     let (x1, y1) = ((b[2] as u32).min(img.width()), (b[3] as u32).min(img.height()));
@@ -375,6 +375,21 @@ fn split_at_gaps(img: &RgbImage, b: [f32; 4]) -> Vec<[f32; 4]> {
     if let Some(s) = start {
         pieces.push((s, last_ink + 1));
     }
+    // A single character beside such a blank is letter spacing ("謝　　　辞", "5. 考　　察",
+    // a name), not another column, unless the blank is longer still (an equation's
+    // number, a page number beside the running head).
+    let single = |p: &(usize, usize)| (p.1 - p.0) as f32 <= h as f32 * 1.6;
+    let mut joined: Vec<(usize, usize)> = Vec::new();
+    let mut last_single = false;
+    for p in pieces {
+        let cur_single = single(&p);
+        match joined.last_mut() {
+            Some(l) if (p.0 - l.1) as f32 <= h as f32 * 6.0 && (last_single || cur_single) => l.1 = p.1,
+            _ => joined.push(p),
+        }
+        last_single = cur_single;
+    }
+    let pieces = joined;
     // (Too small a piece is a speck, kept with its neighbour by not splitting.)
     if pieces.len() < 2 || pieces.iter().any(|&(a, e)| (e - a) < h as usize / 2) {
         return vec![b];
@@ -748,6 +763,27 @@ mod tests {
         ]);
         assert_eq!(c, "found near the top of the deposit.");
         assert_eq!(consensus(vec!["16,00000m. Scov-".into(), "16,000m. Scoriaceous".into()]), "16,000m. Scoriaceous");
+    }
+
+    #[test]
+    fn gaps_between_columns_not_letters() {
+        // Characters of 20 pixels (with their side bearing, 24) on a line box of 24.
+        let line = |chars: &[u32]| {
+            let mut img = RgbImage::from_pixel(1000, 24, image::Rgb([255, 255, 255]));
+            for &x in chars {
+                for (dx, y) in (0..20).flat_map(|dx| (2..22).map(move |y| (dx, y))) {
+                    img.put_pixel(x + dx, y, image::Rgb([0, 0, 0]));
+                }
+            }
+            split_at_gaps(&img, [0.0, 0.0, 1000.0, 24.0]).len()
+        };
+        // "謝　　　辞", "5. 考　　察", a name set over the line.
+        assert_eq!(line(&[100, 240]), 1);
+        assert_eq!(line(&[100, 124, 148, 240]), 1);
+        assert_eq!(line(&[100, 220, 244, 360, 480]), 1);
+        // Two headings side by side, a page number far from the running head.
+        assert_eq!(line(&[100, 124, 148, 172, 300, 324, 348, 372]), 2);
+        assert_eq!(line(&[20, 600, 624, 648, 672]), 2);
     }
 
     #[test]
