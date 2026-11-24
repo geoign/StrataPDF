@@ -19,7 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Not the newest stable: the build directory layout of cargo 1.100 breaks the build
+      # script of ort-sys 2.0.0-rc.13 (it copies DirectML.dll next to the build output).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - uses: Swatinem/rust-cache@v2
 
