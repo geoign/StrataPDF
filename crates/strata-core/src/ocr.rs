@@ -372,6 +372,11 @@ impl OcrStore {
         self.len() == 0
     }
 
+    /// Pages read by another engine, or by this one with other models.
+    pub fn outdated(&self, engine: &str) -> usize {
+        self.pages.read().values().filter(|p| p.engine != engine).count()
+    }
+
     /// Bumped whenever a page is added.
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
@@ -459,7 +464,8 @@ pub enum OcrEvent {
 }
 
 impl Document {
-    /// OCR pages on a background thread. Pages already in the store are skipped.
+    /// OCR pages on a background thread. Pages this engine has already read are
+    /// skipped; pages read by another one (older models) are read again.
     pub fn run_ocr(&self, scope: OcrScope, engine: Arc<dyn OcrEngine>, cancel: Arc<AtomicBool>) -> Receiver<OcrEvent> {
         let (tx, rx) = unbounded();
         let path = self.info().path.clone();
@@ -479,7 +485,7 @@ impl Document {
                     }
                 };
                 let pages: Vec<(u32, bool)> = (0..n as u32)
-                    .filter(|&p| store.get(p).is_none())
+                    .filter(|&p| store.get(p).is_none_or(|r| r.engine != engine.name()))
                     .filter_map(|p| ocr_wanted(&eng, p, scope).map(|forced| (p, forced)))
                     .collect();
                 let total = pages.len();

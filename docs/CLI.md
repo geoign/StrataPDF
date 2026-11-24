@@ -82,7 +82,8 @@ OCR の文字も置き換える。`all` はすべてのページを読む。OCR 
 スキャンページに他のプログラムが付けた OCR の文字層があり、その品質が低いと判定したときは、
 警告が `--ocr scans` を勧める（文字層は置き換えない限りそのまま使う）。
 ただし、アプリで OCR 済みのファイルなら、その結果を `--ocr off` でも使う。OCR の結果はファイルごとに
-`%LOCALAPPDATA%\StrataPDF\data\ocr` に保存され、アプリと CLI で共有する。
+`%LOCALAPPDATA%\StrataPDF\data\ocr` に保存され、アプリと CLI で共有する。`--ocr` を付けて実行しても、
+今のモデルで読み終えているページは読み直さない。範囲に入るページのうち、前の版のモデルで読んだものは読み直す。
 
 OCR と `--latex` のモデルは、初めて使うときに GitHub と Hugging Face から
 `%LOCALAPPDATA%\StrataPDF\data\models` に取得する。取得中は標準エラー出力に大きさを示す。

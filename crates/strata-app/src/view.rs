@@ -1023,6 +1023,10 @@ impl DocView {
             if n > 0 {
                 ui.separator();
                 ui.weak(format!("OCR 済み {n} ページ（キャッシュ済み）"));
+                let old = self.doc.ocr_store().outdated(strata_ocr::ndl::ENGINE);
+                if old > 0 {
+                    ui.weak(format!("うち {old} ページは旧バージョンの OCR")).on_hover_text("上のメニューでもう一度 OCR すると、新しいモデルで読み直す");
+                }
                 if ui.add_enabled(self.doc.info().is_pdf && self.save_job.is_none(), egui::Button::new("検索可能な PDF として保存…"))
                     .on_hover_text("OCR 結果を透明なテキスト層として埋め込む。暗号は外れます")
                     .clicked()
