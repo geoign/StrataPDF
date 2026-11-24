@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-strata-core = { version = "0.2.7", path = "../strata-core" }
+strata-core = { version = "0.2.8", path = "../strata-core" }
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 log.workspace = true
