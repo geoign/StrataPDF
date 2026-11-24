@@ -20,6 +20,10 @@ use crate::models::ModelSet;
 use crate::order;
 use crate::{Device, LineKind, OcrEngine, OcrError, OcrLine, OcrPage, OcrRegion, RegionKind};
 
+/// The engine's name with the version of its models, recorded with every page read:
+/// pages read by another version can be told (and are read again when asked for).
+pub const ENGINE: &str = "NDLOCR-Lite 2.0.0";
+
 const DET_CONF: f32 = 0.25;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
@@ -379,6 +383,22 @@ fn split_at_gaps(img: &RgbImage, b: [f32; 4]) -> Vec<[f32; 4]> {
     pieces.iter().map(|&(a, e)| [(x0 as usize + a.saturating_sub(pad)) as f32, b[1], (x0 as usize + e + pad).min(x1 as usize) as f32, b[3]]).collect()
 }
 
+/// A reading without the ASCII spaces beside "、" and "。", which the recognizers put
+/// there for the blank half of the character (NDLOCR-Lite 2 drops them as well). Not
+/// done before the cascade is through: a model's limit counts them.
+fn without_spaces_at_stops(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    for c in t.chars() {
+        if matches!(c, '、' | '。') {
+            out.truncate(out.trim_end_matches(' ').len());
+        }
+        if c != ' ' || !out.ends_with(['、', '。']) {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn non_space(t: &str) -> usize {
     t.chars().filter(|c| !c.is_whitespace()).count()
 }
@@ -507,9 +527,27 @@ fn overlap(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     w * h / area(a).min(area(b))
 }
 
+/// For each region the largest text block that holds it (90% of its area), or itself.
+fn outer_blocks(regions: &[OcrRegion]) -> Vec<usize> {
+    let area = |r: &[f32; 4]| (r[2] - r[0]) * (r[3] - r[1]);
+    let common = |a: &[f32; 4], b: &[f32; 4]| (a[2].min(b[2]) - a[0].max(b[0])).max(0.0) * (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    (0..regions.len())
+        .map(|i| {
+            let r = &regions[i];
+            if r.kind != RegionKind::TextBlock {
+                return i;
+            }
+            (0..regions.len())
+                .filter(|&j| regions[j].kind == RegionKind::TextBlock && area(&regions[j].bbox) > area(&r.bbox) && common(&regions[j].bbox, &r.bbox) >= area(&r.bbox) * 0.9)
+                .max_by(|&j, &k| area(&regions[j].bbox).total_cmp(&area(&regions[k].bbox)))
+                .unwrap_or(i)
+        })
+        .collect()
+}
+
 impl OcrEngine for NdlOcr {
     fn name(&self) -> &str {
-        "NDLOCR-Lite"
+        ENGINE
     }
 
     fn recognize(&self, img: &RgbImage) -> Result<OcrPage, OcrError> {
@@ -574,14 +612,31 @@ impl OcrEngine for NdlOcr {
                 area(regions[a].bbox).total_cmp(&area(regions[b].bbox))
             })
         };
+        let line_block: Vec<Option<usize>> = raw_lines.iter().map(|l| in_block(&l.0)).collect();
+        // A block inside a larger one (a heading in its section: the detector often gives
+        // both) is ordered line by line with the larger one, unless their lines lie side by
+        // side (columns). Ordered as a box of its own, overlapping the other, it came
+        // behind all of it. (NDLOCR-Lite 2 drops such a block; here it still parts the
+        // heading from the text.)
+        let outer = outer_blocks(&regions);
+        let beside = |a: &[f32; 4], b: &[f32; 4]| {
+            let (s, e) = if vertical { (0, 2) } else { (1, 3) };
+            a[e].min(b[e]) - a[s].max(b[s]) > (a[e] - a[s]).min(b[e] - b[s]) * 0.5
+        };
+        let mut unit: Vec<usize> = (0..regions.len()).collect();
+        for bi in (0..regions.len()).filter(|&bi| outer[bi] != bi) {
+            let columns = raw_lines.iter().zip(&line_block).filter(|(_, b)| **b == Some(bi)).any(|(l, _)| {
+                raw_lines.iter().zip(&line_block).any(|(m, b)| b.is_some_and(|b| b != bi && outer[b] == outer[bi]) && beside(&l.0, &m.0))
+            });
+            if !columns {
+                unit[bi] = outer[bi];
+            }
+        }
         // Units for ordering: each text block with its lines, and lone lines.
         let mut groups: Vec<([f32; 4], Vec<usize>)> = Vec::new();
         let mut block_group: std::collections::HashMap<usize, usize> = Default::default();
-        let mut line_block = Vec::with_capacity(raw_lines.len());
         for (li, l) in raw_lines.iter().enumerate() {
-            let b = in_block(&l.0);
-            line_block.push(b);
-            match b {
+            match line_block[li].map(|b| unit[b]) {
                 Some(bi) => {
                     let gi = *block_group.entry(bi).or_insert_with(|| {
                         groups.push((regions[bi].bbox, Vec::new()));
@@ -653,6 +708,7 @@ impl OcrEngine for NdlOcr {
                 }
                 text = consensus(cands);
             }
+            text = without_spaces_at_stops(&text);
             // `STRATA_OCR_DEBUG`: each line with its length class and every model's reading.
             if std::env::var("STRATA_OCR_DEBUG").is_ok() {
                 let each = self.read_with_each(&crop)?;
@@ -692,6 +748,25 @@ mod tests {
         ]);
         assert_eq!(c, "found near the top of the deposit.");
         assert_eq!(consensus(vec!["16,00000m. Scov-".into(), "16,000m. Scoriaceous".into()]), "16,000m. Scoriaceous");
+    }
+
+    #[test]
+    fn nested_regions() {
+        let r = |bbox, kind| OcrRegion { bbox, kind, conf: 0.5 };
+        // (Vertical writing on one page: the block of the page, and one around its first line.)
+        let outer = outer_blocks(&[
+            r([485.0, 19.0, 545.0, 357.0], RegionKind::TextBlock),
+            r([16.0, 10.0, 545.0, 791.0], RegionKind::TextBlock),
+            r([100.0, 100.0, 200.0, 200.0], RegionKind::Figure),
+            r([500.0, 700.0, 700.0, 900.0], RegionKind::TextBlock),
+        ]);
+        assert_eq!(outer, vec![1, 1, 2, 3]);
+    }
+
+    #[test]
+    fn spaces_at_stops() {
+        assert_eq!(without_spaces_at_stops("噴火 、 降灰。  また 、"), "噴火、降灰。また、");
+        assert_eq!(without_spaces_at_stops("Fig. 1, 2 と 3"), "Fig. 1, 2 と 3");
     }
 
     #[test]

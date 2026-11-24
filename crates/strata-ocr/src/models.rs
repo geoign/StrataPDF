@@ -45,7 +45,8 @@ impl ModelSet {
     }
 }
 
-const NDL_COMMIT: &str = "636d1cfeb1331f89f4048f416e49e23a09a714b5";
+/// NDLOCR-Lite 2.0.0.
+const NDL_COMMIT: &str = "1f3adc7af311af1ce4cbbd4d9089f30781d01313";
 
 fn ndl_file(path: &str, name: &str, sha256: &str, size: u64) -> ModelFile {
     ModelFile {
@@ -74,26 +75,28 @@ pub fn builtin_sets() -> Vec<ModelSet> {
             mfr_file("tokenizer.json", "4ffbeb2143e6a38324bb6111b7a8109530d38a076a8439aa5777535f0a32758a", 113168),
         ],
     }, ModelSet {
-        id: "ndlocr-lite-202604".into(),
-        title: "NDLOCR-Lite（国立国会図書館）日本語・縦書き対応".into(),
+        // (Another version needs another id: installed files are told by their sizes,
+        // and the 50-character model of 2.0.0 is as large as the one before it.)
+        id: "ndlocr-lite-2.0.0".into(),
+        title: "NDLOCR-Lite ver.2（国立国会図書館）日本語・縦書き対応".into(),
         license: "CC BY 4.0（レイアウトモデルは DINOv3 License も遵守）".into(),
         source: "https://github.com/ndl-lab/ndlocr-lite".into(),
         files: vec![
-            ndl_file("model/deim-s-1024x1024.onnx", "deim.onnx", "c156ce0c4e704bc3bf7e4016d0a87b949cffa8b3724f4b4cc696b8284c3c7373", 40256763),
+            ndl_file("model/deim-s-1024x1024-261124.onnx", "deim.onnx", "f9a41c8453dd687f370bee199fd6d47ecf583cc14f1d839a0b416db39b356e8c", 40280965),
             ndl_file(
-                "model/parseq-ndl-24x256-30-tiny-189epoch-tegaki3-r8data-202604.onnx",
+                "model/parseq-ndl-24x256-30-tiny-499epoch-261124.onnx",
                 "parseq30.onnx",
-                "9e651bae4c1a4d5254da1127e86e82e21ef62d5339b37e62d4a3d3d30831772d",
-                36457393,
+                "063ec5b3201bce79d56c3ad73b5726cf76ec6a82f42e11a89466ae683755296c",
+                36738502,
             ),
             ndl_file(
-                "model/parseq-ndl-24x384-50-tiny-300epoch-tegaki3-r8data-202604.onnx",
+                "model/parseq-ndl-24x384-50-tiny-278epoch-261124.onnx",
                 "parseq50.onnx",
-                "49cea9db4552f19eb05c8ee202fcf74714977749b2f4c9376b127fde41b07a99",
+                "d3dd9e7733aeff5c9f50687c7da6e8d01915a0bf07cfbefe1d9ac58241c61471",
                 37808553,
             ),
             ndl_file(
-                "model/parseq-ndl-24x768-100-tiny-153epoch-tegaki3-r8data-202604.onnx",
+                "model/parseq-ndl-24x768-100-tiny-153epoch-261124.onnx",
                 "parseq100.onnx",
                 "06462b0dbd5b0b8508545c8c3d485cf20dbf4ffa652fe145e69c9e7457080602",
                 42588187,
