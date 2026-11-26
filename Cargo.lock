@@ -4814,6 +4814,7 @@ dependencies = [
  "egui_dock",
  "egui_extras",
  "env_logger",
+ "image",
  "log",
  "mupdf",
  "parking_lot",

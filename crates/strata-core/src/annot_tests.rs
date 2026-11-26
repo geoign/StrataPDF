@@ -224,3 +224,17 @@ fn saved_and_reopened() {
     assert!(l.iter().any(|a| a.spec.kind == AnnotKind::Stamp && a.spec.image > 0 && (a.spec.rect.width() - spec.rect.width()).abs() < 0.01));
     assert!(shown_lines(&back).iter().any(|(t, _)| t == "保存して開き直す"));
 }
+
+#[test]
+fn png_transparency_is_kept() {
+    // Red on the left, transparent on the right.
+    let mut pm = mupdf::Pixmap::new_with_w_h(&Colorspace::device_rgb(), 2, 1, true).unwrap();
+    pm.samples_mut().copy_from_slice(&[255, 0, 0, 255, 0, 0, 0, 0]);
+    let mut png = Vec::new();
+    pm.write_to(&mut png, mupdf::pixmap::ImageFormat::PNG).unwrap();
+    let mut pdf = blank(0);
+    let place = ImagePlace { center: [0.0, 0.0], fit: Some(RectF { x0: 100.0, y0: 100.0, x1: 300.0, y1: 200.0 }) };
+    create_image(&mut pdf, 0, &png, place, "").unwrap();
+    assert!(near(pixel(&pdf, 120, 150), [255, 0, 0]), "{:?}", pixel(&pdf, 120, 150));
+    assert!(near(pixel(&pdf, 280, 150), [255, 255, 255]), "{:?}", pixel(&pdf, 280, 150));
+}

@@ -1247,7 +1247,7 @@ impl DocView {
                 ui.separator();
                 self.ocr_menu(ui);
                 self.table_toolbar_button(ui);
-                if ui.selectable_label(self.annot.bar, "注釈").on_hover_text("注釈ツール").clicked() {
+                if ui.selectable_label(self.annot.bar, "注釈・編集").on_hover_text("文字・付箋・画像・図形・マーカーを書き込む (Ctrl+V で画像を貼り付け)").clicked() {
                     self.annot.bar = !self.annot.bar;
                     if !self.annot.bar {
                         self.annot.tool = annot_ui::Tool::Select;
@@ -1717,6 +1717,9 @@ impl DocView {
             }
             resp.context_menu(|ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                if let Some((page, x, y)) = self.menu_at {
+                    self.edit_context_menu(ui, page, x, y);
+                }
                 // The image under the click (the topmost one); the list arrives a frame or two later.
                 if let Some((page, x, y)) = self.menu_at
                     && let Some(list) = self.page_images(page)
