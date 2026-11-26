@@ -51,6 +51,15 @@
 - v0.2.2 の後：変換を `StrataPDF.exe --headless` に移し、`StrataPDF-cli.exe` は起動して待つだけの窓口にした
   （61 MB → 約 230 KB。MuPDF・ONNX Runtime・モデルを二重に配らない）
 
+## 脆弱性の修正（2026-11-26、v0.2.10）
+
+- 同梱の MuPDF 1.27.2 に、本家の修正を移した（CVE-2026-3308：細工した PDF の画像を展開するときに
+  ヒープの範囲外へ書き込む。CVE-2026-112036：署名ロックの情報の二重解放）。mupdf-sys のリリースが
+  まだ MuPDF 1.28 を含まないので、修正した mupdf-sys を github.com/geoign/mupdf-rs の
+  `strata/v0.8.0-security` に置き、`[patch.crates-io]` で使う。詳細は `vendor/PATCHES.md`
+- 更新確認の通信に使う rustls・rustls-webpki・webpki-roots（emSign の中間証明書の不信任を含む）と url を修正版に上げた
+- 修正の前後で 255 ページの描画が一致することを確かめた
+
 ## 簡単な編集（2026-11-26）
 
 - 「注釈・編集」バーの「文字」：クリックした所にその場で文字を打つ（Ctrl+Enter かほかの所のクリックで確定、Esc で取り消し）。
@@ -133,6 +142,9 @@ OCR は `OcrEngine` トレイトで抽象化する。M3 ではローカルのエ
 - [ ] 書き込んだ文字のフォント埋め込み（現在は非埋め込みのゴシック・明朝で、字形は閲覧する側のフォントになる）。
       埋め込むならサブセット化が必須（`pdf_subset_fonts` は差分保存と相性が悪い）
 - [ ] 画像ファイルをページへドラッグ＆ドロップして置く（現在のドロップは文書として開く）
+- [ ] MuPDF 1.28 以降への版上げ（mupdf-sys のリリース待ち。来たら `[patch]` の mupdf-sys を外し、
+      `vendor/mupdf-include`・`features.c`・テキスト表示の出力を確かめる）
+- [ ] 依存ライブラリの脆弱性の見張り（Dependabot、cargo-deny、MuPDF の新版と CVE の週次確認）
 - [ ] ジャーナル機能の Rust ラッパーを vendor に追加し、MuPDF 側の取り消しへ移行する検討
 - [ ] 表示位置の復元（ファイルごとに最後のページとズームを記憶）
 - [ ] ページの表示回転（90°単位）。`TileKey` に回転を足し、描画の変換行列に組み込む

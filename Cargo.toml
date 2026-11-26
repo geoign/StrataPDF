@@ -28,3 +28,6 @@ debug = "line-tables-only"
 # Local patches to upstream crates; see vendor/PATCHES.md.
 [patch.crates-io]
 mupdf = { path = "vendor/mupdf" }
+# MuPDF 1.27.2 with security fixes backported (CVE-2026-3308, CVE-2026-112036);
+# see vendor/PATCHES.md. Drop this once a mupdf-sys release carries MuPDF 1.28 or later.
+mupdf-sys = { git = "https://github.com/geoign/mupdf-rs", rev = "682584e80e5af32bd9f4e33bedade7e947343960" }
