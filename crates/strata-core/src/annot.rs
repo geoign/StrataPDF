@@ -2,11 +2,12 @@
 //! thread, with undo/redo, and saving (incremental or full, optionally without
 //! encryption). Coordinates are MuPDF page space (points, y down).
 
-use mupdf::pdf::{LineEndingStyle, PdfAnnotation, PdfAnnotationType, PdfDocument, PdfPage};
+use mupdf::pdf::{Intent, LineEndingStyle, PdfAnnotation, PdfAnnotationType, PdfDocument, PdfPage};
 use mupdf::color::AnnotationColor;
 use mupdf::{Point, Quad, Rect};
 use serde::{Deserialize, Serialize};
 
+use crate::appearance::{self, PageGeom, PAD};
 use crate::geom::{QuadF, RectF};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -22,8 +23,35 @@ pub enum AnnotKind {
     FreeText,
     /// Sticky note.
     Text,
+    /// A stamp showing an image.
+    Stamp,
     /// Any other type; shown and deletable but not editable here.
     Other(String),
+}
+
+/// Typeface of free text: Helvetica with Gothic, or Times with Mincho.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextFont {
+    #[default]
+    Sans,
+    Serif,
+}
+
+impl TextFont {
+    pub fn label(self) -> &'static str {
+        match self {
+            TextFont::Sans => "ゴシック",
+            TextFont::Serif => "明朝",
+        }
+    }
+
+    /// Font name in the default appearance string, for readers that redraw the text.
+    fn da_name(self) -> &'static str {
+        match self {
+            TextFont::Sans => "Helv",
+            TextFont::Serif => "TiRo",
+        }
+    }
 }
 
 impl AnnotKind {
@@ -39,12 +67,18 @@ impl AnnotKind {
             AnnotKind::Ink => "手書き",
             AnnotKind::FreeText => "テキスト",
             AnnotKind::Text => "付箋",
+            AnnotKind::Stamp => "画像",
             AnnotKind::Other(s) => s,
         }
     }
 
     pub fn is_markup(&self) -> bool {
         matches!(self, AnnotKind::Highlight | AnnotKind::Underline | AnnotKind::StrikeOut | AnnotKind::Squiggly)
+    }
+
+    /// Kinds whose rectangle can be resized.
+    pub fn is_resizable(&self) -> bool {
+        matches!(self, AnnotKind::Square | AnnotKind::Circle | AnnotKind::FreeText | AnnotKind::Stamp)
     }
 
     fn pdf_type(&self) -> Option<PdfAnnotationType> {
@@ -59,6 +93,7 @@ impl AnnotKind {
             AnnotKind::Ink => PdfAnnotationType::Ink,
             AnnotKind::FreeText => PdfAnnotationType::FreeText,
             AnnotKind::Text => PdfAnnotationType::Text,
+            AnnotKind::Stamp => PdfAnnotationType::Stamp,
             AnnotKind::Other(_) => return None,
         })
     }
@@ -75,6 +110,7 @@ impl AnnotKind {
             PdfAnnotationType::Ink => AnnotKind::Ink,
             PdfAnnotationType::FreeText => AnnotKind::FreeText,
             PdfAnnotationType::Text => AnnotKind::Text,
+            PdfAnnotationType::Stamp => AnnotKind::Stamp,
             other => AnnotKind::Other(format!("{other:?}")),
         }
     }
@@ -97,6 +133,17 @@ pub struct AnnotSpec {
     pub contents: String,
     pub font_size: f32,
     pub author: String,
+    /// Free text: typeface.
+    #[serde(default)]
+    pub font: TextFont,
+    /// Free text: a click-to-type box (intent FreeTextTypeWriter) whose width
+    /// follows the text, up to the right edge of the page. Otherwise the width
+    /// is fixed and the text wraps. The height always grows to fit the text.
+    #[serde(default)]
+    pub typewriter: bool,
+    /// Image stamp: object number of the image XObject.
+    #[serde(default)]
+    pub image: i32,
 }
 
 impl AnnotSpec {
@@ -115,6 +162,9 @@ impl AnnotSpec {
             contents: String::new(),
             font_size: 12.0,
             author: std::env::var("USERNAME").unwrap_or_default(),
+            font: TextFont::Sans,
+            typewriter: false,
+            image: 0,
         }
     }
 
@@ -176,8 +226,17 @@ fn quad(q: &QuadF) -> Quad {
 }
 
 pub(crate) fn read_spec(a: &PdfAnnotation) -> Result<AnnotSpec, mupdf::Error> {
-    let kind = AnnotKind::from_pdf(a.r#type()?);
+    let mut kind = AnnotKind::from_pdf(a.r#type()?);
+    let mut image = 0;
+    if kind == AnnotKind::Stamp {
+        // Rubber stamps and drawn stamps can only be shown and deleted.
+        match appearance::stamp_image(a) {
+            Some(n) => image = n,
+            None => kind = AnnotKind::Other("Stamp".into()),
+        }
+    }
     let mut s = AnnotSpec::new(kind.clone(), from_color(a.color()?).unwrap_or([0.0, 0.0, 0.0]));
+    s.image = image;
     s.author = a.author()?.unwrap_or_default().to_string();
     s.rect = a.rect().map(RectF::from).unwrap_or_default();
     s.fill = from_color(a.interior_color().ok().flatten());
@@ -198,22 +257,52 @@ pub(crate) fn read_spec(a: &PdfAnnotation) -> Result<AnnotSpec, mupdf::Error> {
     if kind == AnnotKind::Ink {
         s.ink = a.ink_list().unwrap_or_default().into_iter().map(|st| st.into_iter().map(|p| [p.x, p.y]).collect()).collect();
     }
-    if kind == AnnotKind::FreeText
-        && let Ok(Some(da)) = a.default_appearance()
-    {
-        s.font_size = da.size;
-        if let Some(c) = from_color(da.color) {
-            s.color = c;
+    if kind == AnnotKind::FreeText {
+        // The colour of a free text annotation is its background.
+        s.fill = from_color(a.color()?);
+        s.color = [0.0, 0.0, 0.0];
+        if let Ok(Some(da)) = a.default_appearance() {
+            s.font_size = da.size;
+            if let Some(c) = from_color(da.color) {
+                s.color = c;
+            }
+            let f = da.font_name.to_ascii_lowercase();
+            if f.starts_with("tiro") || f.starts_with("times") || f.contains("mincho") || f.contains("serif") {
+                s.font = TextFont::Serif;
+            }
         }
+        let it = a.object().get_dict("IT")?.and_then(|n| n.as_name().ok());
+        s.typewriter = it.as_deref() == Some(b"FreeTextTypeWriter".as_slice());
     }
     Ok(s)
 }
 
-fn apply_spec(a: &mut PdfAnnotation, s: &AnnotSpec) -> Result<(), mupdf::Error> {
+/// Fit a free text box to its text: the width follows the text for a
+/// typewriter box (up to the page edge) and is kept otherwise; the height fits
+/// the lines, and a fixed box never shrinks below the height it was given.
+fn fit_free_text(s: &AnnotSpec, g: &PageGeom) -> (RectF, Vec<appearance::Line>) {
+    let size = s.font_size.max(1.0);
+    let x0 = s.rect.x0;
+    let y0 = s.rect.y0;
+    let min_w = size + 2.0 * PAD;
+    let (lines, w) = if s.typewriter {
+        let cap = (g.width - x0).max(min_w);
+        let lines = appearance::layout(&s.contents, s.font, size, cap - 2.0 * PAD);
+        let (w, _) = appearance::text_size(&lines, size);
+        (lines, w.clamp(min_w.min(cap), cap))
+    } else {
+        let w = s.rect.width().max(min_w);
+        (appearance::layout(&s.contents, s.font, size, w - 2.0 * PAD), w)
+    };
+    let (_, need) = appearance::text_size(&lines, size);
+    let h = if s.typewriter { need } else { need.max(s.rect.height()) };
+    (RectF { x0, y0, x1: x0 + w, y1: y0 + h }, lines)
+}
+
+fn apply_spec(pdf: &mut PdfDocument, page: &PdfPage, a: &mut PdfAnnotation, s: &AnnotSpec) -> Result<(), mupdf::Error> {
     a.set_author(&s.author)?;
-    if s.opacity < 1.0 {
-        a.set_opacity(s.opacity)?;
-    }
+    // Always set, so that it can go back to opaque.
+    a.set_opacity(s.opacity.clamp(0.0, 1.0))?;
     match &s.kind {
         AnnotKind::Highlight | AnnotKind::Underline | AnnotKind::StrikeOut | AnnotKind::Squiggly => {
             a.set_color(rgb(s.color))?;
@@ -244,19 +333,52 @@ fn apply_spec(a: &mut PdfAnnotation, s: &AnnotSpec) -> Result<(), mupdf::Error> 
             a.set_ink_list(strokes)?;
         }
         AnnotKind::FreeText => {
-            a.set_rect(rect(s.rect))?;
-            a.set_default_appearance("Helv", s.font_size, Some(rgb(s.color)))?;
+            a.set_default_appearance(s.font.da_name(), s.font_size, Some(rgb(s.color)))?;
             a.set_border_width(0.0)?;
+            match s.fill {
+                Some(f) => a.set_color(rgb(f))?,
+                None => {
+                    a.object().dict_delete("C")?;
+                }
+            }
+            a.set_intent(if s.typewriter { Intent::FreetextTypewriter } else { Intent::Default })?;
         }
         AnnotKind::Text => {
             // Sticky notes are anchored by their top-left corner.
             a.set_rect(Rect { x0: s.rect.x0, y0: s.rect.y0, x1: s.rect.x0 + 20.0, y1: s.rect.y0 + 20.0 })?;
             a.set_color(rgb(s.color))?;
         }
+        AnnotKind::Stamp => {
+            if s.image <= 0 {
+                return Err(mupdf::Error::InvalidArgument("stamp without an image".into()));
+            }
+            // With the image already in the appearance, MuPDF's synthesis draws
+            // the image; without it, a "Draft" rubber stamp that reshapes the rectangle.
+            appearance::write_stamp(pdf, a, s, &PageGeom::of(page)?)?;
+            a.set_rect(rect(s.rect))?;
+        }
         AnnotKind::Other(_) => {}
     }
     a.set_contents(&s.contents)?;
-    a.update()?;
+    match &s.kind {
+        AnnotKind::FreeText => {
+            // MuPDF draws Japanese only in Mincho and ignores page rotation:
+            // after its synthesis, the appearance is replaced by ours.
+            let g = PageGeom::of(page)?;
+            let (r, lines) = fit_free_text(s, &g);
+            a.set_rect(rect(r))?;
+            a.update()?;
+            appearance::write_free_text(pdf, a, s, &lines, r.width(), r.height(), &g)?;
+        }
+        AnnotKind::Stamp => {
+            a.update()?;
+            // MuPDF's image appearance ignores page rotation.
+            appearance::write_stamp(pdf, a, s, &PageGeom::of(page)?)?;
+        }
+        _ => {
+            a.update()?;
+        }
+    }
     Ok(())
 }
 
@@ -283,10 +405,60 @@ pub(crate) fn create(pdf: &mut PdfDocument, page: u32, s: &AnnotSpec) -> Result<
     let t = s.kind.pdf_type().ok_or(mupdf::Error::InvalidArgument("unsupported annotation".into()))?;
     let mut p = pdf.load_pdf_page(page as i32)?;
     let mut a = p.create_annotation(t)?;
-    apply_spec(&mut a, s)?;
+    if let Err(e) = apply_spec(pdf, &p, &mut a, s) {
+        // Leave no half-made annotation behind.
+        let _ = p.delete_annotation(a);
+        return Err(e);
+    }
     let id = a.xref()?;
     p.update()?;
     Ok(id)
+}
+
+/// Where to put a new image: centred on a point at its natural size (at most
+/// 60% of the page each way), or fitted into a box the user drew.
+#[derive(Clone, Copy, Debug)]
+pub struct ImagePlace {
+    pub center: [f32; 2],
+    pub fit: Option<RectF>,
+}
+
+/// Add an image file's bytes to the document and place it on a page as a
+/// stamp annotation. Returns the annotation id and its properties.
+pub(crate) fn create_image(pdf: &mut PdfDocument, page: u32, data: &[u8], place: ImagePlace, author: &str) -> Result<(i32, AnnotSpec), mupdf::Error> {
+    let img = mupdf::Image::from_bytes(data)?;
+    let (pw, ph) = (img.width() as f32, img.height() as f32);
+    if pw < 1.0 || ph < 1.0 {
+        return Err(mupdf::Error::InvalidArgument("empty image".into()));
+    }
+    let (xres, yres) = img.resolution();
+    let dpi = |r: i32| if (10..=10000).contains(&r) { r as f32 } else { 96.0 };
+    let (nw, nh) = (pw * 72.0 / dpi(xres), ph * 72.0 / dpi(yres));
+    let g = PageGeom::of(&pdf.load_pdf_page(page as i32)?)?;
+    let r = match place.fit.filter(|b| b.width() > 4.0 && b.height() > 4.0) {
+        Some(b) => {
+            let k = (b.width() / nw).min(b.height() / nh);
+            let (w, h) = (nw * k, nh * k);
+            let (cx, cy) = ((b.x0 + b.x1) * 0.5, (b.y0 + b.y1) * 0.5);
+            RectF { x0: cx - w * 0.5, y0: cy - h * 0.5, x1: cx + w * 0.5, y1: cy + h * 0.5 }
+        }
+        None => {
+            let k = (0.6 * g.width / nw).min(0.6 * g.height / nh).min(1.0);
+            let (w, h) = (nw * k, nh * k);
+            let x0 = (place.center[0] - w * 0.5).clamp(0.0, (g.width - w).max(0.0));
+            let y0 = (place.center[1] - h * 0.5).clamp(0.0, (g.height - h).max(0.0));
+            RectF { x0, y0, x1: x0 + w, y1: y0 + h }
+        }
+    };
+    let obj = pdf.add_image(&img)?;
+    let mut spec = AnnotSpec::new(AnnotKind::Stamp, [0.0, 0.0, 0.0]);
+    spec.rect = r;
+    spec.image = obj.as_indirect()?;
+    if !author.is_empty() {
+        spec.author = author.into();
+    }
+    let id = create(pdf, page, &spec)?;
+    Ok((id, spec))
 }
 
 pub(crate) fn delete(pdf: &mut PdfDocument, page: u32, id: i32) -> Result<AnnotSpec, mupdf::Error> {
@@ -313,7 +485,7 @@ pub(crate) fn modify(pdf: &mut PdfDocument, page: u32, id: i32, s: &AnnotSpec) -
     if s.kind == AnnotKind::Ink {
         a.clear_ink_list()?;
     }
-    apply_spec(&mut a, s)?;
+    apply_spec(pdf, &p, &mut a, s)?;
     p.update()?;
     Ok(old)
 }
@@ -386,3 +558,7 @@ impl History {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "annot_tests.rs"]
+mod tests;

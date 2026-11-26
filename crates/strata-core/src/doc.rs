@@ -98,10 +98,22 @@ type Reply<T> = Sender<Result<T, String>>;
 #[derive(Clone, Debug)]
 pub enum AnnotOp {
     Create { page: u32, spec: crate::annot::AnnotSpec },
+    /// Place an image file (PNG, JPEG, GIF, BMP, TIFF, JPEG 2000) as a stamp.
+    AddImage { page: u32, data: ImageBytes, place: crate::annot::ImagePlace },
     Modify { page: u32, id: i32, spec: crate::annot::AnnotSpec },
     Delete { page: u32, id: i32 },
     Undo,
     Redo,
+}
+
+/// The bytes of an image file (not printed in debug output).
+#[derive(Clone)]
+pub struct ImageBytes(pub Arc<Vec<u8>>);
+
+impl std::fmt::Debug for ImageBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImageBytes({} bytes)", self.0.len())
+    }
 }
 
 /// Page affected by an edit, and the id of a created annotation.
@@ -767,6 +779,12 @@ fn doc_thread(mut eng: Engine, rx: Receiver<Cmd>, waker: Waker, ocr: Arc<crate::
                             Ok(match op {
                                 AnnotOp::Create { page, spec } => {
                                     let id = crate::annot::create(pdf, page, &spec)?;
+                                    history.push(Edit::Created { page, id, spec });
+                                    AnnotResult { page: Some(page), id: Some(id) }
+                                }
+                                AnnotOp::AddImage { page, data, place } => {
+                                    let author = std::env::var("USERNAME").unwrap_or_default();
+                                    let (id, spec) = crate::annot::create_image(pdf, page, &data.0, place, &author)?;
                                     history.push(Edit::Created { page, id, spec });
                                     AnnotResult { page: Some(page), id: Some(id) }
                                 }
